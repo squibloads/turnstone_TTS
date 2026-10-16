@@ -3571,6 +3571,7 @@ class Pane {
   }
 
   async _playMessageTTS(el, btn) {
+    const MAX_CLIPS = 200;
     // Toggle: clicking the active button (or any while playing) stops first.
     if (this._ttsBtnActive) {
       const wasThis = this._ttsBtnActive === btn;
@@ -3610,6 +3611,18 @@ class Pane {
       if (!segments.length) {
         this._stopTTS();
         return;
+      }
+      // One request per clip, so a table or list of hundreds of rows would
+      // queue hundreds of syntheses; read the first MAX_CLIPS and say so.
+      if (segments.length > MAX_CLIPS) {
+        segments.length = MAX_CLIPS;
+        segments[MAX_CLIPS - 1].pauseMs = 0;
+        showToast(
+          "Read-aloud stopped after the first " +
+            MAX_CLIPS +
+            " sections; the rest of this reply was skipped.",
+          "warn",
+        );
       }
       let next = fetchClip(segments[0].text);
       for (let i = 0; i < segments.length; i++) {

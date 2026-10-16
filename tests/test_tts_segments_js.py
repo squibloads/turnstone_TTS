@@ -733,3 +733,33 @@ def test_consecutive_code_markers_collapse_into_one() -> None:
     assert _segs(f"<p>See <code>{long_}</code> <code>{long_}</code> for details here.</p>") == [
         ("See Code omitted. for details here.", 0)
     ]
+
+
+def test_a_reply_over_the_clip_cap_plays_the_first_200_and_says_so() -> None:
+    out = _play(
+        """
+const html = Array.from({ length: 250 }, (_, i) => "<p>Paragraph number " + i + " is long enough.</p>").join("");
+const btn = button();
+T._playMessageTTS(parse(html, "msg-body"), btn);
+await tick();
+const toastsAtStart = [...log.toasts];
+for (let i = 0; ; i++) {
+  if (!log.fetches[i]) break;
+  log.fetches[i].reply(); await tick();
+  log.audios[i].fire("ended"); await tick();
+  if (log.timers[i]) log.timers[i].fn();
+  await tick();
+}
+console.log(JSON.stringify({ toastsAtStart, fetches: log.fetches.length, audios: log.audios.length,
+  last: log.fetches[log.fetches.length - 1].text, timers: log.timers.length, toasts: log.toasts, active: T._ttsBtnActive }));
+"""
+    )
+    assert out["fetches"] == out["audios"] == 200
+    assert out["last"] == "Paragraph number 199 is long enough."
+    assert out["timers"] == 199  # no trailing pause after the last clip played
+    assert out["toastsAtStart"] == out["toasts"]
+    assert len(out["toasts"]) == 1
+    message, kind = out["toasts"][0]
+    assert kind == "warn"
+    assert "200" in message and "skipped" in message
+    assert out["active"] is None
