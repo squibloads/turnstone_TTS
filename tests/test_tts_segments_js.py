@@ -662,6 +662,29 @@ console.log(JSON.stringify(res));
     }
 
 
+def test_auth_sentinels_end_the_run_without_a_toast() -> None:
+    """authFetch rejects with 'auth' (a 401 it could not recover) or 'auth
+    changed' (the login moved mid-request); app.js treats both as a silent stop,
+    and a sign-out while a clip loop waits is routine, not an error."""
+    for sentinel in ("auth changed", "auth"):
+        out = _play(
+            f"""
+const btn = button();
+T._playMessageTTS(msg(), btn); await tick();
+log.fetches[0].fail({json.dumps(sentinel)}); await tick();
+const first = {{ toasts: [...log.toasts], active: T._ttsBtnActive, busy: btn.cls.has("is-busy") }};
+T._playMessageTTS(msg(), btn); await tick();
+log.fetches[1].reply(); await tick();
+log.fetches[2].fail({json.dumps(sentinel)}); await tick();         // the prefetch fails while clip 0 plays
+log.audios[0].fire("ended"); await tick(); log.timers[0].fn(); await tick();
+console.log(JSON.stringify({{ first, toasts: log.toasts, active: T._ttsBtnActive,
+  playing: btn.cls.has("is-playing") }}));
+"""
+        )
+        assert out["first"] == {"toasts": [], "active": None, "busy": False}, sentinel
+        assert out["toasts"] == [] and out["active"] is None and out["playing"] is False, sentinel
+
+
 def test_a_login_change_mid_run_stops_playback_at_the_next_clip_boundary() -> None:
     out = _play(
         """

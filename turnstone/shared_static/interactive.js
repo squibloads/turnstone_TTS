@@ -3786,6 +3786,12 @@ class Pane {
       this._stopTTS();
     } catch (err) {
       if (token !== this._ttsSeq) return; // aborted by a stop or a newer run
+      // authFetch's sentinels for a lost or changed login end the run quietly,
+      // as every other caller does; the login screen is the message.
+      if (err && (err.message === "auth" || err.message === "auth changed")) {
+        this._stopTTS();
+        return;
+      }
       showToast(
         err && err.message ? err.message : "Speech synthesis failed",
         "error",
