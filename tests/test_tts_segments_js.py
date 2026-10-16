@@ -382,6 +382,91 @@ def test_fenced_code_is_one_omitted_segment_but_inline_code_is_spoken() -> None:
     ]
 
 
+# Markup states renderer.js produces for a ```mermaid fence: before
+# postRenderMermaid runs it is <pre><code class="language-mermaid">; the
+# replacement div is .mermaid-container + .mermaid-loading, then
+# .mermaid-rendered (innerHTML = the SVG) or .mermaid-error (message div + a
+# <pre><code> holding the source).
+_MERMAID_SVG = (
+    '<svg id="mermaid-1" class="flowchart"><style>#mermaid-1 .label { color: red; }</style>'
+    '<g class="nodes"><g class="node"><foreignObject><div><span class="nodeLabel"><p>llm-gateway:8316</p></span></div></foreignObject></g>'
+    '<g class="node"><text>llama-swap:8080</text></g></g>'
+    '<g class="edgeLabels"><g class="label"><foreignObject><span class="edgeLabel">chat completions</span></foreignObject></g></g></svg>'
+)
+_LABELS = ("llm-gateway", "llama-swap", "chat completions", "color: red")
+
+
+def test_a_rendered_mermaid_container_is_one_diagram_marker_not_its_labels() -> None:
+    segs = _segs(
+        "<p>The gateway chain is as follows:</p>"
+        f'<div class="mermaid-container mermaid-rendered" role="region">{_MERMAID_SVG}</div>'
+        "<ul><li>First item of the list</li><li>Second item of the list</li></ul>"
+        "<p>Closing paragraph after the list.</p>"
+    )
+    assert segs == [
+        ("The gateway chain is as follows:", 500),
+        ("Diagram omitted.", 400),
+        ("First item of the list. Second item of the list.", 0),
+        ("Closing paragraph after the list.", 0),
+    ]
+    assert not any(label in t for t, _ in segs for label in _LABELS)
+
+
+def test_loading_and_error_mermaid_containers_are_also_one_marker() -> None:
+    assert _segs('<div class="mermaid-container mermaid-loading"></div>') == [("Diagram omitted.", 0)]
+    err = (
+        '<div class="mermaid-container mermaid-error"><div class="mermaid-error-msg">Parse error on line 2</div>'
+        "<pre><code>flowchart LR\n A --> llm-gateway</code></pre></div>"
+    )
+    segs = _segs(err)
+    assert segs == [("Diagram omitted.", 0)]  # the last clip never pauses
+
+
+def test_an_unrendered_mermaid_fence_says_diagram_not_code() -> None:
+    assert _segs(
+        '<p>Here is the chain:</p><pre><code class="language-mermaid">flowchart LR\n A --> B</code></pre>'
+        "<p>Back to normal prose now.</p>"
+    ) == [
+        ("Here is the chain:", 500),
+        ("Diagram omitted.", 400),
+        ("Back to normal prose now.", 0),
+    ]
+
+
+def test_consecutive_diagram_markers_merge_but_not_into_a_code_marker() -> None:
+    d = '<div class="mermaid-container mermaid-loading"></div>'
+    assert _segs(d + d + "<pre>x</pre>" + d) == [
+        ("Diagram omitted.", 400),
+        ("Code omitted.", 400),
+        ("Diagram omitted.", 0),
+    ]
+
+
+def test_a_diagram_inside_a_list_item_keeps_the_list_one_clip() -> None:
+    segs = _segs(
+        "<ul><li>Before the diagram comes here"
+        f'<div class="mermaid-container mermaid-rendered">{_MERMAID_SVG}</div></li>'
+        "<li>After the diagram comes here</li></ul>"
+    )
+    assert not any(label in t for t, _ in segs for label in _LABELS)
+    assert [t for t, _ in segs] == [
+        "Before the diagram comes here.",
+        "Diagram omitted.",
+        "After the diagram comes here.",
+    ]
+
+
+def test_inline_svg_and_media_elements_are_skipped_silently() -> None:
+    assert _segs(
+        "<p>Click the <svg><title>gear icon</title><text>cog</text></svg> button to open settings.</p>"
+        "<p>See <img alt=\"chart of results\"></img> the picture and <canvas>fallback text</canvas> "
+        "<video>no video support</video><audio>no audio support</audio> for details.</p>"
+    ) == [
+        ("Click the button to open settings.", 500),
+        ("See the picture and for details.", 0),
+    ]
+
+
 def test_katex_is_removed() -> None:
     assert _segs(
         '<p>The value <span class="katex"><span>x squared annotation</span></span> is quite large.</p>'
