@@ -1245,6 +1245,15 @@ class TestTextToSpeech:
         resp = client.post("/v1/api/tts", json={"text": "x" * 9000}, headers=_auth("userA"))
         assert resp.status_code == 200, resp.text
 
+    def test_text_cap_through_a_real_config_store(self, storage):
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.server import _tts_text_cap
+
+        cs = ConfigStore(storage)
+        assert _tts_text_cap(cs) == 8000
+        cs.set("audio.tts_max_chars", 10)
+        assert _tts_text_cap(cs) == 10
+
     @pytest.mark.parametrize("bad", ["", "abc", 0, -5, None])
     def test_unusable_text_cap_falls_back_to_the_default(self, voice_app_client, bad):
         client, _ = voice_app_client

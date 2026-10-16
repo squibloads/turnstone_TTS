@@ -3335,8 +3335,6 @@ class TestProxyTtsTimeout:
 
     @staticmethod
     def _call(monkeypatch, path, config_store):
-        from types import SimpleNamespace
-
         import httpx
 
         from turnstone.console import server as csrv
@@ -3375,6 +3373,14 @@ class TestProxyTtsTimeout:
         assert timeout.read == 90
         # Only the wait for the clip follows the setting; reaching the node does not.
         assert (timeout.connect, timeout.write, timeout.pool) == (30, 30, 30)
+
+    def test_real_config_store_drives_the_read_timeout(self, monkeypatch, storage):
+        from turnstone.core.config_store import ConfigStore
+
+        cs = ConfigStore(storage)
+        assert self._call(monkeypatch, "tts", cs)["timeout"].read == 30
+        cs.set("audio.tts_timeout_seconds", 90)
+        assert self._call(monkeypatch, "tts", cs)["timeout"].read == 90
 
     def test_other_paths_pass_no_timeout(self, monkeypatch):
         store = SimpleNamespace(get=lambda key: {"audio.tts_timeout_seconds": 90}[key])

@@ -59,6 +59,8 @@ MAX_TTS_TIMEOUT_SECONDS = 600
 # The node synthesizes a request whole and does not stop when the caller gives
 # up, so the text cap is bounded by what a slow backend finishes inside the
 # longest timeout: Kokoro-82M on CPU ran ~107 chars/s, so 50,000 takes ~470 s.
+# The clip is held whole on the way back (the console buffers the node's reply,
+# peaking near twice the clip), so memory per request grows with the cap too.
 MAX_TTS_MAX_CHARS = 50_000
 
 
