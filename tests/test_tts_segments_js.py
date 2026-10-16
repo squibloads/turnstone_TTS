@@ -620,6 +620,25 @@ console.log(JSON.stringify({ audios: log.audios.length, fetches: log.fetches.len
     assert out["playing"] is False and out["active"] is None and out["toasts"] == []
 
 
+def test_an_audio_error_event_mid_clip_shows_a_toast_and_resets_the_button() -> None:
+    out = _play(
+        """
+const btn = button();
+T._playMessageTTS(msg(), btn); await tick();
+log.fetches[0].reply(); await tick();
+const before = btn.cls.has("is-playing");
+log.audios[0].fire("error"); await tick();
+console.log(JSON.stringify({ before, toasts: log.toasts, playing: btn.cls.has("is-playing"),
+  pressed: btn.attrs["aria-pressed"], active: T._ttsBtnActive, audio: T._ttsAudio,
+  fetches: log.fetches.length }));
+"""
+    )
+    assert out["before"] is True
+    assert out["toasts"] == [["Audio playback failed", "error"]]
+    assert out["playing"] is False and out["pressed"] == "false" and out["active"] is None
+    assert out["audio"] is None and out["fetches"] == 2  # no third clip was requested
+
+
 def test_play_blocked_by_autoplay_policy_shows_a_toast_and_stops() -> None:
     out = _play(
         """
