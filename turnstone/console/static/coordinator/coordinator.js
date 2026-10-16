@@ -68,6 +68,7 @@ import {
   createTtsPlayer,
   getVoiceRoles,
 } from "/shared/tts_player.js";
+import { createMicController } from "/shared/stt_mic.js";
 import {
   acceptUserTurnEvent,
   clientSendMaySettleForViewer,
@@ -565,6 +566,16 @@ function createCoordinatorPane(root, wsId, opts) {
   // Provenance of the current busy=true (see setBusy): "server" |
   // "optimistic" | null when idle.
   let busySource = null;
+  // Dictation: the console's own /v1/api/workstreams/{id}/speech-to-text/stream
+  // (base ""), one controller per pane so a destroyed pane releases its own
+  // microphone.  The button stays hidden until /v1/api/models reports an stt
+  // role (see _applyVoiceRoles) and, like send, is off while a turn is running.
+  const mic = createMicController({
+    composer: composer,
+    base: "",
+    wsId: () => wsId,
+    isBusy: () => busy,
+  });
   // Acting user (turn initiator) of the in-flight turn, from state_change
   // events; drives the shared-workstream cross-user send gate. Carries the
   // owner id even single-user (the gate just no-ops — it equals this viewer);
@@ -2777,6 +2788,8 @@ function createCoordinatorPane(root, wsId, opts) {
     busy = next;
     reconcileSendBlock();
     if (edge && !next) queue.onIdleEdge();
+    // The mic produces composer input the user can only send when idle.
+    mic.syncBusy();
   }
 
   // Shared-workstream send gate: block this viewer's send while another
@@ -6638,9 +6651,10 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   // The roles resolve after the first history paint, so the bubbles it built
-  // get their speaker now.
+  // get their speaker now, and the mic appears once an stt role is confirmed.
   function _applyVoiceRoles(roles) {
     voiceRoles = roles;
+    mic.setAvailable(!!roles.stt);
     _addTtsActions();
   }
 
@@ -7313,6 +7327,7 @@ function createCoordinatorPane(root, wsId, opts) {
   function destroy() {
     reasoningActivity.finish();
     ttsPlayer.stop();
+    mic.destroy(); // release the microphone and abort a transcription in flight
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
     // truncated resync).
     closeStreamTransport();

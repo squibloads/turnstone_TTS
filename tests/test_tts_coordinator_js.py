@@ -79,6 +79,8 @@ let currentAssistantEl = null, currentAssistantBuf = '', currentReasoningEl = nu
 const reasoningActivity = { finish() {} };
 const _scheduleScroll = () => {};
 function _retryLast() {}
+// The dictation mic (covered by test_stt_coordinator_js) is inert here.
+const mic = { setAvailable() {}, syncBusy() {}, destroy() {} };
 """
 
 _HELPERS = r"""
