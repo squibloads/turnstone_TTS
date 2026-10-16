@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
@@ -15,6 +17,8 @@ RULE_CASES: list[tuple[str, str]] = [
     ("2×3", "2 by 3"),
     ("2 × 3", "2 by 3"),
     ("1024x1024", "1024 by 1024"),
+    ("1024x1024x3", "1024 by 1024 by 3"),
+    ("a -> -> b", "a to  to b"),
     ("≈ 5", "approximately 5"),
     ("±3", "plus or minus 3"),
     ("± 3", "plus or minus 3"),
@@ -46,6 +50,9 @@ RULE_CASES: list[tuple[str, str]] = [
     # ranges
     ("3-5 items", "3 to 5 items"),
     ("pages 10-20", "pages 10 to 20"),
+    ("10-20ms", "10 to 20 milliseconds"),
+    ("A100-80GB", "A100-80 gigabytes"),
+    ("V100-SXM2-32GB", "V100-SXM2-32 gigabytes"),
     # versions
     ("1.8.5", "1 point 8 point 5"),
     ("v1.9.0", "version 1 point 9 point 0"),
@@ -83,6 +90,11 @@ def test_idempotent(src: str, _expected: str) -> None:
         "Version two is out.",
         "The x axis and y axis; box and tax.",
         "Memory at 0x1F is fine.",
+        "Qwen3-8B and qwen3-32b run.",
+        "The .30-06 rifle.",
+        "30-06",
+        "Dated 16.10.2026 here.",
+        "About 1.000.000 rows.",
     ],
 )
 def test_plain_prose_unchanged(text: str) -> None:
@@ -103,6 +115,20 @@ def test_dates_untouched() -> None:
 
 def test_two_part_decimal_untouched() -> None:
     assert normalize_for_speech("score 13.9") == "score 13.9"
+
+
+def test_arrow_whitespace_variants() -> None:
+    assert normalize_for_speech("a->b") == "a to b"
+    assert normalize_for_speech("a  ->  b") == "a to b"
+    assert normalize_for_speech("a ->") == "a to "
+    assert normalize_for_speech("a -> → b") == "a to  to b"
+    assert normalize_for_speech("->b") == " to b"
+
+
+def test_dimension_chain_single_pass() -> None:
+    once = normalize_for_speech("1024x1024x3")
+    assert once == "1024 by 1024 by 3"
+    assert normalize_for_speech(once) == once
 
 
 def test_empty_string() -> None:
@@ -135,3 +161,28 @@ class TestPronunciations:
 
     def test_parse_value_with_equals(self) -> None:
         assert parse_pronunciations("a = b = c") == {"a": "b = c"}
+
+
+class TestUnicodeCaseFolds:
+    def test_long_s_matches_key(self) -> None:
+        assert normalize_for_speech("ſql rocks", {"sql": "sequel"}) == "sequel rocks"
+
+    def test_dotless_i_does_not_raise(self) -> None:
+        normalize_for_speech("an ı here", {"i": "eye"})
+
+    def test_dotted_capital_i_does_not_raise(self) -> None:
+        normalize_for_speech("İs it", {"is": "X"})
+
+
+def _elapsed(text: str) -> float:
+    start = time.perf_counter()
+    normalize_for_speech(text)
+    return time.perf_counter() - start
+
+
+def test_timing_long_whitespace_run() -> None:
+    assert _elapsed("a" + " " * 49_998 + "b") < 1.0
+
+
+def test_timing_long_dotted_chain() -> None:
+    assert _elapsed("1." * 25_000 + "1x1") < 1.0
