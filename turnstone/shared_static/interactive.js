@@ -3431,7 +3431,8 @@ class Pane {
   // punctuation and the items are joined with a space, with no pause between
   // items and none after the list (listening tests: the model's own
   // sentence-end pause was enough).  Table rows keep one clip each with a
-  // 150 ms pause and are never merged by the short-clip fold.  Fenced code becomes a marker and rendered
+  // 150 ms pause; a table row is never itself folded forward, but a short
+  // lead-in paragraph can fold into the first row.  Fenced code becomes a marker and rendered
   // math (KaTeX's accessibility text) is dropped.  Inline code is spoken when
   // short (an identifier or flag) and replaced by the marker from
   // INLINE_CODE_MAX characters up (a command line or expression is noise
