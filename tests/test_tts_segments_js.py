@@ -313,6 +313,21 @@ def test_table_rows_inside_a_list_item_each_start_cleanly() -> None:
     ) == [("Intro text here. Plan, Price. Pro, $9. Max, $20. Closing item text.", 0)]
 
 
+def test_every_long_code_cell_in_a_row_keeps_its_marker() -> None:
+    long_ = "x" * 40
+    code = f"<td><code>{long_}</code></td>"
+    assert _segs(f"<table><tr><td>x</td>{code}{code}<td>y</td></tr></table>") == [
+        ("x, Code omitted., Code omitted., y.", 0)
+    ]
+    assert _segs(f"<table><tr><td>x</td>{code}{code}</tr></table>") == [
+        ("x, Code omitted., Code omitted.", 0)
+    ]
+    # Within one cell two adjacent long spans are still one omission.
+    assert _segs(f"<table><tr><td>x</td><td><code>{long_}</code><code>{long_}</code></td></tr></table>") == [
+        ("x, Code omitted.", 0)
+    ]
+
+
 def test_short_table_rows_are_never_merged() -> None:
     assert _segs(
         "<table><tr><th>Plan</th><th>Price</th></tr><tr><td>Pro</td><td>$9</td></tr>"

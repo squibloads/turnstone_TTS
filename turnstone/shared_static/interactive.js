@@ -3450,6 +3450,7 @@ class Pane {
       BLOCKQUOTE: 500,
       TR: 150,
     };
+    const CODE_OMITTED = "Code omitted.";
     const raw = [];
     // A segment keeps its text as parts plus a count of non-space characters,
     // so the list and cell logic below looks only at the tail and never
@@ -3533,11 +3534,13 @@ class Pane {
         const cls = child.classList;
         if (cls.contains("katex") || cls.contains("katex-display")) continue;
         if (child.tagName === "CODE" && child.textContent.length >= INLINE_CODE_MAX) {
-          if (!(cur && cur.marker)) addText(" Code omitted. ", true);
+          // Adjacent markers collapse, except across a cell boundary: each
+          // long-code cell of a row keeps its own.
+          if (!(cur && cur.marker && !cellSep)) addText(" " + CODE_OMITTED + " ", true);
           continue;
         }
         if (child.tagName === "PRE") {
-          put(newSeg(400, { code: true }), "Code omitted.");
+          put(newSeg(400, { code: true }), CODE_OMITTED);
           cur = listDepth ? newSeg(0) : null;
           continue;
         }
