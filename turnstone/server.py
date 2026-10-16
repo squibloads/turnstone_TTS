@@ -1949,6 +1949,7 @@ async def text_to_speech(request: Request) -> Response:
     )
     from turnstone.core.deadline import StreamAbortRef
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+    from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
@@ -1977,6 +1978,13 @@ async def text_to_speech(request: Request) -> Response:
     voice = str(body.get("voice") or "").strip()
     if not voice and config_store is not None:
         voice = (config_store.get("audio.tts_voice") or "").strip()
+
+    # On by default; a missing config store means defaults, not "off".
+    if config_store is None or config_store.get("audio.tts_normalize", True):
+        pronunciations = ""
+        if config_store is not None:
+            pronunciations = config_store.get("audio.tts_pronunciations") or ""
+        text = normalize_for_speech(text, parse_pronunciations(pronunciations))
 
     abort_ref = StreamAbortRef()
     backend_auth_resolver = _audio_backend_auth_resolver(request)

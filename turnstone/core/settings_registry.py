@@ -688,6 +688,31 @@ def _build_registry() -> dict[str, SettingDef]:
             "local speech backend. Every other request the console forwards keeps the "
             "proxy's shared timeout.",
         ),
+        SettingDef(
+            "audio.tts_normalize",
+            "bool",
+            True,
+            "Rewrite symbols, units and versions into speakable words before text-to-speech",
+            "audio",
+            help="Technical replies contain symbols, units and version numbers that speech "
+            "models read badly (~5, 32GB, 1.8.5). When on, a small English rule set rewrites "
+            "them into plain words (about 5, 32 gigabytes, 1 point 8 point 5) before the text "
+            "is sent to the TTS backend. It works the same for every backend; turn it off for "
+            "non-English replies or a model that already handles this itself.",
+        ),
+        SettingDef(
+            "audio.tts_pronunciations",
+            "str",
+            "",
+            "Custom pronunciations for text-to-speech (one 'word = respelling' per line)",
+            "audio",
+            help="One entry per line as `word = respelling`, for example `SQL = sequel` or "
+            "`nginx = engine ex`. Matching is whole-word and case-insensitive, and applies "
+            "after the built-in rules. Write the respelling as plain words that sound right "
+            "when read aloud: plain respellings work with every TTS model, unlike phoneme or "
+            "SSML syntax. Blank lines and lines starting with # are ignored. Only used when "
+            "text normalisation is on.",
+        ),
         # -- judge ----------------------------------------------------------
         SettingDef(
             "judge.enabled",
