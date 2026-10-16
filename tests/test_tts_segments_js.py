@@ -94,7 +94,11 @@ globalThis.Audio = class {
   constructor(url) { this.src = url; this.paused = false; this.l = {}; log.audios.push(this); }
   addEventListener(n, f) { this.l[n] = f; }
   pause() { this.paused = true; }
-  play() { return playMode === "ok" ? Promise.resolve() : Promise.reject(new Error("NotAllowedError")); }
+  play() {
+    if (playMode === "ok") return Promise.resolve();
+    // playMode doubles as the DOMException name the browser would reject with.
+    return Promise.reject(Object.assign(new Error("play() failed"), { name: playMode }));
+  }
   fire(n) { this.l[n](); }
 };
 // Manual fetch: each call parks until the test settles it; honours abort.
@@ -502,10 +506,10 @@ console.log(JSON.stringify(res));
     }
 
 
-def test_rejected_play_shows_a_toast_and_stops() -> None:
+def test_play_blocked_by_autoplay_policy_shows_a_toast_and_stops() -> None:
     out = _play(
         """
-playMode = "reject";
+playMode = "NotAllowedError";
 const btn = button();
 T._playMessageTTS(msg(), btn); await tick();
 log.fetches[0].reply(); await tick();
@@ -607,3 +611,16 @@ def test_destroy_stops_read_aloud() -> None:
     covered only through disconnectSSE(), which no longer stops playback."""
     body = strip_js_comments(extract_braced(_SRC, "    destroy() {"))
     assert "pane._stopTTS()" in body
+
+
+def test_an_undecodable_clip_is_not_reported_as_an_autoplay_block() -> None:
+    out = _play(
+        """
+playMode = "NotSupportedError";
+const btn = button();
+T._playMessageTTS(msg(), btn); await tick();
+log.fetches[0].reply(); await tick();
+console.log(JSON.stringify({ toasts: log.toasts, active: T._ttsBtnActive }));
+"""
+    )
+    assert out == {"toasts": [["Audio playback failed", "error"]], "active": None}

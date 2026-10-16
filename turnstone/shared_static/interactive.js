@@ -3599,10 +3599,18 @@ class Pane {
           audio.addEventListener("error", () =>
             reject(new Error("Audio playback failed")),
           );
+          // NotAllowedError is the autoplay policy; anything else (an
+          // undecodable clip) must not be blamed on the browser.
           audio
             .play()
-            .catch(() =>
-              reject(new Error("Playback was blocked by the browser")),
+            .catch((e) =>
+              reject(
+                new Error(
+                  e && e.name === "NotAllowedError"
+                    ? "Playback was blocked by the browser"
+                    : "Audio playback failed",
+                ),
+              ),
             );
         });
         URL.revokeObjectURL(url);
