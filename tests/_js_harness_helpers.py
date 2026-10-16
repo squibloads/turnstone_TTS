@@ -201,7 +201,9 @@ def run_node_source(source: str, *, timeout: int = 15) -> subprocess.CompletedPr
     slice-and-run suites share (a sliced console function plus ``throw``
     checks); skips the test when node is absent.
     """
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".mjs", delete=False, encoding="utf-8"
+    ) as f:
         f.write(source)
         tmp = f.name
     try:
