@@ -703,6 +703,26 @@ console.log(JSON.stringify({ audios: log.audios.length, fetches: log.fetches.len
     assert out["playing"] is False and out["active"] is None and out["toasts"] == []
 
 
+def test_a_login_change_while_the_next_clip_is_fetching_stops_before_it_plays() -> None:
+    """The check after each fetch is separate from the one after each pause:
+    the login can change while clip 1 is still in flight, and its reply must
+    not play under the previous session."""
+    out = _play(
+        """
+const btn = button();
+T._playMessageTTS(msg(), btn); await tick();
+log.fetches[0].reply(); await tick();
+log.audios[0].fire("ended"); await tick();
+log.timers[0].fn(); await tick();
+authGen++;                       // the login changes while clip 1 is still fetching
+log.fetches[1].reply(); await tick();
+console.log(JSON.stringify({ audios: log.audios.length, created: log.created.length,
+  playing: btn.cls.has("is-playing"), active: T._ttsBtnActive, toasts: log.toasts }));
+"""
+    )
+    assert out == {"audios": 1, "created": 1, "playing": False, "active": None, "toasts": []}
+
+
 def test_an_audio_error_event_mid_clip_shows_a_toast_and_resets_the_button() -> None:
     out = _play(
         """
