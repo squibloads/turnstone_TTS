@@ -769,9 +769,11 @@ console.log(JSON.stringify({ toasts: log.toasts, created: log.created, revoked: 
 
 def test_real_pane_survives_reset_and_disconnect_before_any_playback() -> None:
     """reset() and replayHistory() call _stopTTS() on every pane before any
-    playback, so a field it touches that only the player assigns throws on
-    history load and blanks the transcript (seen live 2026-10-16).  Build the
-    pane from the shipped constructor rather than a pre-populated fake."""
+    playback.  _stopTTS guards each field it reads, so a missing one would not
+    throw; this pins that the shipped constructor initialises every _tts field
+    the stop path reads, so a pane never depends on the player having run
+    first.  Build the pane from the shipped constructor rather than a
+    pre-populated fake."""
     import re
 
     used = sorted(set(re.findall(r"this\.(_tts\w+)", extract_braced(_SRC, "_stopTTS() {"))))

@@ -510,8 +510,8 @@ class Pane {
     this._ttsAudio = null;
     this._ttsBtnActive = null;
     this._ttsSeq = 0;
-    // reset() and replayHistory() call _stopTTS() before any playback, so
-    // these must exist from construction.
+    // reset() and replayHistory() call _stopTTS() before any playback; the
+    // stop path reads these, so they are initialised here and a test pins it.
     this._ttsAbort = null;
     this._ttsTimer = null;
     this._createDOM();
