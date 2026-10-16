@@ -22,15 +22,27 @@ _SRC = (
     Path(__file__).resolve().parents[1] / "turnstone" / "shared_static" / "interactive.js"
 ).read_text(encoding="utf-8")
 
-_METHODS = ",\n".join(
+_SIGS = (
+    "_extractSpeechSegments(bodyEl) {",
+    "_shapeSpeechSegments(raw) {",
+    "async _playMessageTTS(el, btn) {",
+    "_stopTTS() {",
+)
+_METHODS = ",\n".join(extract_braced(_SRC, sig) for sig in _SIGS)  # object-literal body
+# The real constructor and the two lifecycle methods that call _stopTTS(); the
+# player tests build their pane from these so a field the constructor fails to
+# initialise breaks them, as it blanked live transcripts on 2026-10-16.  The
+# constructor has non-ASCII comments and run_node_source writes the script in
+# the locale encoding (cp1252 on Windows), so they are escaped here.
+_PANE_SRC = "\n".join(
     extract_braced(_SRC, sig)
     for sig in (
-        "_extractSpeechSegments(bodyEl) {",
-        "_shapeSpeechSegments(raw) {",
-        "async _playMessageTTS(el, btn) {",
-        "_stopTTS() {",
+        "constructor(wsId, opts) {",
+        "reset() {",
+        "disconnectSSE() {",
+        *_SIGS,
     )
-)
+).encode("ascii", "backslashreplace").decode("ascii")
 
 # Just enough DOM for the walker: element/text nodes, classList.contains and
 # an HTML-subset parser so the cases below read as the markup they model.
@@ -105,10 +117,22 @@ function button() {
     setAttribute: (k, v) => { attrs[k] = v; },
   };
 }
-const T = {
-  _base: "http://x", _ttsAudio: null, _ttsAbort: null, _ttsTimer: null, _ttsUrls: new Set(), _ttsBtnActive: null, _ttsSeq: 0,
-  METHODS
-};
+// Only what the real constructor, reset() and disconnectSSE() reach for is
+// stubbed; every _tts* field comes from the constructor under test.
+let _paneCounter = 0;
+const INTERACTIVE_DEFAULT_HOST = {};
+const createHistoryHandoffRepair = () => ({});
+const createReasoningActivity = () => ({ finish() {} });
+const STALE_RETRY_BASE_MS = 0, STALE_RETRY_JITTER_MS = 0, DEGRADED_COOLDOWN_MAX_MS = 0, DEGRADED_COOLDOWN_BASE_MS = 0;
+class Pane {
+  PANE
+  _createDOM() { this.inputEl = {}; this.attachments = { clearChips() {} }; }
+  setBusy() {}
+  _reconcileSendDisabled() {}
+  _stopRecording() {}
+}
+const T = new Pane("ws", {});
+T._base = "http://x";
 // Three paragraphs long enough to avoid the short-segment merge.
 const msg = () => parse(
   "<p>First paragraph is long enough.</p><p>Second paragraph is long enough.</p><p>Third paragraph is long enough.</p>",
@@ -286,7 +310,7 @@ def test_empty_bodies_yield_no_segments() -> None:
 
 
 def _play(body: str) -> Any:
-    return _run(_DOM + _PLAYER.replace("METHODS", _METHODS), body)
+    return _run(_DOM + _PLAYER.replace("PANE", _PANE_SRC), body)
 
 
 def test_clips_play_in_order_with_one_fetch_in_flight_and_a_pause_between() -> None:
@@ -491,16 +515,20 @@ console.log(JSON.stringify({ toasts: log.toasts, created: log.created, revoked: 
     assert out["active"] is None
 
 
-def test_constructor_initialises_every_tts_field_stop_uses() -> None:
+def test_real_pane_survives_reset_and_disconnect_before_any_playback() -> None:
     """reset() and disconnectSSE() call _stopTTS() on every pane before any
     playback, so a field it touches that only the player assigns throws on
-    history load and blanks the transcript (seen live 2026-10-16). The tests
-    above build a fake pane with the fields pre-set, so pin the real
-    constructor here."""
+    history load and blanks the transcript (seen live 2026-10-16).  Build the
+    pane from the shipped constructor rather than a pre-populated fake."""
     import re
 
-    ctor = extract_braced(_SRC, "constructor(wsId, opts) {")
-    used = set(re.findall(r"this\.(_tts\w+)", extract_braced(_SRC, "_stopTTS() {")))
-    assigned = set(re.findall(r"this\.(_tts\w+)\s*=", ctor))
+    used = sorted(set(re.findall(r"this\.(_tts\w+)", extract_braced(_SRC, "_stopTTS() {"))))
     assert used, "no _tts fields found in _stopTTS"
-    assert used <= assigned, f"not initialised in the constructor: {sorted(used - assigned)}"
+    out = _play(
+        f"""
+const missing = {json.dumps(used)}.filter((k) => T[k] === undefined);
+T.reset(); T.disconnectSSE();
+console.log(JSON.stringify({{ missing }}));
+"""
+    )
+    assert out == {"missing": []}
