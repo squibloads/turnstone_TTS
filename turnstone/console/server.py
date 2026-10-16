@@ -297,6 +297,24 @@ _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 # proxy client's granular Timeout is a separate contract.
 _PROXY_CLIENT_TIMEOUT_S = 30
 
+
+def _proxy_tts_timeout(request: Request) -> float | None:
+    """The ``audio.tts_timeout_seconds`` setting, or None to keep the pool's timeout.
+
+    The node's ``tts`` route answers only when the whole clip is synthesized, so
+    a long reply on a local backend outlasts ``_PROXY_CLIENT_TIMEOUT_S``.  Read
+    per request; an unusable value falls back to the shared timeout.
+    """
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store is None:
+        return None
+    try:
+        value = float(config_store.get("audio.tts_timeout_seconds"))
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value < float("inf") else None
+
+
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
 
 
@@ -3760,11 +3778,18 @@ async def _proxy_post(
     try:
         headers = {"Content-Type": content_type}
         headers.update(_proxy_auth_headers(request))
+        extra: dict[str, Any] = {}
+        if path == "tts":
+            tts_timeout = _proxy_tts_timeout(request)
+            if tts_timeout is not None:
+                # Only the wait for the clip; connecting and the pool keep the shared bound.
+                extra["timeout"] = httpx.Timeout(_PROXY_CLIENT_TIMEOUT_S, read=tts_timeout)
         resp = await client.request(
             request.method,
             target,
             content=body,
             headers=headers,
+            **extra,
         )
         return Response(
             content=resp.content,

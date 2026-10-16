@@ -3,6 +3,7 @@
 import asyncio
 import json
 import queue
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, MagicMock
 
@@ -3325,3 +3326,73 @@ class TestProxyGetHeaderPassThrough:
             "server" not in {k.lower() for k in resp.headers}
             or resp.headers.get("server") != "upstream-internal"
         )
+
+
+class TestProxyTtsTimeout:
+    """The node's ``tts`` route answers only once the whole clip is synthesized,
+    so it gets its own deadline (``audio.tts_timeout_seconds``); every other
+    proxied POST keeps the shared proxy client's timeout."""
+
+    @staticmethod
+    def _call(monkeypatch, path, config_store):
+        import httpx
+
+        from turnstone.console import server as csrv
+
+        calls = []
+
+        async def _mock_request(method, url, **kwargs):
+            calls.append(kwargs)
+            return httpx.Response(200, content=b"ok", request=httpx.Request(method, url))
+
+        proxy_client = MagicMock(spec=httpx.AsyncClient)
+        proxy_client.request = MagicMock(side_effect=_mock_request)
+
+        async def _body():
+            return b"{}"
+
+        state = SimpleNamespace(proxy_client=proxy_client)
+        if config_store is not None:
+            state.config_store = config_store
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=state),
+            method="POST",
+            body=_body,
+            headers={"content-type": "application/json"},
+            url=SimpleNamespace(query=""),
+        )
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+        resp = asyncio.run(csrv._proxy_post(request, "http://n:1", path, api_prefix="v1/api"))
+        assert resp.status_code == 200
+        return calls[0]
+
+    def test_tts_uses_the_setting(self, monkeypatch):
+        store = SimpleNamespace(get=lambda key: {"audio.tts_timeout_seconds": 90}[key])
+        kwargs = self._call(monkeypatch, "tts", store)
+        timeout = kwargs["timeout"]
+        assert timeout.read == 90
+        # Only the wait for the clip follows the setting; reaching the node does not.
+        assert (timeout.connect, timeout.write, timeout.pool) == (30, 30, 30)
+
+    def test_real_config_store_drives_the_read_timeout(self, monkeypatch, storage):
+        from turnstone.core.config_store import ConfigStore
+
+        cs = ConfigStore(storage)
+        assert self._call(monkeypatch, "tts", cs)["timeout"].read == 30
+        cs.set("audio.tts_timeout_seconds", 90)
+        assert self._call(monkeypatch, "tts", cs)["timeout"].read == 90
+
+    def test_other_paths_pass_no_timeout(self, monkeypatch):
+        store = SimpleNamespace(get=lambda key: {"audio.tts_timeout_seconds": 90}[key])
+        kwargs = self._call(monkeypatch, "workstreams/ws-1/send", store)
+        assert "timeout" not in kwargs
+
+    @pytest.mark.parametrize("bad", [None, "", "abc", 0, -1])
+    def test_unusable_setting_keeps_the_shared_timeout(self, monkeypatch, bad):
+        store = SimpleNamespace(get=lambda key: bad)
+        kwargs = self._call(monkeypatch, "tts", store)
+        assert "timeout" not in kwargs
+
+    def test_no_config_store_keeps_the_shared_timeout(self, monkeypatch):
+        kwargs = self._call(monkeypatch, "tts", None)
+        assert "timeout" not in kwargs

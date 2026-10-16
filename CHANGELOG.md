@@ -120,6 +120,28 @@ frozen.
 
 ### Added
 
+- **Speech-synthesis limits are settings.** `audio.tts_max_chars` (default 8000, the old fixed
+  cap, at most 50,000) is the longest text `POST /v1/api/tts` accepts, and
+  `audio.tts_timeout_seconds` (default 30, at most 600) is how long the console waits for a node's
+  `tts` answer. The node answers only once the whole clip is synthesized, so a long reply on a
+  local backend outlasted the proxy's shared 30-second timeout and showed "Node unreachable". The
+  setting covers only that wait: connecting to the node, and every other request the console
+  forwards, keep the shared timeout. Both are read per request, so a change in the Settings tab
+  applies without a restart. A stored value that is not a number falls back to the default, and
+  one out of range is clamped to the nearest bound.
+
+- **Read-aloud speaks symbols, units and version numbers.** Before text goes to the text-to-speech
+  backend, a small English rule set rewrites things models read badly into plain words: `~5`
+  becomes "about 5", `32GB` "32 gigabytes", `120ms` "120 milliseconds", `3-5` "3 to 5", `1.8.5`
+  "1 point 8 point 5", `->` "to", `60s` "60 seconds" (but `the 80s` stays a decade), `2026-10-16`
+  "October 16th, 2026" and `2026-10` "October 2026", `300W` "300 watts" (attached only), a
+  ten-digit phone number digit by digit, `speech_text.py` "speech_text dot py", and `e.g.` "for
+  example". A few technical terms voices mangle get plain respellings
+  (`PostgreSQL` as "Postgres", `systemctl`, `kubectl`, `YAML`, `JSON`). It uses no model-specific syntax, so it
+  behaves the same on Kokoro, OpenAI and vLLM-Omni backends. The new `audio.tts_normalize` setting
+  (on by default) turns it off, and `audio.tts_pronunciations` takes one `word = respelling` per
+  line for words the rules do not cover; an entry there overrides a built-in respelling.
+
 - **MCP servers on the 2026-07-28 revision (#679).** A connection probes `server/discover` and
   adopts 2026-07-28 when the server offers it; a server that refuses the probe gets the 2025-11-25
   `initialize` handshake, so existing servers connect as before. On 2026-07-28 connections, change

@@ -48,6 +48,30 @@ class TestValidateKey:
         assert validate_key("audio.stt_prompt").default == ""
         assert validate_key("audio.tts_voice").default == "alloy"
 
+    def test_tts_limit_settings_registered(self):
+        cap = validate_key("audio.tts_max_chars")
+        assert (cap.type, cap.section, cap.default) == ("int", "audio", 8000)
+        assert cap.min_value == 1
+        assert cap.max_value == 50000
+        assert cap.strict_int is True
+        timeout = validate_key("audio.tts_timeout_seconds")
+        assert (timeout.type, timeout.section, timeout.default) == ("int", "audio", 30)
+        assert timeout.min_value == 1
+        assert timeout.max_value == 600
+        assert timeout.strict_int is True
+
+    def test_tts_normalize_settings_registered(self):
+        norm = validate_key("audio.tts_normalize")
+        assert norm.type == "bool"
+        assert norm.default is True
+        assert norm.section == "audio"
+        assert norm.help
+        pron = validate_key("audio.tts_pronunciations")
+        assert pron.type == "str"
+        assert pron.default == ""
+        assert pron.section == "audio"
+        assert "respelling" in pron.help
+
     def test_smart_approvals_setting_registered(self):
         defn = validate_key("judge.smart_approvals")
         assert defn.key == "judge.smart_approvals"

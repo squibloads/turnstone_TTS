@@ -139,6 +139,26 @@ def test_exactly_cap_text_is_accepted() -> None:
     assert resp.status_code == 200
 
 
+def test_cap_follows_the_tts_max_chars_setting() -> None:
+    # Same per-request setting the node reads, so one Settings change governs both.
+    resp = _client(settings={**_SETTINGS, "audio.tts_max_chars": "10"}).post(
+        "/v1/api/tts", json={"text": "x" * 11}
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "text too long (cap 10 chars)"}
+
+
+def test_text_is_normalized_for_speech_like_the_node() -> None:
+    # Coordinator replies must sound like interactive ones: the console applies
+    # the node's speech cleanup before synthesis.
+    settings = {**_SETTINGS, "audio.tts_normalize": True}
+    with patch("turnstone.core.audio.synthesize", return_value=_speech()) as synth:
+        _client(settings=settings).post(
+            "/v1/api/tts", json={"text": "Written 1.000.000 in German format."}
+        )
+    assert synth.call_args.kwargs["text"] == "Written 1 dot 000 dot 000 in German format."
+
+
 _NOT_CONFIGURED = "Text-to-speech is not configured. Assign a TTS model role in Models → Roles."
 
 

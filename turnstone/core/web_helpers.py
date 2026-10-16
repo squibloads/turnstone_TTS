@@ -438,7 +438,21 @@ def auth_user_id(request: Request) -> str:
     return str(getattr(auth, "user_id", "") or "")
 
 
-TTS_TEXT_CAP = 8000  # characters per synthesis request
+def tts_text_cap(config_store: Any) -> int:
+    """The ``audio.tts_max_chars`` setting, or its default when unset or unusable.
+
+    Read per request so a change in the Settings tab applies without a restart;
+    a bad stored value must not refuse every request or lift the cap entirely.
+    """
+    from turnstone.core.settings_registry import DEFAULT_TTS_MAX_CHARS
+
+    if config_store is None:
+        return DEFAULT_TTS_MAX_CHARS
+    try:
+        cap = int(config_store.get("audio.tts_max_chars"))
+    except (TypeError, ValueError):
+        return DEFAULT_TTS_MAX_CHARS
+    return cap if cap > 0 else DEFAULT_TTS_MAX_CHARS
 
 
 def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
@@ -487,6 +501,7 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
     from turnstone.core.deadline import StreamAbortRef
     from turnstone.core.log import get_logger
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+    from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
 
     log = get_logger(__name__)
     body = await read_json_or_400(request)
@@ -495,12 +510,11 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
     text = str(body.get("text") or "").strip()
     if not text:
         return _JSONResponse({"error": "text is required"}, status_code=400)
-    if len(text) > TTS_TEXT_CAP:
-        return _JSONResponse(
-            {"error": f"text too long (cap {TTS_TEXT_CAP} chars)"}, status_code=400
-        )
-
     config_store = getattr(request.app.state, "config_store", None)
+    cap = tts_text_cap(config_store)
+    if len(text) > cap:
+        return _JSONResponse({"error": f"text too long (cap {cap} chars)"}, status_code=400)
+
     alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
     if not alias:
         return _JSONResponse(
@@ -515,6 +529,16 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
     voice = str(body.get("voice") or "").strip()
     if not voice and config_store is not None:
         voice = (config_store.get("audio.tts_voice") or "").strip()
+
+    # On by default (the registry default applies); a missing config store
+    # means defaults, not "off".
+    if config_store is None or config_store.get("audio.tts_normalize"):
+        pronunciations = ""
+        if config_store is not None:
+            pronunciations = config_store.get("audio.tts_pronunciations") or ""
+        # Every rule is linear and the length cap bounds the work; a thread would
+        # not help (the regex holds the GIL).
+        text = normalize_for_speech(text, parse_pronunciations(pronunciations))
 
     abort_ref = StreamAbortRef()
     backend_auth_resolver = audio_backend_auth_resolver(request)
