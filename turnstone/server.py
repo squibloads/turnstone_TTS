@@ -1675,27 +1675,13 @@ async def list_available_models(request: Request) -> JSONResponse:
 
 
 _STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation clips
-_TTS_TEXT_CAP = 8000  # characters per synthesis request
 
 
 def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
     """Bind one audio HTTP request to its authenticated model principal."""
-    from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
+    from turnstone.core.web_helpers import audio_backend_auth_resolver
 
-    principal_id = _auth_user_id(request).strip()
-    config_store = getattr(request.app.state, "config_store", None)
-    mint_client = get_model_token_client(request.app.state)
-
-    def _resolve(alias: str, config: Any) -> str | None:
-        return resolve_model_backend_auth_token(
-            alias,
-            config,
-            principal_id=principal_id,
-            config_store=config_store,
-            mint_client=mint_client,
-        )
-
-    return _resolve
+    return audio_backend_auth_resolver(request)
 
 
 class _AbortOnExitStreamingResponse(StreamingResponse):
@@ -1925,74 +1911,10 @@ async def speech_to_text_stream(request: Request) -> Response:
 
 async def text_to_speech(request: Request) -> Response:
     """POST /v1/api/tts — synthesize assistant text into playable audio."""
-    from turnstone.core.audio import (
-        AudioBackendError,
-        AudioUnavailableError,
-        resolve_role_alias,
-        synthesize,
-    )
-    from turnstone.core.deadline import StreamAbortRef
-    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
-    from turnstone.core.web_helpers import read_json_or_400
+    from turnstone.core.web_helpers import text_to_speech_response
 
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    text = str(body.get("text") or "").strip()
-    if not text:
-        return JSONResponse({"error": "text is required"}, status_code=400)
-    if len(text) > _TTS_TEXT_CAP:
-        return JSONResponse(
-            {"error": f"text too long (cap {_TTS_TEXT_CAP} chars)"}, status_code=400
-        )
-
-    registry = getattr(request.app.state, "registry", None)
-    config_store = getattr(request.app.state, "config_store", None)
-    alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
-    if not alias:
-        return JSONResponse(
-            {
-                "error": (
-                    "Text-to-speech is not configured. Assign a TTS model role in Models → Roles."
-                )
-            },
-            status_code=503,
-        )
-
-    voice = str(body.get("voice") or "").strip()
-    if not voice and config_store is not None:
-        voice = (config_store.get("audio.tts_voice") or "").strip()
-
-    abort_ref = StreamAbortRef()
-    backend_auth_resolver = _audio_backend_auth_resolver(request)
-    try:
-        # Blocking SDK round-trip — offload off the event loop.
-        speech = await asyncio.to_thread(
-            synthesize,
-            registry=registry,
-            alias=alias,
-            text=text,
-            voice=voice,
-            config_store=config_store,
-            backend_auth_resolver=backend_auth_resolver,
-            cancel_ref=abort_ref,
-        )
-    except BackendAuthUnavailableError:
-        log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
-        return JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
-    except AudioUnavailableError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=503)
-    except AudioBackendError as exc:
-        # Static body to the caller; backend SDK detail stays in the log.
-        log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
-        return JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
-    finally:
-        abort_ref.abort()
-
-    return Response(
-        speech.audio_bytes,
-        media_type=speech.media_type,
-        headers={"X-Model-Alias": speech.model_alias},
+    return await text_to_speech_response(
+        request, registry=getattr(request.app.state, "registry", None)
     )
 
 

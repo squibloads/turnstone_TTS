@@ -16,6 +16,8 @@ from starlette.responses import FileResponse, PlainTextResponse, Response
 from starlette.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from starlette.middleware import Middleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse
@@ -434,6 +436,119 @@ def auth_user_id(request: Request) -> str:
     """
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     return str(getattr(auth, "user_id", "") or "")
+
+
+TTS_TEXT_CAP = 8000  # characters per synthesis request
+
+
+def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
+    """Bind one audio HTTP request to its authenticated model principal.
+
+    Shared by node and console so a per-user OBO token is minted for the
+    *requesting* user on either process, never for a workstream owner.
+    """
+    from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
+    from turnstone.core.model_oauth import get_model_token_client
+
+    principal_id = auth_user_id(request).strip()
+    config_store = getattr(request.app.state, "config_store", None)
+    mint_client = get_model_token_client(request.app.state)
+
+    def _resolve(alias: str, config: Any) -> str | None:
+        return resolve_model_backend_auth_token(
+            alias,
+            config,
+            principal_id=principal_id,
+            config_store=config_store,
+            mint_client=mint_client,
+        )
+
+    return _resolve
+
+
+async def text_to_speech_response(request: Request, *, registry: Any | None) -> Response:
+    """Serve ``POST /v1/api/tts`` against *registry*.
+
+    The node and the console hold their model registries under different
+    ``app.state`` names (``registry`` / ``coord_registry``), so the caller
+    passes it in; everything else — validation, role resolution, error masking
+    — is one contract so coordinator read-aloud behaves exactly like a node's.
+    """
+    import asyncio
+
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.audio import (
+        AudioBackendError,
+        AudioUnavailableError,
+        resolve_role_alias,
+        synthesize,
+    )
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.log import get_logger
+    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+
+    log = get_logger(__name__)
+    body = await read_json_or_400(request)
+    if isinstance(body, _JSONResponse):
+        return body
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return _JSONResponse({"error": "text is required"}, status_code=400)
+    if len(text) > TTS_TEXT_CAP:
+        return _JSONResponse(
+            {"error": f"text too long (cap {TTS_TEXT_CAP} chars)"}, status_code=400
+        )
+
+    config_store = getattr(request.app.state, "config_store", None)
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
+    if not alias:
+        return _JSONResponse(
+            {
+                "error": (
+                    "Text-to-speech is not configured. Assign a TTS model role in Models → Roles."
+                )
+            },
+            status_code=503,
+        )
+
+    voice = str(body.get("voice") or "").strip()
+    if not voice and config_store is not None:
+        voice = (config_store.get("audio.tts_voice") or "").strip()
+
+    abort_ref = StreamAbortRef()
+    backend_auth_resolver = audio_backend_auth_resolver(request)
+    try:
+        # Blocking SDK round-trip — offload off the event loop.
+        speech = await asyncio.to_thread(
+            synthesize,
+            registry=registry,
+            alias=alias,
+            text=text,
+            voice=voice,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=abort_ref,
+        )
+    except BackendAuthUnavailableError:
+        log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
+        return _JSONResponse(
+            {"error": "Model backend authentication unavailable"}, status_code=503
+        )
+    except AudioUnavailableError as exc:
+        return _JSONResponse({"error": str(exc)}, status_code=503)
+    except AudioBackendError as exc:
+        # Static body to the caller; backend SDK detail stays in the log.
+        log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
+        return _JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
+    finally:
+        abort_ref.abort()
+
+    return Response(
+        speech.audio_bytes,
+        media_type=speech.media_type,
+        headers={"X-Model-Alias": speech.model_alias},
+    )
 
 
 def audit_context(request: Request) -> tuple[str, str]:
