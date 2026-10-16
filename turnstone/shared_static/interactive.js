@@ -3906,9 +3906,7 @@ class Pane {
 
   replayHistory(messages) {
     const scrollTop = this.messagesEl.scrollTop;
-    // The rebuild detaches the speaker button; playback would otherwise go on
-    // with no control left to stop it.
-    this._stopTTS();
+    this._stopTTS(); // the speaker button is about to be detached
     this.messagesEl.replaceChildren();
     // A full committed-history render repairs any recorded truncation
     // gap — from the resync itself or an unrelated clear_ui rebuild — so
