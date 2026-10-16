@@ -648,3 +648,37 @@ console.log(JSON.stringify({ during, aborted: first.opts.signal.aborted, active:
         "fetches": 1,
         "toasts": [],
     }
+
+
+def test_an_extraction_failure_shows_the_error_toast() -> None:
+    """The recursive walker can throw (RangeError on pathological nesting); that
+    must surface as a toast, not an unhandled rejection with no state change."""
+    out = _play(
+        """
+const btn = button();
+const bad = { querySelector: () => null, get childNodes() { throw new RangeError("too deeply nested"); } };
+let rejected = false;
+await T._playMessageTTS(bad, btn).catch(() => { rejected = true; });
+console.log(JSON.stringify({ rejected, toasts: log.toasts, active: T._ttsBtnActive,
+  busy: btn.cls.has("is-busy"), fetches: log.fetches.length }));
+"""
+    )
+    assert out == {
+        "rejected": False,
+        "toasts": [["too deeply nested", "error"]],
+        "active": None,
+        "busy": False,
+        "fetches": 0,
+    }
+
+
+def test_an_empty_reply_leaves_the_button_idle() -> None:
+    out = _play(
+        """
+const btn = button();
+await T._playMessageTTS(parse(""), btn);
+console.log(JSON.stringify({ active: T._ttsBtnActive, busy: btn.cls.has("is-busy"),
+  fetches: log.fetches.length, toasts: log.toasts }));
+"""
+    )
+    assert out == {"active": None, "busy": False, "fetches": 0, "toasts": []}

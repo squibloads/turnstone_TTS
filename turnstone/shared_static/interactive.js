@@ -3544,12 +3544,9 @@ class Pane {
       this._stopTTS();
       if (wasThis) return;
     }
-    const segments = this._extractSpeechSegments(
-      el.querySelector(".msg-body") || el,
-    );
-    if (!segments.length) return;
     // Serialize: _stopTTS bumps the token, so a superseded run notices at its
-    // next await and neither plays nor leaks a blob.
+    // next await and neither plays nor leaks a blob.  Taken before the try so
+    // the catch can tell a failure of this run from one a stop already ended.
     const token = ++this._ttsSeq;
     const abort = new AbortController();
     this._ttsAbort = abort;
@@ -3572,6 +3569,15 @@ class Pane {
       return r.blob();
     };
     try {
+      // Inside the try: the walker is recursive and can throw on pathological
+      // nesting, which must reach the toast rather than reject silently.
+      const segments = this._extractSpeechSegments(
+        el.querySelector(".msg-body") || el,
+      );
+      if (!segments.length) {
+        this._stopTTS();
+        return;
+      }
       let next = fetchClip(segments[0].text);
       for (let i = 0; i < segments.length; i++) {
         const blob = await next;
