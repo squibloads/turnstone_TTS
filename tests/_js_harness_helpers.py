@@ -205,7 +205,9 @@ def run_node_source(source: str, *, timeout: int = 15) -> subprocess.CompletedPr
         f.write(source)
         tmp = f.name
     try:
-        return subprocess.run(["node", tmp], capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(
+            ["node", tmp], capture_output=True, text=True, encoding="utf-8", timeout=timeout
+        )
     except FileNotFoundError:
         pytest.skip("node binary not available on PATH")
     finally:
