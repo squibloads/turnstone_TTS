@@ -29,7 +29,8 @@ _SIGS = (
     "_stopTTS() {",
 )
 _METHODS = ",\n".join(extract_braced(_SRC, sig) for sig in _SIGS)  # object-literal body
-# The real constructor and the two lifecycle methods that call _stopTTS(); the
+# The real constructor and the lifecycle methods that call _stopTTS() (reset,
+# replayHistory; disconnectSSE deliberately does not); the
 # player tests build their pane from these so a field the constructor fails to
 # initialise breaks them, as it blanked live transcripts on 2026-10-16.  The
 # constructor has non-ASCII comments and run_node_source writes the script in
@@ -147,7 +148,7 @@ function button() {
     setAttribute: (k, v) => { attrs[k] = v; },
   };
 }
-// Only what the real constructor, reset() and disconnectSSE() reach for is
+// Only what the real constructor, reset(), disconnectSSE() and replayHistory() reach for is
 // stubbed; every _tts* field comes from the constructor under test.
 let _paneCounter = 0;
 const INTERACTIVE_DEFAULT_HOST = {};
@@ -658,7 +659,7 @@ console.log(JSON.stringify({ toasts: log.toasts, created: log.created, revoked: 
 
 
 def test_real_pane_survives_reset_and_disconnect_before_any_playback() -> None:
-    """reset() and disconnectSSE() call _stopTTS() on every pane before any
+    """reset() and replayHistory() call _stopTTS() on every pane before any
     playback, so a field it touches that only the player assigns throws on
     history load and blanks the transcript (seen live 2026-10-16).  Build the
     pane from the shipped constructor rather than a pre-populated fake."""
