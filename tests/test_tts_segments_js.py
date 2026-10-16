@@ -97,7 +97,7 @@ function parse(html, cls) {
 """
 
 _PLAYER = r"""
-const log = { announce: 0, toasts: [], created: [], revoked: [], timers: [], audios: [], fetches: [] };
+const log = { announce: 0, toasts: [], created: [], revoked: [], timers: [], audios: [], srcs: [], fetches: [] };
 let authGen = 0;
 const authGeneration = () => authGen;
 let inFlight = 0, maxInFlight = 0, playMode = "ok", ignoreAbort = false;
@@ -109,15 +109,22 @@ URL.revokeObjectURL = (u) => { log.revoked.push(u); };
 globalThis.setTimeout = (fn, ms) => { const t = { fn, ms, cleared: false }; log.timers.push(t); return t; };
 globalThis.clearTimeout = (t) => { if (t) t.cleared = true; };
 globalThis.Audio = class {
-  constructor(url) { this.src = url; this.paused = false; this.l = {}; log.audios.push(this); }
-  addEventListener(n, f) { this.l[n] = f; }
+  constructor(url) {
+    this.paused = false; this.l = {}; log.audios.push(this);
+    if (url !== undefined) this.src = url;
+  }
+  get src() { return this._src; }
+  set src(v) { this._src = v; log.srcs.push(v); }
+  addEventListener(n, f) { (this.l[n] ||= new Set()).add(f); }
+  removeEventListener(n, f) { if (this.l[n]) this.l[n].delete(f); }
+  listeners() { return Object.values(this.l).reduce((a, set) => a + set.size, 0); }
   pause() { this.paused = true; }
   play() {
     if (playMode === "ok") return Promise.resolve();
     // playMode doubles as the DOMException name the browser would reject with.
     return Promise.reject(Object.assign(new Error("play() failed"), { name: playMode }));
   }
-  fire(n) { this.l[n](); }
+  fire(n) { [...(this.l[n] || [])].forEach((f) => f()); }
 };
 // Manual fetch: each call parks until the test settles it; honours abort unless
 // ignoreAbort is set, which models a reply already in flight when the run is
@@ -492,20 +499,20 @@ T._playMessageTTS(msg(), btn);
 await tick();
 const s0 = { fetches: log.fetches.length, busy: btn.cls.has("is-busy"), disabled: btn.disabled };
 log.fetches[0].reply(); await tick();
-const s1 = { fetches: log.fetches.length, audios: log.audios.length,
+const s1 = { fetches: log.fetches.length, audios: log.srcs.length,
   playing: btn.cls.has("is-playing"), busy: btn.cls.has("is-busy"),
   pressed: btn.attrs["aria-pressed"], announce: log.announce };
 log.audios[0].fire("ended"); await tick();
 // Clip 0 ended: its URL is gone, the 500 ms pause is pending, clip 1 has not started.
-const s2 = { audios: log.audios.length, timers: log.timers.map((t) => t.ms), revoked: [...log.revoked] };
+const s2 = { audios: log.srcs.length, timers: log.timers.map((t) => t.ms), revoked: [...log.revoked] };
 log.timers[0].fn(); await tick();
 // Pause over but fetch 1 still outstanding: wait for it.
-const s3 = { audios: log.audios.length };
+const s3 = { audios: log.srcs.length };
 log.fetches[1].reply(); await tick();
-const s4 = { audios: log.audios.length, fetches: log.fetches.length, announce: log.announce };
-log.audios[1].fire("ended"); await tick(); log.timers[1].fn(); await tick();
+const s4 = { audios: log.srcs.length, fetches: log.fetches.length, announce: log.announce };
+log.audios[0].fire("ended"); await tick(); log.timers[1].fn(); await tick();
 log.fetches[2].reply(); await tick();
-log.audios[2].fire("ended"); await tick();
+log.audios[0].fire("ended"); await tick();
 console.log(JSON.stringify({ s0, s1, s2, s3, s4, maxInFlight, timers: log.timers.map((t) => t.ms),
   texts: log.fetches.map((f) => f.text), url: log.fetches[0].url, method: log.fetches[0].opts.method,
   headers: log.fetches[0].opts.headers, revoked: log.revoked, announce: log.announce,
@@ -558,7 +565,7 @@ T._stopTTS();
 await tick();
 pending.reply(); await tick();
 console.log(JSON.stringify({ paused: log.audios[0].paused, aborted: pending.opts.signal.aborted,
-  audios: log.audios.length, fetches: log.fetches.length, created: log.created, revoked: log.revoked,
+  audios: log.srcs.length, fetches: log.fetches.length, created: log.created, revoked: log.revoked,
   playing: btn.cls.has("is-playing"), pressed: btn.attrs["aria-pressed"], toasts: log.toasts,
   inFlight }));
 """
@@ -588,7 +595,7 @@ log.audios[0].fire("ended"); await tick();
 const timer = log.timers[0];
 T._stopTTS();
 timer.fn(); await tick();
-console.log(JSON.stringify({ cleared: timer.cleared, audios: log.audios.length,
+console.log(JSON.stringify({ cleared: timer.cleared, audios: log.srcs.length,
   fetches: log.fetches.length, created: log.created, revoked: log.revoked }));
 """
     )
@@ -610,13 +617,13 @@ const stale = log.fetches[0];
 T._playMessageTTS(msg(), b);            // another button supersedes run A
 await tick();
 stale.reply(); await tick();             // A's late reply must not play or leak
-const afterStale = { audios: log.audios.length, created: log.created.length,
+const afterStale = { audios: log.srcs.length, created: log.created.length,
   aBusy: a.cls.has("is-busy"), aDisabled: a.disabled, bBusy: b.cls.has("is-busy") };
 log.fetches[1].reply(); await tick();
 T._playMessageTTS(msg(), b);            // clicking the active button stops
 await tick();
-console.log(JSON.stringify({ afterStale, audios: log.audios.length, fetches: log.fetches.length,
-  active: T._ttsBtnActive, paused: log.audios[0].paused, revoked: log.revoked }));
+console.log(JSON.stringify({ afterStale, audios: log.srcs.length, fetches: log.fetches.length,
+  active: T._ttsBtnActive, paused: log.audios[1].paused, revoked: log.revoked }));
 """
     )
     assert out["afterStale"] == {
@@ -647,8 +654,8 @@ T._playMessageTTS(msg(), btn); await tick();
 log.fetches[1].reply(); await tick();             // clip 0 plays, clip 1 is prefetched
 log.fetches[2].fail("network down"); await tick();
 // The failure is held until the next clip is due: the current clip is not cut off.
-res.during = { toasts: log.toasts.length, paused: log.audios[0].paused };
-log.audios[0].fire("ended"); await tick(); log.timers[0].fn(); await tick();
+res.during = { toasts: log.toasts.length, paused: log.audios[1].paused };
+log.audios[1].fire("ended"); await tick(); log.timers[0].fn(); await tick();
 res.network = { toasts: [...log.toasts], audio: T._ttsAudio, active: T._ttsBtnActive,
   playing: btn.cls.has("is-playing") };
 console.log(JSON.stringify(res));
@@ -683,7 +690,7 @@ const first = {{ toasts: [...log.toasts], active: T._ttsBtnActive, busy: btn.cls
 T._playMessageTTS(msg(), btn); await tick();
 log.fetches[1].reply(); await tick();
 log.fetches[2].fail({json.dumps(sentinel)}); await tick();         // the prefetch fails while clip 0 plays
-log.audios[0].fire("ended"); await tick(); log.timers[0].fn(); await tick();
+log.audios[1].fire("ended"); await tick(); log.timers[0].fn(); await tick();
 console.log(JSON.stringify({{ first, toasts: log.toasts, active: T._ttsBtnActive,
   playing: btn.cls.has("is-playing") }}));
 """
@@ -700,7 +707,7 @@ T._playMessageTTS(msg(), btn); await tick();
 log.fetches[0].reply(); await tick();
 authGen++;  // another account signed in while clip 0 plays
 log.audios[0].fire("ended"); await tick(); log.timers[0].fn(); await tick();
-console.log(JSON.stringify({ audios: log.audios.length, fetches: log.fetches.length,
+console.log(JSON.stringify({ audios: log.srcs.length, fetches: log.fetches.length,
   fetch1Aborted: log.fetches[1] ? log.fetches[1].done : null,
   playing: btn.cls.has("is-playing"), active: T._ttsBtnActive, toasts: log.toasts }));
 """
@@ -723,7 +730,7 @@ log.audios[0].fire("ended"); await tick();
 log.timers[0].fn(); await tick();
 authGen++;                       // the login changes while clip 1 is still fetching
 log.fetches[1].reply(); await tick();
-console.log(JSON.stringify({ audios: log.audios.length, created: log.created.length,
+console.log(JSON.stringify({ audios: log.srcs.length, created: log.created.length,
   playing: btn.cls.has("is-playing"), active: T._ttsBtnActive, toasts: log.toasts }));
 """
     )
@@ -788,6 +795,37 @@ console.log(JSON.stringify({{ missing }}));
     assert out == {"missing": []}
 
 
+def test_one_audio_element_is_made_in_the_click_and_reused_for_every_clip() -> None:
+    """iOS Safari only lets an element that was unlocked inside the user's
+    gesture play later from a timer or an await, so the element is created
+    synchronously in the click handler and each clip just swaps its src."""
+    out = _play(
+        """
+const btn = button();
+T._playMessageTTS(msg(), btn);
+const atClick = log.audios.length;       // before the first await settles
+await tick(); log.fetches[0].reply(); await tick();
+const clip0 = { src: log.audios[0].src, listeners: log.audios[0].listeners() };
+log.audios[0].fire("ended"); await tick(); log.timers[0].fn(); await tick();
+log.fetches[1].reply(); await tick();
+const clip1 = { src: log.audios[0].src, listeners: log.audios[0].listeners() };
+log.audios[0].fire("ended"); await tick(); log.timers[1].fn(); await tick();
+log.fetches[2].reply(); await tick();
+log.audios[0].fire("ended"); await tick();
+console.log(JSON.stringify({ atClick, elements: log.audios.length, srcs: log.srcs, clip0, clip1,
+  listeners: log.audios[0].listeners(), revoked: log.revoked, toasts: log.toasts }));
+"""
+    )
+    assert out["atClick"] == 1 and out["elements"] == 1
+    assert out["srcs"] == ["blob:0", "blob:1", "blob:2"]
+    # Per-clip handlers are removed, not stacked on the shared element.
+    assert out["clip0"] == {"src": "blob:0", "listeners": 2}
+    assert out["clip1"] == {"src": "blob:1", "listeners": 2}
+    assert out["listeners"] == 0
+    assert out["revoked"] == ["blob:0", "blob:1", "blob:2"]
+    assert out["toasts"] == []
+
+
 def test_a_prefetched_clip_is_a_blob_until_it_plays() -> None:
     out = _play(
         """
@@ -795,10 +833,10 @@ const btn = button();
 T._playMessageTTS(msg(), btn);
 await tick(); log.fetches[0].reply(); await tick();
 log.fetches[1].reply(); await tick();          // clip 1 arrives while clip 0 plays
-const whilePlaying = { created: [...log.created], audios: log.audios.length };
+const whilePlaying = { created: [...log.created], audios: log.srcs.length };
 log.audios[0].fire("ended"); await tick(); log.timers[0].fn(); await tick();
 console.log(JSON.stringify({ whilePlaying, created: log.created, revoked: log.revoked,
-  src: log.audios[1].src }));
+  src: log.audios[0].src }));
 """
     )
     assert out["whilePlaying"] == {"created": ["blob:0"], "audios": 1}
@@ -900,7 +938,7 @@ const during = { busy: btn.cls.has("is-busy"), disabled: btn.disabled };
 T._playMessageTTS(msg(), btn); await tick();   // the click lands while the first clip is pending
 first.reply(); await tick();
 console.log(JSON.stringify({ during, aborted: first.opts.signal.aborted, active: T._ttsBtnActive,
-  busy: btn.cls.has("is-busy"), audios: log.audios.length, fetches: log.fetches.length, toasts: log.toasts }));
+  busy: btn.cls.has("is-busy"), audios: log.srcs.length, fetches: log.fetches.length, toasts: log.toasts }));
 """
     )
     assert out == {
@@ -993,11 +1031,11 @@ const toastsAtStart = [...log.toasts];
 for (let i = 0; ; i++) {
   if (!log.fetches[i]) break;
   log.fetches[i].reply(); await tick();
-  log.audios[i].fire("ended"); await tick();
+  log.audios[0].fire("ended"); await tick();
   if (log.timers[i]) log.timers[i].fn();
   await tick();
 }
-console.log(JSON.stringify({ toastsAtStart, fetches: log.fetches.length, audios: log.audios.length,
+console.log(JSON.stringify({ toastsAtStart, fetches: log.fetches.length, audios: log.srcs.length,
   last: log.fetches[log.fetches.length - 1].text, timers: log.timers.length, toasts: log.toasts, active: T._ttsBtnActive }));
 """
     )

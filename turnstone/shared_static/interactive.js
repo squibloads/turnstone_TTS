@@ -3684,6 +3684,11 @@ class Pane {
     this._ttsBtnActive = btn;
     // Not disabled: a click during the first fetch must still stop the run.
     btn.classList.add("is-busy");
+    // One element for the whole run, made here while the click's user gesture
+    // is still live: iOS Safari lets only an element unlocked by a gesture play
+    // later from an await or a timer, so each clip swaps its src rather than
+    // constructing a new Audio.
+    const audio = new Audio();
     // Many self-hosted backends synthesize one request at a time, so exactly
     // one fetch is ever in flight: clip i+1 is requested once clip i starts.
     const fetchClip = async (text) => {
@@ -3743,7 +3748,6 @@ class Pane {
         // Minted only now so a prefetched clip holds no object URL; _stopTTS
         // revokes the playing clip's, the "ended" path below the finished one.
         const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
         this._ttsAudio = audio;
         if (i === 0) {
           btn.classList.remove("is-busy");
@@ -3754,16 +3758,25 @@ class Pane {
         // A stopped clip never fires "ended", so a stopped run just stays
         // parked here (and at the pause below) until it is collected.
         await new Promise((resolve, reject) => {
-          audio.addEventListener("ended", resolve);
-          audio.addEventListener("error", () =>
-            reject(new Error("Audio playback failed")),
-          );
+          // The element outlives the clip, so this clip's handlers come off
+          // when it settles instead of stacking up on the next one.
+          const settle = (fn, arg) => {
+            audio.removeEventListener("ended", onEnded);
+            audio.removeEventListener("error", onError);
+            fn(arg);
+          };
+          const onEnded = () => settle(resolve);
+          const onError = () => settle(reject, new Error("Audio playback failed"));
+          audio.addEventListener("ended", onEnded);
+          audio.addEventListener("error", onError);
+          audio.src = url;
           // NotAllowedError is the autoplay policy; anything else (an
           // undecodable clip) must not be blamed on the browser.
           audio
             .play()
             .catch((e) =>
-              reject(
+              settle(
+                reject,
                 new Error(
                   e && e.name === "NotAllowedError"
                     ? "Playback was blocked by the browser"
