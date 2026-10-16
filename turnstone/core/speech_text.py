@@ -43,10 +43,16 @@ if TYPE_CHECKING:
 def _speak_version(match: re.Match[str]) -> str:
     text = match.group(0)
     parts = text.split(".")
-    # 1.000.000 is a number with thousands separators, not a version.  Exactly
+    # 1.000.000 is a number with thousands separators (German format), not a
+    # version: a 1-3 digit lead and exactly two groups of three digits.  Read the
+    # dots literally, since "point" would make it sound like a decimal.  Exactly
     # two dots: an address such as 192.168.100.203 is still read as points.
-    if len(parts) == 3 and all(len(p) == 3 and p.isdigit() for p in parts[1:]):
-        return text
+    if (
+        len(parts) == 3
+        and 1 <= len(parts[0]) <= 3
+        and all(len(p) == 3 and p.isdigit() for p in parts[1:])
+    ):
+        return text.replace(".", " dot ")
     # 2026.10.16 is a dotted date, left raw like 16.10.2026.
     if re.fullmatch(r"\d{4}\.\d{1,2}\.\d{1,2}", text):
         return text

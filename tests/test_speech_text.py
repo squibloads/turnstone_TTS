@@ -73,6 +73,16 @@ RULE_CASES: list[tuple[str, str]] = [
     ("1.8.5", "1 point 8 point 5"),
     ("v1.9.0", "version 1 point 9 point 0"),
     ("version 1.2.3.4", "version 1 point 2 point 3 point 4"),
+    ("3.12.1", "3 point 12 point 1"),
+    ("1.100.20", "1 point 100 point 20"),
+    # dotted thousands (German format) read with literal dots
+    ("written 1.000.000 in German format", "written 1 dot 000 dot 000 in German format"),
+    ("12.500.000", "12 dot 500 dot 000"),
+    ("123.456.789", "123 dot 456 dot 789"),
+    ("It was 1.000.000.", "It was 1 dot 000 dot 000."),
+    ("About 1.000.000 rows.", "About 1 dot 000 dot 000 rows."),
+    ("1.100.200", "1 dot 100 dot 200"),
+    ("1.000.000.000", "1 point 000 point 000 point 000"),
     # abbreviations
     ("e.g. this", "for example this"),
     ("i.e. that", "that is that"),
@@ -177,7 +187,7 @@ def test_idempotent(src: str, _expected: str) -> None:
         "The .30-06 rifle.",
         "30-06",
         "Dated 16.10.2026 here.",
-        "About 1.000.000 rows.",
+        "About 1,000,000 rows.",
         "Call 1-800-555-1234 now",
         "Moved to 1600 W 13th Ave",
         "2026-02-31",
@@ -308,6 +318,10 @@ def _elapsed(text: str) -> float:
 
 def test_timing_long_whitespace_run() -> None:
     assert _elapsed("a" + " " * 49_998 + "b") < 1.0
+
+
+def test_timing_repeated_dotted_thousands() -> None:
+    assert _elapsed("1.000." * 8_334) < 0.1
 
 
 def test_timing_long_dotted_chain() -> None:
