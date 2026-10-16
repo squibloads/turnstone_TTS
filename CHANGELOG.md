@@ -261,7 +261,7 @@ frozen.
 ### Changed
 
 - **Read-aloud speaks a reply one block at a time** — headings, paragraphs and table rows
-  are each read as their own clip with a pause after them (a whole list is one clip, see below), instead of
+  are each read as their own clip with a pause after them (a heading or paragraph under 20 characters joins the clip that follows and takes no pause of its own; a whole list is one clip, see below), instead of
   running into the next sentence, and a code block is replaced by "Code omitted." (consecutive blocks by one marker). Inline code of
   40 or more characters is replaced the same way; shorter inline code is read aloud. A reply is read
   up to its first 200 clips, with a toast saying the rest was skipped. Playback starts as soon as the first clip is
