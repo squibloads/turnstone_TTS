@@ -176,8 +176,11 @@ def _run(prelude: str, body: str) -> Any:
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+_T_PRELUDE = "const T = {\n" + _METHODS + "\n};\n"
+
+
 def _extract(*htmls: str) -> list[list[dict[str, Any]]]:
-    prelude = _DOM + "const T = {\n" + _METHODS + "\n};\n"
+    prelude = _DOM + _T_PRELUDE
     body = f"console.log(JSON.stringify({json.dumps(list(htmls))}.map((h) => T._extractSpeechSegments(parse(h)))));"
     return _run(prelude, body)
 
@@ -254,6 +257,28 @@ def test_a_long_list_splits_at_item_ends_with_no_pause_between_clips() -> None:
     assert all(len(r["text"]) <= 600 for r in rows)
     assert " ".join(r["text"] for r in rows[:2]) == " ".join(["x" * 99 + "."] * 10)
     assert [r["pauseMs"] for r in rows] == [0, 0, 0]
+
+
+def test_a_huge_list_extracts_in_linear_time() -> None:
+    """Model output can degenerate into tens of thousands of list items, and
+    extraction runs synchronously inside the click.  Each item used to re-scan
+    the whole accumulated list (1.5 s at 20,000 items); the time is taken
+    inside node, around the extractor alone."""
+    n = 20_000
+    out = _run(
+        _DOM + _T_PRELUDE,
+        f"""
+const root = parse("<ul>" + "<li>a</li>".repeat({n}) + "</ul>");
+const t0 = performance.now();
+const segs = T._extractSpeechSegments(root);
+const ms = performance.now() - t0;
+console.log(JSON.stringify({{ ms, count: segs.length, longest: Math.max(...segs.map((s) => s.text.length)),
+  words: segs.map((s) => s.text).join(" ").split(" ").length }}));
+""",
+    )
+    print(f"extract of {n} list items: {out['ms']:.1f} ms")
+    assert out["ms"] < 200
+    assert out["words"] == n and out["longest"] <= 600
 
 
 def test_table_rows_join_cells_with_commas() -> None:

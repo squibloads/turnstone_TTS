@@ -3451,27 +3451,75 @@ class Pane {
       TR: 150,
     };
     const raw = [];
+    // A segment keeps its text as parts plus a count of non-space characters,
+    // so the list and cell logic below looks only at the tail and never
+    // re-flattens the whole accumulated text (a degenerate reply can be tens of
+    // thousands of list items).
+    const newSeg = (pauseMs, extra) => {
+      const seg = { parts: [], sig: 0, marker: false, pauseMs, ...extra };
+      raw.push(seg);
+      return seg;
+    };
+    const put = (seg, str, isMarker) => {
+      const n = str.replace(/\s+/g, "").length;
+      const p = seg.parts;
+      if (!n && p.length && !p[p.length - 1].trim()) p[p.length - 1] += str;
+      else p.push(str);
+      if (n) {
+        seg.sig += n;
+        seg.marker = !!isMarker;
+      }
+    };
+    const trimEnd = (seg) => {
+      const p = seg.parts;
+      while (p.length) {
+        const t = p[p.length - 1].trimEnd();
+        if (t) {
+          p[p.length - 1] = t;
+          return;
+        }
+        p.pop();
+      }
+    };
+    const tail = (seg, n) => {
+      let t = "";
+      for (let i = seg.parts.length - 1; i >= 0 && t.length < n; i--) {
+        t = seg.parts[i].slice(-(n - t.length)) + t;
+      }
+      return t;
+    };
     let cur = null; // segment taking inline text; null until the next text
     let listDepth = 0; // inside a list everything folds into the one list row
     // Written with hex escapes for the quote characters; see _shapeSpeechSegments.
-    const ENDS = /[.!?:\u2026][\x22\x27)\]\u201d\u2019]*$/;
+    const ENDS = /[.!?:…][\x22\x27)\]”’]*$/;
     const itemBreak = () => {
-      const t = cur.text.trimEnd().replace(/,$/, "");
-      if (!t.trim()) return;
-      cur.text = t + (ENDS.test(t) ? " " : ". ");
+      // Looked at before anything is trimmed: a blank item leaves the text as is.
+      const p = cur.parts;
+      let i = p.length - 1;
+      while (i >= 0 && !p[i].trim()) i--;
+      const comma = i >= 0 && p[i].trimEnd().endsWith(",");
+      if (cur.sig - (comma ? 1 : 0) <= 0) return;
+      trimEnd(cur);
+      if (comma) {
+        p[p.length - 1] = p[p.length - 1].slice(0, -1);
+        cur.sig--;
+      }
+      put(cur, ENDS.test(tail(cur, 16)) ? " " : ". ");
     };
     // A cell after the first sets cellSep; the ", " is written only once the
     // cell has text, so an empty cell adds no separator and padding around
     // the cell text does not leave "Plan , Price".
     let cellSep = false;
-    const addText = (str) => {
-      if (!cur) raw.push((cur = { text: "", pauseMs: 500 }));
+    const addText = (str, isMarker) => {
+      if (!cur) cur = newSeg(500);
       if (!cellSep) {
-        cur.text += str;
+        put(cur, str, isMarker);
         return;
       }
       if (!str.trim()) return;
-      cur.text = cur.text.trimEnd() + ", " + str.trimStart();
+      trimEnd(cur);
+      put(cur, ", ");
+      put(cur, str.trimStart(), isMarker);
       cellSep = false;
     };
     const walk = (node) => {
@@ -3484,19 +3532,18 @@ class Pane {
         const cls = child.classList;
         if (cls.contains("katex") || cls.contains("katex-display")) continue;
         if (child.tagName === "CODE" && child.textContent.length >= INLINE_CODE_MAX) {
-          if (!/Code omitted\.\s*$/.test(cur ? cur.text : "")) addText(" Code omitted. ");
+          if (!(cur && cur.marker)) addText(" Code omitted. ", true);
           continue;
         }
         if (child.tagName === "PRE") {
-          raw.push({ text: "Code omitted.", pauseMs: 400, code: true });
-          cur = listDepth ? { text: "", pauseMs: 0 } : null;
-          if (cur) raw.push(cur);
+          put(newSeg(400, { code: true }), "Code omitted.");
+          cur = listDepth ? newSeg(0) : null;
           continue;
         }
         const tag = child.tagName;
         if (tag === "UL" || tag === "OL" || tag === "DL") {
           if (listDepth) itemBreak();
-          else raw.push((cur = { text: "", pauseMs: 0 }));
+          else cur = newSeg(0);
           listDepth++;
           walk(child);
           listDepth--;
@@ -3511,14 +3558,14 @@ class Pane {
           continue;
         }
         const isCell = child.tagName === "TD" || child.tagName === "TH";
-        if (isCell && cur && cur.text.trim()) cellSep = true;
+        if (isCell && cur && cur.sig > 0) cellSep = true;
         const pauseMs = PAUSE[child.tagName];
         if (pauseMs === undefined) {
           walk(child);
           continue;
         }
         cellSep = false;
-        raw.push((cur = { text: "", pauseMs, table: child.tagName === "TR" }));
+        cur = newSeg(pauseMs, { table: child.tagName === "TR" });
         walk(child);
         cur = null; // a nested block ends this one; later text starts anew
       }
@@ -3526,7 +3573,9 @@ class Pane {
     walk(bodyEl);
     // Plain text (no block structure) is shaped like any other reply, so the
     // clip cap applies to it too.
-    return this._shapeSpeechSegments(raw);
+    return this._shapeSpeechSegments(
+      raw.map((s) => ({ text: s.parts.join(""), pauseMs: s.pauseMs, code: s.code, table: s.table })),
+    );
   }
 
   // Normalise raw block text into clips a TTS model reads well: terminal
