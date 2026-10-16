@@ -235,6 +235,13 @@ def test_a_short_lead_in_paragraph_carries_into_the_list_clip() -> None:
     ]
 
 
+def test_a_short_lead_in_folds_into_the_first_table_row_only() -> None:
+    assert _segs(
+        "<p>Choose a plan:</p><table><tr><th>Plan</th><th>Price</th></tr>"
+        "<tr><td>Pro</td><td>$9</td></tr></table>"
+    ) == [("Choose a plan: Plan, Price.", 150), ("Pro, $9.", 0)]
+
+
 def test_nested_list_items_join_the_one_list_clip() -> None:
     assert _segs(
         "<ul><li>Parent item text here<ul><li>Child item one is here</li>"
