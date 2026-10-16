@@ -7,8 +7,9 @@ backend at once, which is why this is a small ordered rule table rather than
 anything model-specific.
 
 Design rules: cover the common 95% and leave text alone when unsure; every rule
-is idempotent so normalising twice equals normalising once; plain prose without
-symbols passes through unchanged.
+in the table is idempotent (its output is not rewritten by the table again); the
+respellings are applied once and their output is not rescanned; plain prose
+without symbols passes through unchanged.
 
 Deliberately skipped (do not add without a measured need):
 
@@ -36,15 +37,27 @@ if TYPE_CHECKING:
 
 def _speak_version(match: re.Match[str]) -> str:
     text = match.group(0)
-    # 1.000.000 is a number with thousands separators, not a version.
-    if all(len(p) == 3 and p.isdigit() for p in text.split(".")[1:]):
+    parts = text.split(".")
+    # 1.000.000 is a number with thousands separators, not a version.  Exactly
+    # two dots: an address such as 192.168.100.203 is still read as points.
+    if len(parts) == 3 and all(len(p) == 3 and p.isdigit() for p in parts[1:]):
+        return text
+    # 2026.10.16 is a dotted date, left raw like 16.10.2026.
+    if re.fullmatch(r"\d{4}\.\d{1,2}\.\d{1,2}", text):
         return text
     return text.replace(".", " point ")
 
 
+# Characters looked back for a decade cue or an earlier decade: enough for
+# "the 80s, " and it keeps every step a constant-size scan.
+_DECADE_WINDOW = 24
+# Decades walked back along a list; a cue further than this is not searched for,
+# so the ninth item of a cued list is read as seconds.
+_DECADE_MAX_STEPS = 8
+
 _DECADE_CUE = re.compile(r"(?:\b(?:the|early|mid|late)[\s-]+|')$", re.IGNORECASE)
 _DECADE_BEFORE = re.compile(
-    r"(?<![\w.])(\d0|\d{3}0)s(?:\s*,\s*|\s+(?:and|or|to|through)\s+)$", re.IGNORECASE
+    r"(?<![\w.])(\d0|\d{3}0)s(?:\s*[,\-–]\s*|\s+(?:and|or|to|through)\s+)$", re.IGNORECASE
 )
 
 
@@ -58,12 +71,12 @@ def _is_decade(text: str, start: int, number: str) -> bool:
     90s").  A bare "60s" in a technical reply is a timeout far more often than
     an era.
     """
-    for _ in range(8):  # decade lists are short; this bounds the walk back
+    for _ in range(_DECADE_MAX_STEPS):
         if len(number) == 4:
             return re.fullmatch(r"1\d\d0|20\d0", number) is not None
         if len(number) != 2 or not number.endswith("0"):
             return False
-        before = text[max(0, start - 24) : start]
+        before = text[max(0, start - _DECADE_WINDOW) : start]
         if _DECADE_CUE.search(before):
             return True
         previous = _DECADE_BEFORE.search(before)
@@ -116,33 +129,34 @@ _TECH_TERMS = {
 
 
 # Ordered (pattern, replacement); a replacement is a string or a callback.
-# Order matters: ``GB/s`` before ``GB`` and ``s``.  The two version rows stay at
-# the head so no later rule (ranges, units, "x") can eat their digits.
+# Order matters: ``GB/s`` before ``GB`` and ``s``.  Phone numbers, ISO dates, file
+# names and the version rows come first so no later rule (ranges, units, "x")
+# can eat their digits.
 _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = tuple(
     (re.compile(pattern), repl)
     for pattern, repl in (
         # ten-digit phone numbers and ISO dates first: later rules would read
         # their parts as ranges or versions
         (
-            r"(?<![\w.(-])(?:\+?1[\s.-])?\(?(\d{3})\)?[\s.-]?(\d{3})[\s.-](\d{4})(?![\w.-])",
+            r"(?<![\w.(-])\(?(\d{3})\)?[\s.-]?(\d{3})[\s.-](\d{4})(?![\w-]|\.\w)",
             _speak_phone,
         ),
         (
-            r"(?<![\w.-])(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?![\w.-])",
+            r"(?<![\w.-])(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?![\w-]|\.\w)",
             _speak_iso_date,
         ),
         # file names with a common extension: "speech_text.py" is "speech_text dot py"
         (
-            r"(?<![\w.])([A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*)"
-            r"\.(py|js|mjs|ts|tsx|jsx|md|json|ya?ml|toml|txt|sh|html|css|sql|csv|log|ini|cfg"
-            r"|rs|go|java|rb|php)\b",
+            r"(?<![\w.])([A-Za-z_][\w-]{0,63}(?:\.[A-Za-z_][\w-]{0,63})*)"
+            r"\.((?i:py|js|mjs|ts|tsx|jsx|md|json|ya?ml|toml|txt|sh|html|css|sql|csv|log|ini|cfg"
+            r"|rs|go|java|rb|php))\b",
             "\\1 dot \\2",
         ),
         # versions: 3+ dotted parts only (two-part decimals like "13.9" read fine).
         # The possessive group keeps long dotted chains linear and the date guard
         # leaves 16.10.2026 alone.
         (r"\bv(?=\d+(?:\.\d+){2,})", "version "),
-        (r"(?<![\w.])\d+(?:\.\d+){2,}+(?<!\.\d{4})(?![\w.]*\d)", _speak_version),
+        (r"(?<![\w.])\d+(?:\.\d+){2,}+(?<!\.\d{4})(?![\w.]*\d|-\d)", _speak_version),
         # symbols
         (r"~\s*(?=\d)", "about "),
         # lookbehind + possessive tail stop quadratic backtracking on long blanks
@@ -165,14 +179,15 @@ _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...]
         (r"(?<=\d)\s*MHz\b", " megahertz"),
         (r"(?<=\d)\s*ms\b", " milliseconds"),
         (r"(?<=\d)\s*min\b", " minutes"),
-        (r"(?<=\d)\s*W\b", " watts"),
+        # "300 W" is watts, "123 W Main Street" is a compass point
+        (r"(?<=\d)W\b|(?<=\d)\s+W\b(?!\s+[A-Z])", " watts"),
         # "13.9 s", "3s" and "60s" are seconds; "1990s" and "the 80s" are decades
         # (see _is_decade).  Not inside a word: "k8s" stays.
         (r"(?<=\d)\s+s\b", " seconds"),
         (r"(?<![\w.])(\d+(?:\.\d+)?)s\b", _seconds_unless_decade),
         # numeric ranges, but not dates (2026-10-16), version/decimal tails,
         # identifiers (Qwen3-8B) or calibers (30-06: a right side starting 0)
-        (r"(?<![\w.-])(\d+)-(?!0)(\d+)(?![\w.-])", "\\1 to \\2"),
+        (r"(?<![\w.-])(\d+)-(?!0)(\d+)(?![\w-]|\.\w)", "\\1 to \\2"),
         # abbreviations
         (r"\be\.g\.", "for example"),
         (r"\bi\.e\.", "that is"),
@@ -184,13 +199,20 @@ _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...]
 )
 
 
+# Bound per-request cost: the setting is admin text, but it is compiled into a
+# regex on every read-aloud call.
+_MAX_PRONUNCIATIONS = 200
+_MAX_RESPELLING_CHARS = 100
+
+
 def parse_pronunciations(raw: str) -> dict[str, str]:
     """Parse ``word = respelling`` lines into a mapping.
 
     Operators edit this as free text in a settings box, so bad input must
     degrade to "that line is ignored" rather than an exception that would
     break read-aloud.  Blank lines, ``#`` comments and lines missing a key or
-    a respelling are skipped.
+    a respelling are skipped, as are respellings over 100 characters and every
+    word after the first 200.  A later line for the same word wins.
     """
     out: dict[str, str] = {}
     for line in raw.splitlines():
@@ -199,8 +221,11 @@ def parse_pronunciations(raw: str) -> dict[str, str]:
             continue
         key, _, value = line.partition("=")
         key, value = key.strip(), value.strip()
-        if key and value:
-            out[key] = value
+        if not key or not value or len(value) > _MAX_RESPELLING_CHARS:
+            continue
+        if key not in out and len(out) >= _MAX_PRONUNCIATIONS:
+            continue
+        out[key] = value
     return out
 
 
@@ -210,15 +235,12 @@ def _apply_pronunciations(text: str, pronunciations: Mapping[str, str]) -> str:
     One alternation (longest key first) keeps a respelling from being
     re-substituted by another key, so the result does not depend on dict order.
     """
-    folded_keys: list[str] = []
-    values: list[str] = []
-    seen: set[str] = set()
-    for key, value in sorted(pronunciations.items(), key=lambda kv: len(kv[0]), reverse=True):
-        folded = key.lower()
-        if key and folded not in seen:
-            seen.add(folded)
-            folded_keys.append(folded)
-            values.append(value)
+    # The only caller passes lower-cased, unique, non-empty keys (a later
+    # duplicate line already won in ``parse_pronunciations``), so there is
+    # nothing to fold or dedupe here.
+    ordered = sorted(pronunciations.items(), key=lambda kv: len(kv[0]), reverse=True)
+    folded_keys = [key for key, _ in ordered]
+    values = [value for _, value in ordered]
     if not values:
         return text
     # One capturing group per key: the group index names the value directly, so

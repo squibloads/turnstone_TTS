@@ -91,6 +91,22 @@ RULE_CASES: list[tuple[str, str]] = [
     ("call 555-123-4567", "call 5 5 5, 1 2 3, 4 5 6 7"),
     ("call (555) 123-4567", "call 5 5 5, 1 2 3, 4 5 6 7"),
     ("call 555.123.4567", "call 5 5 5, 1 2 3, 4 5 6 7"),
+    # a "+1" is left as the digits it is; only the ten-digit body is grouped
+    ("call +1 555 123 4567", "call +1 5 5 5, 1 2 3, 4 5 6 7"),
+    # a sentence-final full stop is punctuation, not part of the token
+    ("Released 2026-10-16.", "Released October 16th, 2026."),
+    ("Call 555-123-4567.", "Call 5 5 5, 1 2 3, 4 5 6 7."),
+    ("It takes 10-20.", "It takes 10 to 20."),
+    # file names: bounded segments, case-insensitive extension, leading dashes
+    ("run --config.toml", "run --config dot toml"),
+    ("open speech-text.py", "open speech-text dot py"),
+    ("edit config.YAML now", "edit config dot yammel now"),
+    ("edit Config.JSON now", "edit Config dot jay-son now"),
+    # W is watts after a number, but "123 W Main Street" is a compass point
+    ("300 W and more", "300 watts and more"),
+    # a four-part-or-longer version still reads as points
+    ("on 192.168.100.203", "on 192 point 168 point 100 point 203"),
+    ("on 192.168.1.203", "on 192 point 168 point 1 point 203"),
     # file names with a common extension
     ("open speech_text.py now", "open speech_text dot py now"),
     ("see README.md and app.config.ts", "see README dot md and app.config dot ts"),
@@ -133,6 +149,16 @@ def test_idempotent(src: str, _expected: str) -> None:
         "30-06",
         "Dated 16.10.2026 here.",
         "About 1.000.000 rows.",
+        "Call 1-800-555-1234 now",
+        "2026-10-16.5",
+        "555-123-4567.5",
+        "pages 10-20.5 ok",
+        "logged at 2026-10-16T12:00:00Z",
+        "Read 2026.10.16 in the log.",
+        "openssl 3.0.2-1 installed",
+        "123 W Main Street",
+        "the 80s-90s",
+        "the 80s–90s",
     ],
 )
 def test_plain_prose_unchanged(text: str) -> None:
@@ -173,6 +199,18 @@ def test_empty_string() -> None:
     assert normalize_for_speech("") == ""
 
 
+def test_cued_eight_item_decade_list_stays_decades() -> None:
+    text = "the 10s, 20s, 30s, 40s, 50s, 60s, 70s, 80s"
+    assert normalize_for_speech(text) == text
+
+
+def test_decade_list_past_the_walk_bound_reads_the_tail_as_seconds() -> None:
+    # The cue is more than eight decades back, so the ninth is given up on
+    # rather than searched for: documented, bounded behaviour.
+    text = "the 10s, 20s, 30s, 40s, 50s, 60s, 70s, 80s, 90s"
+    assert normalize_for_speech(text) == text.removesuffix("90s") + "90 seconds"
+
+
 class TestPronunciations:
     def test_case_insensitive_whole_word(self) -> None:
         out = normalize_for_speech("Turnstone and turnstones", {"turnstone": "turn stone"})
@@ -193,6 +231,20 @@ class TestPronunciations:
     def test_parse(self) -> None:
         raw = "\n# comment\nGPU = gee pee you\n\nnoequals\n = empty\nkey =\nSQL=sequel\n"
         assert parse_pronunciations(raw) == {"GPU": "gee pee you", "SQL": "sequel"}
+
+    def test_parse_keeps_first_200_entries(self) -> None:
+        raw = "\n".join(f"w{i} = r{i}" for i in range(250))
+        parsed = parse_pronunciations(raw)
+        assert len(parsed) == 200
+        assert "w199" in parsed
+        assert "w200" not in parsed
+
+    def test_parse_skips_overlong_respelling(self) -> None:
+        parsed = parse_pronunciations(f"long = {'x' * 101}\nok = {'y' * 100}")
+        assert parsed == {"ok": "y" * 100}
+
+    def test_later_duplicate_line_wins(self) -> None:
+        assert parse_pronunciations("a = one\na = two") == {"a": "two"}
 
     def test_parse_empty(self) -> None:
         assert parse_pronunciations("") == {}
@@ -224,3 +276,8 @@ def test_timing_long_whitespace_run() -> None:
 
 def test_timing_long_dotted_chain() -> None:
     assert _elapsed("1." * 25_000 + "1x1") < 1.0
+
+
+def test_timing_long_hyphen_runs() -> None:
+    assert _elapsed("a-" * 25_000 + ".py") < 1.0
+    assert _elapsed("-a" * 25_000) < 1.0
