@@ -489,3 +489,18 @@ console.log(JSON.stringify({ toasts: log.toasts, created: log.created, revoked: 
     assert out["fetches"] == 2  # the prefetch was in flight; it is aborted, not awaited
     assert out["playing"] is False
     assert out["active"] is None
+
+
+def test_constructor_initialises_every_tts_field_stop_uses() -> None:
+    """reset() and disconnectSSE() call _stopTTS() on every pane before any
+    playback, so a field it touches that only the player assigns throws on
+    history load and blanks the transcript (seen live 2026-10-16). The tests
+    above build a fake pane with the fields pre-set, so pin the real
+    constructor here."""
+    import re
+
+    ctor = extract_braced(_SRC, "constructor(wsId, opts) {")
+    used = set(re.findall(r"this\.(_tts\w+)", extract_braced(_SRC, "_stopTTS() {")))
+    assigned = set(re.findall(r"this\.(_tts\w+)\s*=", ctor))
+    assert used, "no _tts fields found in _stopTTS"
+    assert used <= assigned, f"not initialised in the constructor: {sorted(used - assigned)}"
