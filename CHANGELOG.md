@@ -260,6 +260,12 @@ frozen.
 
 ### Changed
 
+- **Read-aloud speaks a reply one block at a time** — headings, paragraphs, list items and table rows
+  are each read as their own clip with a pause after them, instead of running into the next sentence,
+  and a code block is replaced by "Code omitted." Playback starts as soon as the first clip is
+  synthesized rather than after the whole reply, using the same `/v1/api/tts` endpoint with one
+  request in flight at a time. A request that fails, or a browser that blocks playback, now shows an
+  error toast and stops.
 - **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
   `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
   (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP

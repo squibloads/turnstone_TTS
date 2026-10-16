@@ -3417,89 +3417,229 @@ class Pane {
     bar.insertBefore(btn, bar.querySelector(".msg-copy-btn"));
   }
 
-  // Strip code blocks / inline code / rendered math so TTS doesn't read source
-  // or KaTeX accessibility text out character-by-character.
-  _extractSpeakableText(bodyEl) {
-    const clone = bodyEl.cloneNode(true);
-    clone
-      .querySelectorAll("pre, code, .katex, .katex-display")
-      .forEach((n) =>
-        n.replaceWith(document.createTextNode(" (code omitted) ")),
-      );
-    return (clone.textContent || "").replace(/\s+/g, " ").trim();
+  // The speakable reply as [{text, pauseMs}], one row per block element so a
+  // heading, list item or table row gets its own clip and a pause instead of
+  // running into the next sentence.  Fenced code becomes a marker and rendered
+  // math (KaTeX's accessibility text) is dropped; inline code is spoken.
+  _extractSpeechSegments(bodyEl) {
+    const PAUSE = {
+      H1: 600,
+      H2: 600,
+      H3: 600,
+      H4: 600,
+      H5: 600,
+      H6: 600,
+      P: 500,
+      BLOCKQUOTE: 500,
+      LI: 300,
+      TR: 300,
+      DT: 300,
+      DD: 300,
+    };
+    const raw = [];
+    let cur = null; // segment taking inline text; null until the next text
+    let sawBlock = false;
+    const walk = (node) => {
+      for (const child of node.childNodes) {
+        if (child.nodeType === 3) {
+          if (!cur) raw.push((cur = { text: "", pauseMs: 500 }));
+          cur.text += child.textContent;
+          continue;
+        }
+        if (child.nodeType !== 1) continue;
+        const cls = child.classList;
+        if (cls.contains("katex") || cls.contains("katex-display")) continue;
+        if (child.tagName === "PRE") {
+          sawBlock = true;
+          raw.push({ text: "Code omitted.", pauseMs: 400, code: true });
+          cur = null;
+          continue;
+        }
+        const isCell = child.tagName === "TD" || child.tagName === "TH";
+        if (isCell && cur && cur.text.trim()) cur.text += ", ";
+        const pauseMs = PAUSE[child.tagName];
+        if (pauseMs === undefined) {
+          walk(child);
+          continue;
+        }
+        sawBlock = true;
+        raw.push((cur = { text: "", pauseMs }));
+        walk(child);
+        cur = null; // a nested block ends this one; later text starts anew
+      }
+    };
+    walk(bodyEl);
+    if (sawBlock) return this._shapeSpeechSegments(raw);
+    // No block structure (plain text): speak it as one clip, as before.
+    const text = raw
+      .map((r) => r.text)
+      .join("")
+      .replace(/\s+/g, " ")
+      .trim();
+    return text ? [{ text, pauseMs: 0 }] : [];
   }
 
-  _playMessageTTS(el, btn) {
+  // Normalise raw block text into clips a TTS model reads well: terminal
+  // punctuation so it pauses and drops pitch, fragments folded into the next
+  // clip (a five-word clip sounds clipped), long blocks cut at sentence ends
+  // (long inputs raise latency and fail on some backends).
+  _shapeSpeechSegments(raw) {
+    const MIN_CHARS = 20;
+    const MAX_CHARS = 600;
+    // Closing quotes/brackets may follow the mark (a string: the test harness
+    // slices methods with a brace walker that mistakes quotes in a regex literal).
+    const ENDS_SENTENCE = new RegExp("[.!?:\\u2026][\"')\\]\\u201d\\u2019]*$");
+    const rows = [];
+    for (const r of raw) {
+      const text = r.text.replace(/\s+/g, " ").trim().replace(/,$/, "");
+      if (!text) continue;
+      const end = ENDS_SENTENCE.test(text) ? "" : ".";
+      rows.push({ text: text + end, pauseMs: r.pauseMs, code: !!r.code });
+    }
+    const merged = [];
+    let carry = "";
+    rows.forEach((r, i) => {
+      const next = rows[i + 1];
+      const text = carry ? carry + " " + r.text : r.text;
+      if (!r.code && text.length < MIN_CHARS && next && !next.code) {
+        carry = text;
+        return;
+      }
+      carry = "";
+      merged.push({ text, pauseMs: r.pauseMs });
+    });
+    const out = [];
+    for (const seg of merged) {
+      if (seg.text.length <= MAX_CHARS) {
+        out.push(seg);
+        continue;
+      }
+      // Lookbehind is avoided: an unsupported regex fails the whole script.
+      let piece = "";
+      for (const s of seg.text.replace(/([.!?])\s+/g, "$1\n").split("\n")) {
+        if (piece && piece.length + 1 + s.length > MAX_CHARS) {
+          out.push({ text: piece, pauseMs: 0 });
+          piece = s;
+        } else {
+          piece = piece ? piece + " " + s : s;
+        }
+      }
+      out.push({ text: piece, pauseMs: seg.pauseMs });
+    }
+    if (out.length) out[out.length - 1].pauseMs = 0;
+    return out;
+  }
+
+  async _playMessageTTS(el, btn) {
     // Toggle: clicking the active button (or any while playing) stops first.
-    if (this._ttsAudio) {
+    if (this._ttsBtnActive) {
       const wasThis = this._ttsBtnActive === btn;
       this._stopTTS();
       if (wasThis) return;
     }
-    const bodyEl = el.querySelector(".msg-body") || el;
-    const text = this._extractSpeakableText(bodyEl);
-    if (!text) return;
-    // Serialize: a monotonic token guards against an earlier (slower) request
-    // resolving after a newer one — which would double-play and leak the blob.
+    const segments = this._extractSpeechSegments(
+      el.querySelector(".msg-body") || el,
+    );
+    if (!segments.length) return;
+    // Serialize: _stopTTS bumps the token, so a superseded run notices at its
+    // next await and neither plays nor leaks a blob.
     const token = ++this._ttsSeq;
+    const abort = new AbortController();
+    this._ttsAbort = abort;
+    this._ttsBtnActive = btn;
     btn.classList.add("is-busy");
     btn.disabled = true;
-    authFetch(this._base + "/v1/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    })
-      .then((r) => {
-        if (!r.ok) {
-          return r.json().then((b) => {
-            throw new Error((b && b.error) || "Speech synthesis failed");
-          });
-        }
-        return r.blob();
-      })
-      .then((audioBlob) => {
-        const url = URL.createObjectURL(audioBlob);
-        if (token !== this._ttsSeq) {
-          URL.revokeObjectURL(url); // superseded — don't play or leak
-          return;
+    // Many self-hosted backends synthesize one request at a time, so exactly
+    // one fetch is ever in flight: clip i+1 is requested once clip i starts.
+    const fetchClip = async (text) => {
+      const r = await authFetch(this._base + "/v1/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+        signal: abort.signal,
+      });
+      if (!r.ok) {
+        const b = await r.json().catch(() => null);
+        throw new Error((b && b.error) || "Speech synthesis failed");
+      }
+      const blob = await r.blob();
+      if (token !== this._ttsSeq) return null; // superseded: nothing to leak
+      const url = URL.createObjectURL(blob);
+      this._ttsUrls.add(url);
+      return url;
+    };
+    try {
+      let next = fetchClip(segments[0].text);
+      for (let i = 0; i < segments.length; i++) {
+        const url = await next;
+        if (token !== this._ttsSeq) return;
+        if (i + 1 < segments.length) {
+          next = fetchClip(segments[i + 1].text);
+          next.catch(() => {}); // surfaced when awaited; not unhandled meanwhile
         }
         const audio = new Audio(url);
         this._ttsAudio = audio;
-        this._ttsBtnActive = btn;
-        btn.classList.add("is-playing");
-        btn.setAttribute("aria-pressed", "true");
-        voiceAnnounce("Playing response.");
-        audio.addEventListener("ended", () => this._stopTTS());
-        audio.addEventListener("error", () => this._stopTTS());
-        audio.play().catch(() => this._stopTTS());
-      })
-      .catch((err) => {
-        showToast(
-          err && err.message ? err.message : "Speech synthesis failed",
-          "error",
-        );
-      })
-      .finally(() => {
-        btn.classList.remove("is-busy");
-        btn.disabled = false;
-      });
+        if (i === 0) {
+          btn.classList.remove("is-busy");
+          btn.disabled = false;
+          btn.classList.add("is-playing");
+          btn.setAttribute("aria-pressed", "true");
+          voiceAnnounce("Playing response.");
+        }
+        // A stopped clip never fires "ended", so a stopped run just stays
+        // parked here (and at the pause below) until it is collected.
+        await new Promise((resolve, reject) => {
+          audio.addEventListener("ended", resolve);
+          audio.addEventListener("error", () =>
+            reject(new Error("Audio playback failed")),
+          );
+          audio
+            .play()
+            .catch(() =>
+              reject(new Error("Playback was blocked by the browser")),
+            );
+        });
+        URL.revokeObjectURL(url);
+        this._ttsUrls.delete(url);
+        if (segments[i].pauseMs) {
+          await new Promise((resolve) => {
+            this._ttsTimer = setTimeout(resolve, segments[i].pauseMs);
+          });
+        }
+      }
+      this._stopTTS();
+    } catch (err) {
+      if (token !== this._ttsSeq) return; // aborted by a stop or a newer run
+      showToast(
+        err && err.message ? err.message : "Speech synthesis failed",
+        "error",
+      );
+      this._stopTTS();
+    }
   }
 
   _stopTTS() {
-    this._ttsSeq++; // invalidate any in-flight request
+    this._ttsSeq++; // invalidate any run in progress
+    if (this._ttsAbort) {
+      this._ttsAbort.abort();
+      this._ttsAbort = null;
+    }
+    clearTimeout(this._ttsTimer);
     if (this._ttsAudio) {
       try {
         this._ttsAudio.pause();
       } catch (e) {
         /* ignore */
       }
-      const src = this._ttsAudio.src || "";
-      if (src.indexOf("blob:") === 0) URL.revokeObjectURL(src);
       this._ttsAudio = null;
     }
-    if (this._ttsBtnActive) {
-      this._ttsBtnActive.classList.remove("is-playing");
-      this._ttsBtnActive.setAttribute("aria-pressed", "false");
+    this._ttsUrls.forEach((u) => URL.revokeObjectURL(u));
+    this._ttsUrls.clear();
+    const btn = this._ttsBtnActive;
+    if (btn) {
+      btn.classList.remove("is-busy", "is-playing");
+      btn.disabled = false;
+      btn.setAttribute("aria-pressed", "false");
       this._ttsBtnActive = null;
     }
   }
