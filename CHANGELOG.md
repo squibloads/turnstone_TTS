@@ -272,6 +272,7 @@ frozen.
 - **Read-aloud keeps playing when the tab is hidden** — it used to stop, because hiding the tab
   closes the live stream and the stream teardown also stopped the audio. It now stops on Stop,
   when the conversation is rebuilt from history, and when the pane is closed.
+- **Every finished reply has its own read-aloud button** — the speaker used to appear only on the latest reply and moved on with Retry. It now stays on each reply once it has finished (a reply still streaming gets it when it settles), so an earlier answer can be read, or keep playing, while a newer one arrives.
 - **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
   `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
   (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP

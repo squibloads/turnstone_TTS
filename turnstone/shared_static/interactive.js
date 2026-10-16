@@ -1461,14 +1461,19 @@ class Pane {
     // Voice input: mic button, hidden until the STT role is confirmed
     // available (so it never appears when voice isn't configured).
     this._buildMicButton();
-    getVoiceRoles(this._base).then((roles) => {
-      this._voiceRoles = roles;
-      if (this._micBtn) this._micBtn.style.display = roles.stt ? "" : "none";
-      // Right-align the mic next to send (instead of stranded by the model
-      // chip) only when STT is actually available; .has-mic drives the CSS.
-      if (this.composer && this.composer.actionsRowEl)
-        this.composer.actionsRowEl.classList.toggle("has-mic", !!roles.stt);
-    });
+    getVoiceRoles(this._base).then((roles) => this._applyVoiceRoles(roles));
+  }
+
+  _applyVoiceRoles(roles) {
+    this._voiceRoles = roles;
+    if (this._micBtn) this._micBtn.style.display = roles.stt ? "" : "none";
+    // Right-align the mic next to send (instead of stranded by the model
+    // chip) only when STT is actually available; .has-mic drives the CSS.
+    if (this.composer && this.composer.actionsRowEl)
+      this.composer.actionsRowEl.classList.toggle("has-mic", !!roles.stt);
+    // The roles resolve asynchronously, usually after the first replay has
+    // already built bubbles; give those their speaker now.
+    this._addTtsActionsToFinished();
   }
 
   connectSSE(wsId) {
@@ -3115,7 +3120,8 @@ class Pane {
   // O(1) per message, unlike the removed whole-transcript sweep this
   // file's retry attach deliberately avoids (see
   // _attachRetryToLastAssistant).  The bar is shared with the transient
-  // retry / TTS buttons the holder mechanism adds and removes.  Callers
+  // retry button the holder mechanism adds and removes (and the speaker
+  // _addTtsActionsToFinished adds once the reply settles).  Callers
   // pass a JUST-CREATED bubble (both stream branches via
   // _newAssistantBubble, and replay) — no dedup needed against an empty
   // bar.
@@ -3422,6 +3428,30 @@ class Pane {
       this._playMessageTTS(el, btn);
     });
     bar.insertBefore(btn, bar.querySelector(".msg-copy-btn"));
+  }
+
+  // Speaker on every finished assistant reply, not just the retry holder, so
+  // an earlier answer can be read without regenerating the latest one.
+  // Walks back from the tail and stops at the first reply that already has
+  // its speaker: replies are only ever added at the tail, so everything
+  // before it was handled by an earlier pass (the full walk happens once per
+  // replay or role resolution, when no reply has one yet).  The bubble still
+  // streaming is skipped so half a reply is never read; the settle edge
+  // (_attachRetryToLastAssistant) picks it up.
+  _addTtsActionsToFinished() {
+    if (!(this._voiceRoles && this._voiceRoles.tts) || !this.messagesEl) return;
+    for (
+      let el = this.messagesEl.lastElementChild;
+      el;
+      el = el.previousElementSibling
+    ) {
+      if (!el.classList.contains("msg") || !el.classList.contains("assistant"))
+        continue;
+      if (el === this.currentAssistantEl) continue;
+      const bar = findMsgActionsBar(el);
+      if (bar && bar.querySelector(".msg-tts-btn")) break;
+      this._addTtsAction(el);
+    }
   }
 
   // The speakable reply as [{text, pauseMs}], one row per block element so a
@@ -4453,22 +4483,23 @@ class Pane {
   }
 
   _attachRetryToLastAssistant() {
-    // Remove the previous holder's retry / TTS buttons via the tracked ref —
-    // the old whole-transcript ".msg.assistant .msg-actions" sweep was O(N)
-    // per busy→idle edge.  The bar itself stays: every assistant bubble owns
-    // one for its persistent copy button (_addCopyAction, at creation), and
-    // only the transient retry / TTS buttons move with the holder.  At most
-    // one bubble carries them (this method is their only writer); a holder
-    // detached by a rebuild no-ops harmlessly.
+    // Remove the previous holder's retry button via the tracked ref — the
+    // old whole-transcript ".msg.assistant .msg-actions" sweep was O(N) per
+    // busy→idle edge.  The bar itself stays: every assistant bubble owns one
+    // for its persistent copy and read-aloud buttons, and only the transient
+    // retry button moves with the holder.  At most one bubble carries it
+    // (this method is its only writer); a holder detached by a rebuild
+    // no-ops harmlessly.  The speaker is NOT removed: it belongs to every
+    // finished reply, and removing it would also kill a reply that is
+    // playing right now.
     if (this._retryHolderEl) {
       const oldBar = findMsgActionsBar(this._retryHolderEl);
       if (oldBar) {
-        oldBar
-          .querySelectorAll(".msg-retry-btn, .msg-tts-btn")
-          .forEach((b) => b.remove());
+        oldBar.querySelectorAll(".msg-retry-btn").forEach((b) => b.remove());
       }
       this._retryHolderEl = null;
     }
+    this._addTtsActionsToFinished();
     // Find the last assistant message with content and add retry.
     // Reasoning blocks emit as .msg.reasoning (distinct modifier) so the
     // .msg.assistant selector already excludes them — no extra guard needed.
@@ -4504,9 +4535,6 @@ class Pane {
     }
     if (lastAssistant) {
       this._addRetryAction(lastAssistant);
-      if (this._voiceRoles && this._voiceRoles.tts) {
-        this._addTtsAction(lastAssistant);
-      }
       this._retryHolderEl = lastAssistant;
     }
   }
