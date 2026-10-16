@@ -14,13 +14,26 @@ import json
 from pathlib import Path
 from typing import Any
 
-from tests._js_harness_helpers import extract_braced, node_skip, run_node_source, strip_js_comments
+from tests._js_harness_helpers import (
+    demodulize,
+    extract_braced,
+    node_skip,
+    run_node_source,
+    strip_js_comments,
+)
 
 pytestmark = node_skip
 
 _SRC = (
     Path(__file__).resolve().parents[1] / "turnstone" / "shared_static" / "interactive.js"
 ).read_text(encoding="utf-8")
+
+# The speech pipeline lives in tts_player.js; the pane methods sliced below are
+# thin delegates to it, so the module is evaluated in the same context (imports
+# stripped: authFetch, Audio, showToast ... are the globals the stubs below set).
+_PLAYER_MODULE = demodulize(
+    Path(__file__).resolve().parents[1] / "turnstone" / "shared_static" / "tts_player.js"
+)
 
 _SIGS = (
     "_extractSpeechSegments(bodyEl) {",
@@ -46,7 +59,7 @@ _PANE_SRC = "\n".join(
 
 # Just enough DOM for the walker: element/text nodes, classList.contains and
 # an HTML-subset parser so the cases below read as the markup they model.
-_DOM = r"""
+_DOM = _PLAYER_MODULE + r"""
 // childNodes is NodeList-like as in browsers: iterable, length, item(), and NO
 // array methods (no reduce/map/filter), so code that treats it as an Array
 // fails here as it does in Chrome.  The parser appends through _kids.
@@ -168,6 +181,12 @@ class Pane {
 }
 const T = new Pane("ws", {});
 T._base = "http://x";
+// The player state lives in the pane's tts_player instance; these keep the
+// assertions below reading it under the names they were written against.
+Object.defineProperties(T, {
+  _ttsBtnActive: { get: () => T._ttsPlayer.activeButton() },
+  _ttsAudio: { get: () => T._ttsPlayer.audio() },
+});
 T.messagesEl = { scrollTop: 0, replaceChildren() {}, setAttribute() {} };
 // Three paragraphs long enough to avoid the short-segment merge.
 const msg = () => parse(
@@ -861,23 +880,18 @@ console.log(JSON.stringify({ toasts: log.toasts, created: log.created, revoked: 
 
 def test_real_pane_survives_reset_and_disconnect_before_any_playback() -> None:
     """reset() and replayHistory() call _stopTTS() on every pane before any
-    playback.  _stopTTS guards each field it reads, so a missing one would not
-    throw; this pins that the shipped constructor initialises every _tts field
-    the stop path reads, so a pane never depends on the player having run
-    first.  Build the pane from the shipped constructor rather than a
-    pre-populated fake."""
-    import re
-
-    used = sorted(set(re.findall(r"this\.(_tts\w+)", extract_braced(_SRC, "_stopTTS() {"))))
-    assert used, "no _tts fields found in _stopTTS"
+    playback.  Build the pane from the shipped constructor rather than a
+    pre-populated fake, so a pane that only creates its player on first play
+    (and so throws here) fails this test."""
     out = _play(
-        f"""
-const missing = {json.dumps(used)}.filter((k) => T[k] === undefined);
+        """
+const had = T._ttsPlayer !== undefined && T._ttsPlayer !== null;
 T.reset(); T.disconnectSSE();
-console.log(JSON.stringify({{ missing }}));
+T.replayHistory([]);
+console.log(JSON.stringify({ had, active: T._ttsBtnActive, playing: T._ttsPlayer.isPlaying() }));
 """
     )
-    assert out == {"missing": []}
+    assert out == {"had": True, "active": None, "playing": False}
 
 
 def test_one_audio_element_is_made_in_the_click_and_reused_for_every_clip() -> None:

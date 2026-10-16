@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from tests._js_harness_helpers import extract_braced, node_skip, run_node_source
+from tests._js_harness_helpers import demodulize, extract_braced, node_skip, run_node_source
 
 pytestmark = node_skip
 
@@ -108,9 +108,8 @@ function mkPane(tts) {
   T._voiceRoles = { stt: false, tts };
   T._retryHolderEl = null; T.currentAssistantEl = null; T.composer = null; T._micBtn = null;
   T._retryLast = () => {};
-  T._ttsBtnActive = null; T._ttsSeq = 0; T._ttsAbort = null; T._ttsTimer = null; T._ttsAudio = null;
-  globalThis.clearTimeout = () => {};
-  globalThis.URL = { revokeObjectURL() {} };
+  T._ttsBtnActive = null;
+  T._ttsPlayer = { stop() { T._ttsBtnActive && T._ttsBtnActive.classList.remove("is-playing"); T._ttsBtnActive = null; } };
   T._playMessageTTS = async function (el, btn) {
     if (this._ttsBtnActive) { const same = this._ttsBtnActive === btn; this._stopTTS(); if (same) return; }
     this._ttsBtnActive = btn; btn.classList.add("is-playing"); log.plays.push(el);
@@ -127,7 +126,11 @@ const names = (el) => el.children.filter((c) => c.className.includes("msg-action
   .flatMap((bar) => bar.children.map((b) => b.className.split(" ").find((c) => /^msg-(retry|tts|copy)-btn$/.test(c)).slice(4, -4)));
 """
 
-_PRELUDE = _DOM + _COPY_FNS + _HELPERS.replace("METHODS", _PANE_METHODS)
+# The speaker walk lives in tts_player.js (the pane methods delegate to it);
+# its copy_actions imports resolve to the bar helpers sliced above.
+_PLAYER_MODULE = demodulize(_ROOT / "tts_player.js")
+
+_PRELUDE = _DOM + _COPY_FNS + _PLAYER_MODULE + _HELPERS.replace("METHODS", _PANE_METHODS)
 
 
 def _run(body: str) -> Any:
