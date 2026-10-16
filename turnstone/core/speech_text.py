@@ -16,9 +16,10 @@ Deliberately skipped (do not add without a measured need):
 - IPA / SSML or any other model-specific pronunciation syntax (operators use
   plain respellings via ``parse_pronunciations`` instead)
 - math expressions
-- dates: ``2026-10-16`` and ``16.10.2026`` are left alone, not read out
+- dates other than ISO: ``16.10.2026`` is left alone (day/month order is
+  ambiguous); ISO ``2026-10-16`` is read as "October 16th, 2026"
 - currency beyond what models already do
-- phone numbers: ``555-1234`` still reads as a range (known limitation)
+- phone numbers other than ten-digit ones: ``555-1234`` still reads as a range
 - ambiguous tokens such as ``8k``
 - LLM-based rewriting
 - pluralisation ("1 seconds" is accepted)
@@ -79,12 +80,64 @@ def _seconds_unless_decade(match: re.Match[str]) -> str:
     return f"{number} seconds"
 
 
+_MONTHS = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)  # fmt: skip
+
+
+def _ordinal(n: int) -> str:
+    if 11 <= n % 100 <= 13:
+        return f"{n}th"
+    return f"{n}" + {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+def _speak_iso_date(match: re.Match[str]) -> str:
+    # Read as digits, voices rush "2026-10-16" into one blur of numbers.
+    year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
+    return f"{_MONTHS[month - 1]} {_ordinal(day)}, {year}"
+
+
+def _speak_phone(match: re.Match[str]) -> str:
+    # Digit by digit in the number's own groups, the way people read them out.
+    return ", ".join(" ".join(group) for group in match.groups())
+
+
+# Technical terms most voices mangle, as plain respellings that work on every
+# backend.  Universal terms only; an operator's audio.tts_pronunciations entry
+# for the same word wins.
+_TECH_TERMS = {
+    "PostgreSQL": "Postgres Q L",
+    "systemctl": "system control",
+    "kubectl": "kube control",
+    "YAML": "yammel",
+    "JSON": "jay-son",
+}
+
+
 # Ordered (pattern, replacement); a replacement is a string or a callback.
 # Order matters: ``GB/s`` before ``GB`` and ``s``.  The two version rows stay at
 # the head so no later rule (ranges, units, "x") can eat their digits.
 _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = tuple(
     (re.compile(pattern), repl)
     for pattern, repl in (
+        # ten-digit phone numbers and ISO dates first: later rules would read
+        # their parts as ranges or versions
+        (
+            r"(?<![\w.(-])(?:\+?1[\s.-])?\(?(\d{3})\)?[\s.-]?(\d{3})[\s.-](\d{4})(?![\w.-])",
+            _speak_phone,
+        ),
+        (
+            r"(?<![\w.-])(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?![\w.-])",
+            _speak_iso_date,
+        ),
+        # file names with a common extension: "speech_text.py" is "speech_text dot py"
+        (
+            r"(?<![\w.])([A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*)"
+            r"\.(py|js|mjs|ts|tsx|jsx|md|json|ya?ml|toml|txt|sh|html|css|sql|csv|log|ini|cfg"
+            r"|rs|go|java|rb|php)\b",
+            "\\1 dot \\2",
+        ),
         # versions: 3+ dotted parts only (two-part decimals like "13.9" read fine).
         # The possessive group keeps long dotted chains linear and the date guard
         # leaves 16.10.2026 alone.
@@ -123,7 +176,8 @@ _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...]
         # abbreviations
         (r"\be\.g\.", "for example"),
         (r"\bi\.e\.", "that is"),
-        (r"\betc\.(?!\s+[A-Z])", "et cetera"),
+        # "etc." keeps its full stop unless the sentence clearly carries on
+        (r"\betc\.(?=\s*[,;:)]|\s+[a-z])", "et cetera"),
         (r"\betc\.", "et cetera."),
         (r"\bvs\b\.?", "versus"),
     )
@@ -179,11 +233,14 @@ def _apply_pronunciations(text: str, pronunciations: Mapping[str, str]) -> str:
 def normalize_for_speech(text: str, pronunciations: Mapping[str, str] | None = None) -> str:
     """Rewrite symbols, units and versions in *text* into speakable English.
 
-    Operator pronunciations run last so they can override anything the built-in
-    rules produced.
+    Respellings (the built-in technical terms, then the operator's own, which
+    win) run last so they can override anything the rules produced.
     """
     for pattern, repl in _RULES:
         text = pattern.sub(repl, text)
+    # Keys match case-insensitively, so merge them folded: an operator's "yaml"
+    # replaces the built-in "YAML".
+    terms = {key.lower(): value for key, value in _TECH_TERMS.items()}
     if pronunciations:
-        text = _apply_pronunciations(text, pronunciations)
-    return text
+        terms.update({key.lower(): value for key, value in pronunciations.items() if key})
+    return _apply_pronunciations(text, terms)

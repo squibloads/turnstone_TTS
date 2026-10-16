@@ -76,10 +76,30 @@ RULE_CASES: list[tuple[str, str]] = [
     # abbreviations
     ("e.g. this", "for example this"),
     ("i.e. that", "that is that"),
-    ("cats, dogs, etc.", "cats, dogs, et cetera"),
+    ("cats, dogs, etc.", "cats, dogs, et cetera."),
     ("cats, etc. Then go", "cats, et cetera. Then go"),
+    ("cats, etc., and dogs", "cats, et cetera, and dogs"),
+    ("cats, etc. and dogs", "cats, et cetera and dogs"),
     ("a vs. b", "a versus b"),
     ("a vs b", "a versus b"),
+    # ISO dates: the digits otherwise run together
+    ("on 2026-10-16", "on October 16th, 2026"),
+    ("2026-01-01 to 2026-03-22", "January 1st, 2026 to March 22nd, 2026"),
+    ("2026-02-03", "February 3rd, 2026"),
+    ("2026-11-11", "November 11th, 2026"),
+    # ten-digit phone numbers read digit by digit, in their groups
+    ("call 555-123-4567", "call 5 5 5, 1 2 3, 4 5 6 7"),
+    ("call (555) 123-4567", "call 5 5 5, 1 2 3, 4 5 6 7"),
+    ("call 555.123.4567", "call 5 5 5, 1 2 3, 4 5 6 7"),
+    # file names with a common extension
+    ("open speech_text.py now", "open speech_text dot py now"),
+    ("see README.md and app.config.ts", "see README dot md and app.config dot ts"),
+    ("a Node.js app", "a Node dot js app"),
+    # common technical terms that voices mangle
+    ("the PostgreSQL logs", "the Postgres Q L logs"),
+    ("run systemctl and kubectl", "run system control and kube control"),
+    ("edit the YAML and JSON", "edit the yammel and jay-son"),
+    ("open config.json", "open config dot jay-son"),
 ]
 
 
@@ -101,7 +121,9 @@ def test_idempotent(src: str, _expected: str) -> None:
         "The items in these rooms are fine, as it was.",
         "Run it for 5 hours, then stop.",
         "Use items, this, rooms, ms, s and min as words.",
-        "It happened on 2026-10-16 at noon.",
+        "It happened on 2026-13-45 at noon.",
+        "Call 555-12-34 today.",
+        "The file named notes is in the docs folder.",
         "Pi is 3.14 and the load was 13.9 yesterday.",
         "Version two is out.",
         "The x axis and y axis; box and tax.",
@@ -125,8 +147,8 @@ def test_s_unit_only_after_number() -> None:
     assert normalize_for_speech("100 ms") == "100 milliseconds"
 
 
-def test_dates_untouched() -> None:
-    assert normalize_for_speech("on 2026-10-16") == "on 2026-10-16"
+def test_operator_pronunciation_overrides_built_in_term() -> None:
+    assert normalize_for_speech("the YAML file", {"yaml": "yah-mul"}) == "the yah-mul file"
 
 
 def test_two_part_decimal_untouched() -> None:
