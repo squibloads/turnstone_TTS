@@ -3425,8 +3425,13 @@ class Pane {
   }
 
   // The speakable reply as [{text, pauseMs}], one row per block element so a
-  // heading, list item or table row gets its own clip and a pause instead of
-  // running into the next sentence.  Fenced code becomes a marker and rendered
+  // heading, paragraph or table row gets its own clip and a pause instead of
+  // running into the next sentence.  A whole list (UL, OL or DL, nested lists
+  // included) is ONE row: each item gets a full stop if it lacks terminal
+  // punctuation and the items are joined with a space, with no pause between
+  // items and none after the list (listening tests: the model's own
+  // sentence-end pause was enough).  Table rows keep one clip each with a
+  // 150 ms pause and are never merged by the short-clip fold.  Fenced code becomes a marker and rendered
   // math (KaTeX's accessibility text) is dropped.  Inline code is spoken when
   // short (an identifier or flag) and replaced by the marker from
   // INLINE_CODE_MAX characters up (a command line or expression is noise
@@ -3442,14 +3447,19 @@ class Pane {
       H6: 600,
       P: 500,
       BLOCKQUOTE: 500,
-      LI: 300,
-      TR: 300,
-      DT: 300,
-      DD: 300,
+      TR: 150,
     };
     const raw = [];
     let cur = null; // segment taking inline text; null until the next text
     let sawBlock = false;
+    let listDepth = 0; // inside a list everything folds into the one list row
+    // Written with hex escapes for the quote characters; see _shapeSpeechSegments.
+    const ENDS = /[.!?:\u2026][\x22\x27)\]\u201d\u2019]*$/;
+    const itemBreak = () => {
+      const t = cur.text.replace(/\s+$/, "").replace(/,$/, "");
+      if (!t.trim()) return;
+      cur.text = t + (ENDS.test(t) ? " " : ". ");
+    };
     const textLength = (node) =>
       node.nodeType === 3
         ? node.textContent.length
@@ -3472,7 +3482,26 @@ class Pane {
         if (child.tagName === "PRE") {
           sawBlock = true;
           raw.push({ text: "Code omitted.", pauseMs: 400, code: true });
-          cur = null;
+          cur = listDepth ? { text: "", pauseMs: 0, list: true } : null;
+          if (cur) raw.push(cur);
+          continue;
+        }
+        const tag = child.tagName;
+        if (tag === "UL" || tag === "OL" || tag === "DL") {
+          sawBlock = true;
+          if (listDepth) itemBreak();
+          else raw.push((cur = { text: "", pauseMs: 0, list: true }));
+          listDepth++;
+          walk(child);
+          listDepth--;
+          if (listDepth) itemBreak();
+          else cur = null;
+          continue;
+        }
+        if (listDepth && (tag === "LI" || tag === "DT" || tag === "DD" || PAUSE[tag] !== undefined)) {
+          itemBreak();
+          walk(child);
+          itemBreak();
           continue;
         }
         const isCell = child.tagName === "TD" || child.tagName === "TH";
@@ -3483,7 +3512,7 @@ class Pane {
           continue;
         }
         sawBlock = true;
-        raw.push((cur = { text: "", pauseMs }));
+        raw.push((cur = { text: "", pauseMs, table: child.tagName === "TR" }));
         walk(child);
         cur = null; // a nested block ends this one; later text starts anew
       }
@@ -3520,14 +3549,14 @@ class Pane {
       const end = ENDS_SENTENCE.test(text) ? "" : ".";
       // Adjacent fenced blocks are one omission, not one request each.
       if (r.code && rows.length && rows[rows.length - 1].code) continue;
-      rows.push({ text: text + end, pauseMs: r.pauseMs, code: !!r.code });
+      rows.push({ text: text + end, pauseMs: r.pauseMs, code: !!r.code, table: !!r.table });
     }
     const merged = [];
     let carry = "";
     rows.forEach((r, i) => {
       const next = rows[i + 1];
       const text = carry ? carry + " " + r.text : r.text;
-      if (!r.code && text.length < MIN_CHARS && next && !next.code) {
+      if (!r.code && !r.table && text.length < MIN_CHARS && next && !next.code) {
         carry = text;
         return;
       }
