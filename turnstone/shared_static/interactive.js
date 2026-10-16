@@ -3510,6 +3510,7 @@ class Pane {
     // cell has text, so an empty cell adds no separator and padding around
     // the cell text does not leave "Plan , Price".
     let cellSep = false;
+    let rowBase = 0; // non-space count at the start of the current row
     const addText = (str, isMarker) => {
       if (!cur) cur = newSeg(500);
       if (!cellSep) {
@@ -3552,13 +3553,21 @@ class Pane {
           continue;
         }
         if (listDepth && (tag === "LI" || tag === "DT" || tag === "DD" || PAUSE[tag] !== undefined)) {
+          // A table row inside a list item is a sentence of the list clip and
+          // starts clean: its first cell must not see the previous row's text.
+          const isRow = tag === "TR";
           itemBreak();
+          if (isRow) {
+            cellSep = false;
+            rowBase = cur.sig;
+          }
           walk(child);
           itemBreak();
+          if (isRow) cellSep = false;
           continue;
         }
         const isCell = child.tagName === "TD" || child.tagName === "TH";
-        if (isCell && cur && cur.sig > 0) cellSep = true;
+        if (isCell && cur && cur.sig > rowBase) cellSep = true;
         const pauseMs = PAUSE[child.tagName];
         if (pauseMs === undefined) {
           walk(child);
@@ -3566,6 +3575,7 @@ class Pane {
           continue;
         }
         cellSep = false;
+        rowBase = 0;
         cur = newSeg(pauseMs, { table: child.tagName === "TR" });
         walk(child);
         cur = null; // a nested block ends this one; later text starts anew

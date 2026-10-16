@@ -305,6 +305,14 @@ def test_a_trailing_empty_cell_does_not_leak_a_separator_past_the_row() -> None:
     ) == [("Pro.", 150), ("Trailing div text here.", 0)]
 
 
+def test_table_rows_inside_a_list_item_each_start_cleanly() -> None:
+    assert _segs(
+        "<ul><li>Intro text here.<table><tr><th>Plan</th><th>Price</th></tr>"
+        "<tr><td>Pro</td><td>$9</td></tr><tr><td>Max</td><td>$20</td></tr></table>"
+        "</li><li>Closing item text</li></ul>"
+    ) == [("Intro text here. Plan, Price. Pro, $9. Max, $20. Closing item text.", 0)]
+
+
 def test_short_table_rows_are_never_merged() -> None:
     assert _segs(
         "<table><tr><th>Plan</th><th>Price</th></tr><tr><td>Pro</td><td>$9</td></tr>"
