@@ -3476,14 +3476,14 @@ class Pane {
         }
         if (child.tagName === "PRE") {
           raw.push({ text: "Code omitted.", pauseMs: 400, code: true });
-          cur = listDepth ? { text: "", pauseMs: 0, list: true } : null;
+          cur = listDepth ? { text: "", pauseMs: 0 } : null;
           if (cur) raw.push(cur);
           continue;
         }
         const tag = child.tagName;
         if (tag === "UL" || tag === "OL" || tag === "DL") {
           if (listDepth) itemBreak();
-          else raw.push((cur = { text: "", pauseMs: 0, list: true }));
+          else raw.push((cur = { text: "", pauseMs: 0 }));
           listDepth++;
           walk(child);
           listDepth--;
