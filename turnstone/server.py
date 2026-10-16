@@ -1979,15 +1979,15 @@ async def text_to_speech(request: Request) -> Response:
     if not voice and config_store is not None:
         voice = (config_store.get("audio.tts_voice") or "").strip()
 
-    # On by default; a missing config store means defaults, not "off".
-    if config_store is None or config_store.get("audio.tts_normalize", True):
+    # On by default (the registry default applies); a missing config store
+    # means defaults, not "off".
+    if config_store is None or config_store.get("audio.tts_normalize"):
         pronunciations = ""
         if config_store is not None:
             pronunciations = config_store.get("audio.tts_pronunciations") or ""
-        # Regex work on up to the length cap: keep it off the event loop.
-        text = await asyncio.to_thread(
-            normalize_for_speech, text, parse_pronunciations(pronunciations)
-        )
+        # Every rule is linear and the length cap bounds the work; a thread would
+        # not help (the regex holds the GIL).
+        text = normalize_for_speech(text, parse_pronunciations(pronunciations))
 
     abort_ref = StreamAbortRef()
     backend_auth_resolver = _audio_backend_auth_resolver(request)

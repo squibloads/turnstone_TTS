@@ -18,9 +18,13 @@ Deliberately skipped (do not add without a measured need):
   plain respellings via ``parse_pronunciations`` instead)
 - math expressions
 - dates other than ISO: ``16.10.2026`` is left alone (day/month order is
-  ambiguous); ISO ``2026-10-16`` is read as "October 16th, 2026"
+  ambiguous), and a two-digit-year dotted date such as ``16.10.26`` reads as a
+  version; ISO ``2026-10-16`` is read as "October 16th, 2026" (an impossible day
+  such as ``2026-02-31`` stays raw) and ``2026-10`` as "October 2026"
 - currency beyond what models already do
-- phone numbers other than ten-digit ones: ``555-1234`` still reads as a range
+- phone numbers other than ten-digit ones: ``555-1234`` still reads as a range;
+  numbers with a leading 1 (``1-800-555-1234``, ``1 800 555 1234``) are left alone
+- abbreviations beyond e.g., i.e., etc. and vs.
 - ambiguous tokens such as ``8k``
 - LLM-based rewriting
 - pluralisation ("1 seconds" is accepted)
@@ -28,6 +32,7 @@ Deliberately skipped (do not add without a measured need):
 
 from __future__ import annotations
 
+import datetime
 import re
 from typing import TYPE_CHECKING
 
@@ -108,7 +113,20 @@ def _ordinal(n: int) -> str:
 def _speak_iso_date(match: re.Match[str]) -> str:
     # Read as digits, voices rush "2026-10-16" into one blur of numbers.
     year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
+    try:
+        datetime.date(int(year), month, day)
+    except ValueError:
+        return match.group(0)  # 2026-02-31 is not a date: leave it alone
     return f"{_MONTHS[month - 1]} {_ordinal(day)}, {year}"
+
+
+def _speak_year_month(match: re.Match[str]) -> str:
+    return f"{_MONTHS[int(match.group(2)) - 1]} {match.group(1)}"
+
+
+def _speak_dimensions(match: re.Match[str]) -> str:
+    # "2x4s" is lumber: the plural s becomes "'s" so it reads "2 by 4's".
+    return match.group(1).replace("x", " by ") + ("'s" if match.group(2) else "")
 
 
 def _speak_phone(match: re.Match[str]) -> str:
@@ -138,19 +156,24 @@ _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...]
         # ten-digit phone numbers and ISO dates first: later rules would read
         # their parts as ranges or versions
         (
-            r"(?<![\w.(-])\(?(\d{3})\)?[\s.-]?(\d{3})[\s.-](\d{4})(?![\w-]|\.\w)",
+            r"(?<![\w.(-])(?<!(?<!\+)\b1[ -])\(?(\d{3})\)?[\s.-]?(\d{3})[\s.-](\d{4})(?![\w-]|\.\w)",
             _speak_phone,
         ),
         (
             r"(?<![\w.-])(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?![\w-]|\.\w)",
             _speak_iso_date,
         ),
-        # file names with a common extension: "speech_text.py" is "speech_text dot py"
+        # year-month ("2026-10"); a pair of years ("2020-2025") stays a range
         (
-            r"(?<![\w.])([A-Za-z_][\w-]{0,63}(?:\.[A-Za-z_][\w-]{0,63})*)"
-            r"\.((?i:py|js|mjs|ts|tsx|jsx|md|json|ya?ml|toml|txt|sh|html|css|sql|csv|log|ini|cfg"
-            r"|rs|go|java|rb|php))\b",
-            "\\1 dot \\2",
+            r"(?<![\w.-])((?:19|20)\d\d)-(0[1-9]|1[0-2])(?![\w/-]|\.\w)",
+            _speak_year_month,
+        ),
+        # file names: only the dot before a listed extension, so there is no
+        # repetition for the engine to backtrack over ("speech_text.py")
+        (
+            r"(?<=[\w-])\.(?=(?i:py|js|mjs|ts|tsx|jsx|md|json|ya?ml|toml|txt|sh|html|css|sql"
+            r"|csv|log|ini|cfg|rs|go|java|rb|php)\b)",
+            " dot ",
         ),
         # versions: 3+ dotted parts only (two-part decimals like "13.9" read fine).
         # The possessive group keeps long dotted chains linear and the date guard
@@ -160,9 +183,9 @@ _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...]
         # symbols
         (r"~\s*(?=\d)", "about "),
         # lookbehind + possessive tail stop quadratic backtracking on long blanks
-        (r"(?<!\s)\s*(?:->|→)(?:\s*+(?!->|→))?", " to "),
+        (r"(?<!\s)\s*(?:--?>|→)(?:\s*+(?!--?>|→))?", " to "),
         (r"(?<=\d)\s*×\s*(?=\d)", " by "),
-        (r"(?<![\w.])(?!0x)\d+(?:x\d+)+", lambda m: m.group(0).replace("x", " by ")),
+        (r"(?<![\w.])(?!0x)(\d+(?:x\d+)+)(s?)(?!\w)", _speak_dimensions),
         (r"≈\s*", "approximately "),
         (r"±\s*", "plus-or-minus "),  # hyphenated: Kokoro paused after "plus"
         (r"(?<=\d)\s*%", " percent"),
@@ -179,22 +202,25 @@ _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...]
         (r"(?<=\d)\s*MHz\b", " megahertz"),
         (r"(?<=\d)\s*ms\b", " milliseconds"),
         (r"(?<=\d)\s*min\b", " minutes"),
-        # "300 W" is watts, "123 W Main Street" is a compass point
-        (r"(?<=\d)W\b|(?<=\d)\s+W\b(?!\s+[A-Z])", " watts"),
+        # attached only: "300W" is watts, "123 W Main Street" is a compass point
+        (r"(?<=\d)W\b", " watts"),
         # "13.9 s", "3s" and "60s" are seconds; "1990s" and "the 80s" are decades
         # (see _is_decade).  Not inside a word: "k8s" stays.
         (r"(?<=\d)\s+s\b", " seconds"),
         (r"(?<![\w.])(\d+(?:\.\d+)?)s\b", _seconds_unless_decade),
         # numeric ranges, but not dates (2026-10-16), version/decimal tails,
         # identifiers (Qwen3-8B) or calibers (30-06: a right side starting 0)
-        (r"(?<![\w.-])(\d+)-(?!0)(\d+)(?![\w-]|\.\w)", "\\1 to \\2"),
+        (r"(?<![\w.-])(\d+)-(?!0)(\d+)(?![\w/-]|\.\w)", "\\1 to \\2"),
         # abbreviations
         (r"\be\.g\.", "for example"),
         (r"\bi\.e\.", "that is"),
         # "etc." keeps its full stop unless the sentence clearly carries on
         (r"\betc\.(?=\s*[,;:)]|\s+[a-z])", "et cetera"),
         (r"\betc\.", "et cetera."),
-        (r"\bvs\b\.?", "versus"),
+        # like "etc.", a sentence-final "vs." keeps its full stop
+        (r"\bvs\.(?=\s*[,;:)]|\s+[a-z])", "versus"),
+        (r"\bvs\.", "versus."),
+        (r"\bvs\b", "versus"),
     )
 )
 
@@ -211,7 +237,7 @@ def parse_pronunciations(raw: str) -> dict[str, str]:
     Operators edit this as free text in a settings box, so bad input must
     degrade to "that line is ignored" rather than an exception that would
     break read-aloud.  Blank lines, ``#`` comments and lines missing a key or
-    a respelling are skipped, as are respellings over 100 characters and every
+    a respelling are skipped, as are keys and respellings over 100 characters and every
     word after the first 200.  A later line for the same word wins.
     """
     out: dict[str, str] = {}
@@ -221,7 +247,9 @@ def parse_pronunciations(raw: str) -> dict[str, str]:
             continue
         key, _, value = line.partition("=")
         key, value = key.strip(), value.strip()
-        if not key or not value or len(value) > _MAX_RESPELLING_CHARS:
+        if not key or not value:
+            continue
+        if max(len(key), len(value)) > _MAX_RESPELLING_CHARS:
             continue
         if key not in out and len(out) >= _MAX_PRONUNCIATIONS:
             continue

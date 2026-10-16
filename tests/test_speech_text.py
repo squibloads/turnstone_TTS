@@ -82,17 +82,30 @@ RULE_CASES: list[tuple[str, str]] = [
     ("cats, etc. and dogs", "cats, et cetera and dogs"),
     ("a vs. b", "a versus b"),
     ("a vs b", "a versus b"),
+    ("We picked A vs.", "We picked A versus."),
+    ("a --> b", "a to b"),
+    ("a-->b", "a to b"),
     # ISO dates: the digits otherwise run together
     ("on 2026-10-16", "on October 16th, 2026"),
     ("2026-01-01 to 2026-03-22", "January 1st, 2026 to March 22nd, 2026"),
     ("2026-02-03", "February 3rd, 2026"),
     ("2026-11-11", "November 11th, 2026"),
+    ("2026-10-31", "October 31st, 2026"),
+    ("2024-02-29", "February 29th, 2024"),
+    ("2026-02-31", "2026-02-31"),
+    # year-months; a pair of years is still a range
+    ("Released 2026-10.", "Released October 2026."),
+    ("2020-2025", "2020 to 2025"),
+    ("2019-20", "2019 to 20"),
     # ten-digit phone numbers read digit by digit, in their groups
     ("call 555-123-4567", "call 5 5 5, 1 2 3, 4 5 6 7"),
     ("call (555) 123-4567", "call 5 5 5, 1 2 3, 4 5 6 7"),
     ("call 555.123.4567", "call 5 5 5, 1 2 3, 4 5 6 7"),
     # a "+1" is left as the digits it is; only the ten-digit body is grouped
     ("call +1 555 123 4567", "call +1 5 5 5, 1 2 3, 4 5 6 7"),
+    # numbers with a leading 1 (and a space or hyphen) are left alone
+    ("call 1 800 555 1234", "call 1 800 555 1234"),
+    ("call 1-800-555-1234", "call 1-800-555-1234"),
     # a sentence-final full stop is punctuation, not part of the token
     ("Released 2026-10-16.", "Released October 16th, 2026."),
     ("Call 555-123-4567.", "Call 5 5 5, 1 2 3, 4 5 6 7."),
@@ -103,7 +116,9 @@ RULE_CASES: list[tuple[str, str]] = [
     ("edit config.YAML now", "edit config dot yammel now"),
     ("edit Config.JSON now", "edit Config dot jay-son now"),
     # W is watts after a number, but "123 W Main Street" is a compass point
-    ("300 W and more", "300 watts and more"),
+    ("300 W and more", "300 W and more"),
+    ("1600 W 13th Ave", "1600 W 13th Ave"),
+    ("301 W. Main St.", "301 W. Main St."),
     # a four-part-or-longer version still reads as points
     ("on 192.168.100.203", "on 192 point 168 point 100 point 203"),
     ("on 192.168.1.203", "on 192 point 168 point 1 point 203"),
@@ -111,6 +126,20 @@ RULE_CASES: list[tuple[str, str]] = [
     ("open speech_text.py now", "open speech_text dot py now"),
     ("see README.md and app.config.ts", "see README dot md and app.config dot ts"),
     ("a Node.js app", "a Node dot js app"),
+    ("see README.md.sh", "see README dot md dot sh"),
+    ("v1.2.md", "v1.2 dot md"),
+    # ranges: a fraction after the hyphen is not a range
+    ("Mix 1-1/2 cups", "Mix 1-1/2 cups"),
+    ("10-15 minutes", "10 to 15 minutes"),
+    # dimensions
+    ("Use 2x4s", "Use 2 by 4's"),
+    ("Ryzen 7950x3d", "Ryzen 7950x3d"),
+    ("0x1F", "0x1F"),
+    # decade / seconds edges
+    ("the 2090s", "the 2090s"),
+    ("the 2100s", "the 2100 seconds"),
+    ("the 1000s", "the 1000s"),
+    ("bathe 80s", "bathe 80 seconds"),
     # common technical terms that voices mangle
     ("the PostgreSQL logs", "the Postgres logs"),
     ("run systemctl and kubectl", "run system control and kube control"),
@@ -150,6 +179,8 @@ def test_idempotent(src: str, _expected: str) -> None:
         "Dated 16.10.2026 here.",
         "About 1.000.000 rows.",
         "Call 1-800-555-1234 now",
+        "Moved to 1600 W 13th Ave",
+        "2026-02-31",
         "2026-10-16.5",
         "555-123-4567.5",
         "pages 10-20.5 ok",
@@ -173,8 +204,9 @@ def test_s_unit_only_after_number() -> None:
     assert normalize_for_speech("100 ms") == "100 milliseconds"
 
 
-def test_operator_pronunciation_overrides_built_in_term() -> None:
-    assert normalize_for_speech("the YAML file", {"yaml": "yah-mul"}) == "the yah-mul file"
+@pytest.mark.parametrize("key", ["yaml", "YAML", "Yaml"])
+def test_operator_pronunciation_overrides_built_in_term(key: str) -> None:
+    assert normalize_for_speech("the YAML file", {key: "yah-mul"}) == "the yah-mul file"
 
 
 def test_two_part_decimal_untouched() -> None:
@@ -243,6 +275,10 @@ class TestPronunciations:
         parsed = parse_pronunciations(f"long = {'x' * 101}\nok = {'y' * 100}")
         assert parsed == {"ok": "y" * 100}
 
+    def test_parse_skips_overlong_key(self) -> None:
+        parsed = parse_pronunciations(f"{'k' * 101} = x\n{'k' * 100} = y")
+        assert parsed == {"k" * 100: "y"}
+
     def test_later_duplicate_line_wins(self) -> None:
         assert parse_pronunciations("a = one\na = two") == {"a": "two"}
 
@@ -279,5 +315,16 @@ def test_timing_long_dotted_chain() -> None:
 
 
 def test_timing_long_hyphen_runs() -> None:
-    assert _elapsed("a-" * 25_000 + ".py") < 1.0
-    assert _elapsed("-a" * 25_000) < 1.0
+    assert _elapsed("a-" * 25_000 + ".py") < 0.2
+    assert _elapsed("-a" * 25_000) < 0.2
+
+
+def test_timing_file_name_rule() -> None:
+    # Not parametrized: pytest puts the id in an environment variable.
+    for text in ("a-a." * 12_500, "a_b.c-d." * 6_250, "a.x-" * 12_500):
+        assert _elapsed(text) < 0.2
+
+
+def test_timing_arrow_and_decade_runs() -> None:
+    assert _elapsed("a " + "-" * 50_000 + "> b") < 0.2
+    assert _elapsed("10s, " * 10_000) < 1.0  # measured ~0.17 s: decade walk

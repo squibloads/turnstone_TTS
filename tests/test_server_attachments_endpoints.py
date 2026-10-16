@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -1020,8 +1021,16 @@ class _VoiceConfigStore:
     def __init__(self, **values: str) -> None:
         self._values = dict(values)
 
-    def get(self, key: str, default: str = "") -> str:
-        return self._values.get(key, default)
+    def get(self, key: str, default: Any = None) -> Any:
+        # Like ConfigStore: an unset key falls back to the registry default.
+        if key in self._values:
+            return self._values[key]
+        if default is not None:
+            return default
+        from turnstone.core.settings_registry import SETTINGS
+
+        defn = SETTINGS.get(key)
+        return defn.default if defn else None
 
 
 @pytest.fixture
@@ -1271,6 +1280,19 @@ class TestTextToSpeech:
         assert resp.status_code == 200, resp.text
         create = mock_client.audio.speech.with_streaming_response.create
         assert create.call_args.kwargs["input"] == "Needs about 32 gigabytes at 120 milliseconds"
+
+    def test_missing_config_store_still_normalises(self, voice_app_client, monkeypatch):
+        # No config store means defaults (normalisation on), not "off".  The alias
+        # lookup needs a store, so stub it to isolate the normalise branch.
+        import turnstone.core.audio as audio_mod
+
+        client, mock_client = voice_app_client
+        client.app.state.config_store = None
+        monkeypatch.setattr(audio_mod, "resolve_role_alias", lambda **_kw: "voice")
+        resp = client.post("/v1/api/tts", json={"text": "Needs ~32GB"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert "about 32 gigabytes" in create.call_args.kwargs["input"]
 
     def test_normalisation_applies_pronunciations(self, voice_app_client):
         client, mock_client = voice_app_client

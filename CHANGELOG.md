@@ -134,8 +134,9 @@ frozen.
   backend, a small English rule set rewrites things models read badly into plain words: `~5`
   becomes "about 5", `32GB` "32 gigabytes", `120ms` "120 milliseconds", `3-5` "3 to 5", `1.8.5`
   "1 point 8 point 5", `->` "to", `60s` "60 seconds" (but `the 80s` stays a decade), `2026-10-16`
-  "October 16th, 2026", a ten-digit phone number digit by digit, `speech_text.py` "speech_text dot
-  py", and `e.g.` "for example". A few technical terms voices mangle get plain respellings
+  "October 16th, 2026" and `2026-10` "October 2026", `300W` "300 watts" (attached only), a
+  ten-digit phone number digit by digit, `speech_text.py` "speech_text dot py", and `e.g.` "for
+  example". A few technical terms voices mangle get plain respellings
   (`PostgreSQL` as "Postgres", `systemctl`, `kubectl`, `YAML`, `JSON`). It uses no model-specific syntax, so it
   behaves the same on Kokoro, OpenAI and vLLM-Omni backends. The new `audio.tts_normalize` setting
   (on by default) turns it off, and `audio.tts_pronunciations` takes one `word = respelling` per
