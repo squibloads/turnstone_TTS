@@ -3647,10 +3647,6 @@ class Pane {
     };
     const out = [];
     for (const seg of merged) {
-      if (seg.text.length <= MAX_CHARS) {
-        out.push(seg);
-        continue;
-      }
       // Lookbehind is avoided: an unsupported regex fails the whole script.
       let piece = "";
       const sentences = seg.text
