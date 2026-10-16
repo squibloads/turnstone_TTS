@@ -1675,7 +1675,23 @@ async def list_available_models(request: Request) -> JSONResponse:
 
 
 _STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation clips
-_TTS_TEXT_CAP = 8000  # characters per synthesis request
+
+
+def _tts_text_cap(config_store: Any) -> int:
+    """The ``audio.tts_max_chars`` setting, or its default when unset or unusable.
+
+    Read per request so a change in the Settings tab applies without a restart;
+    a bad stored value must not refuse every request or lift the cap entirely.
+    """
+    from turnstone.core.settings_registry import DEFAULT_TTS_MAX_CHARS
+
+    if config_store is None:
+        return DEFAULT_TTS_MAX_CHARS
+    try:
+        cap = int(config_store.get("audio.tts_max_chars"))
+    except (TypeError, ValueError):
+        return DEFAULT_TTS_MAX_CHARS
+    return cap if cap > 0 else DEFAULT_TTS_MAX_CHARS
 
 
 def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
@@ -1941,13 +1957,12 @@ async def text_to_speech(request: Request) -> Response:
     text = str(body.get("text") or "").strip()
     if not text:
         return JSONResponse({"error": "text is required"}, status_code=400)
-    if len(text) > _TTS_TEXT_CAP:
-        return JSONResponse(
-            {"error": f"text too long (cap {_TTS_TEXT_CAP} chars)"}, status_code=400
-        )
+    config_store = getattr(request.app.state, "config_store", None)
+    cap = _tts_text_cap(config_store)
+    if len(text) > cap:
+        return JSONResponse({"error": f"text too long (cap {cap} chars)"}, status_code=400)
 
     registry = getattr(request.app.state, "registry", None)
-    config_store = getattr(request.app.state, "config_store", None)
     alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
     if not alias:
         return JSONResponse(

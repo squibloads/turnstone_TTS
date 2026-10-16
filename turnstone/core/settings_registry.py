@@ -51,6 +51,12 @@ DEFAULT_APPROVAL_TIMEOUT_SECONDS = 0
 TOOL_TRUNCATION_MAX_CHARS = 16 * 1024 * 1024
 
 
+# Speech-synthesis limits.  The node and the console fall back to these when the
+# stored value is unusable, so the registry default and the fallback cannot drift.
+DEFAULT_TTS_MAX_CHARS = 8000
+DEFAULT_TTS_TIMEOUT_SECONDS = 30
+
+
 def _build_registry() -> dict[str, SettingDef]:
     """Build the settings registry from declarative definitions."""
     defs: list[SettingDef] = [
@@ -647,6 +653,32 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Voice passed to the TTS backend. OpenAI voices include alloy, echo, fable, "
             "onyx, nova, shimmer; local backends (vLLM-Omni, Kokoro) define their own — set "
             "this to a voice your configured TTS model backend supports.",
+        ),
+        SettingDef(
+            "audio.tts_max_chars",
+            "int",
+            DEFAULT_TTS_MAX_CHARS,
+            "Longest text one speech request may synthesize (characters)",
+            "audio",
+            min_value=1,
+            strict_int=True,
+            help="A message longer than this is refused with an error instead of being read "
+            "aloud. Raise it together with audio.tts_timeout_seconds: the whole clip is "
+            "synthesized before playback starts, so longer text needs a longer wait.",
+        ),
+        SettingDef(
+            "audio.tts_timeout_seconds",
+            "int",
+            DEFAULT_TTS_TIMEOUT_SECONDS,
+            "How long the console waits for a node to synthesize speech (seconds)",
+            "audio",
+            min_value=1,
+            max_value=600,
+            strict_int=True,
+            help="Playback through the console waits for the node to return the complete "
+            "audio clip, which can take far longer than an ordinary request on a slow or "
+            "local speech backend. Every other request the console forwards keeps the "
+            "proxy's shared timeout.",
         ),
         # -- judge ----------------------------------------------------------
         SettingDef(
