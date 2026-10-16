@@ -3562,12 +3562,14 @@ class Pane {
         const pauseMs = PAUSE[child.tagName];
         if (pauseMs === undefined) {
           walk(child);
+          if (child.tagName === "TABLE") cellSep = false;
           continue;
         }
         cellSep = false;
         cur = newSeg(pauseMs, { table: child.tagName === "TR" });
         walk(child);
         cur = null; // a nested block ends this one; later text starts anew
+        cellSep = false; // a trailing empty cell must not arm the next block's text
       }
     };
     walk(bodyEl);

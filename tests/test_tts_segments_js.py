@@ -295,6 +295,16 @@ def test_empty_and_padded_table_cells_do_not_leave_stray_separators() -> None:
     ) == [("first cell, last cell.", 150), ("Plan, Price.", 0)]
 
 
+def test_a_trailing_empty_cell_does_not_leak_a_separator_past_the_row() -> None:
+    assert _segs(
+        "<table><tr><td>Pro</td><td></td></tr></table>"
+        "<ul><li>Red item here</li><li>Blue item here</li></ul>"
+    ) == [("Pro.", 150), ("Red item here. Blue item here.", 0)]
+    assert _segs(
+        "<table><tr><td>Pro</td><td></td></tr></table><div>Trailing div text here</div>"
+    ) == [("Pro.", 150), ("Trailing div text here.", 0)]
+
+
 def test_short_table_rows_are_never_merged() -> None:
     assert _segs(
         "<table><tr><th>Plan</th><th>Price</th></tr><tr><td>Pro</td><td>$9</td></tr>"
