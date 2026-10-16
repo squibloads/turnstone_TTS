@@ -3754,7 +3754,8 @@ async def _proxy_post(
         if path == "tts":
             tts_timeout = _proxy_tts_timeout(request)
             if tts_timeout is not None:
-                extra["timeout"] = tts_timeout
+                # Only the wait for the clip; connecting and the pool keep the shared bound.
+                extra["timeout"] = httpx.Timeout(_PROXY_CLIENT_TIMEOUT_S, read=tts_timeout)
         resp = await client.request(
             request.method,
             target,

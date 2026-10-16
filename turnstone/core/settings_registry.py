@@ -55,6 +55,11 @@ TOOL_TRUNCATION_MAX_CHARS = 16 * 1024 * 1024
 # stored value is unusable, so the registry default and the fallback cannot drift.
 DEFAULT_TTS_MAX_CHARS = 8000
 DEFAULT_TTS_TIMEOUT_SECONDS = 30
+MAX_TTS_TIMEOUT_SECONDS = 600
+# The node synthesizes a request whole and does not stop when the caller gives
+# up, so the text cap is bounded by what a slow backend finishes inside the
+# longest timeout: Kokoro-82M on CPU ran ~107 chars/s, so 50,000 takes ~470 s.
+MAX_TTS_MAX_CHARS = 50_000
 
 
 def _build_registry() -> dict[str, SettingDef]:
@@ -661,6 +666,7 @@ def _build_registry() -> dict[str, SettingDef]:
             "Longest text one speech request may synthesize (characters)",
             "audio",
             min_value=1,
+            max_value=MAX_TTS_MAX_CHARS,
             strict_int=True,
             help="A message longer than this is refused with an error instead of being read "
             "aloud. Raise it together with audio.tts_timeout_seconds: the whole clip is "
@@ -673,7 +679,7 @@ def _build_registry() -> dict[str, SettingDef]:
             "How long the console waits for a node to synthesize speech (seconds)",
             "audio",
             min_value=1,
-            max_value=600,
+            max_value=MAX_TTS_TIMEOUT_SECONDS,
             strict_int=True,
             help="Playback through the console waits for the node to return the complete "
             "audio clip, which can take far longer than an ordinary request on a slow or "

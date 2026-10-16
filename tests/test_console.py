@@ -3371,7 +3371,10 @@ class TestProxyTtsTimeout:
     def test_tts_uses_the_setting(self, monkeypatch):
         store = SimpleNamespace(get=lambda key: {"audio.tts_timeout_seconds": 90}[key])
         kwargs = self._call(monkeypatch, "tts", store)
-        assert kwargs["timeout"] == 90
+        timeout = kwargs["timeout"]
+        assert timeout.read == 90
+        # Only the wait for the clip follows the setting; reaching the node does not.
+        assert (timeout.connect, timeout.write, timeout.pool) == (30, 30, 30)
 
     def test_other_paths_pass_no_timeout(self, monkeypatch):
         store = SimpleNamespace(get=lambda key: {"audio.tts_timeout_seconds": 90}[key])

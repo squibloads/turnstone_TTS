@@ -121,12 +121,14 @@ frozen.
 ### Added
 
 - **Speech-synthesis limits are settings.** `audio.tts_max_chars` (default 8000, the old fixed
-  cap) is the longest text `POST /v1/api/tts` accepts, and `audio.tts_timeout_seconds` (default 30,
-  at most 600) is how long the console waits for a node's `tts` answer. The node answers only once
-  the whole clip is synthesized, so a long reply on a local backend outlasted the proxy's shared
-  30-second timeout and showed "Node unreachable". Every other request the console forwards keeps
-  that shared timeout. Both are read per request, so a change in the Settings tab applies without
-  a restart, and an unusable stored value falls back to the default.
+  cap, at most 50,000) is the longest text `POST /v1/api/tts` accepts, and
+  `audio.tts_timeout_seconds` (default 30, at most 600) is how long the console waits for a node's
+  `tts` answer. The node answers only once the whole clip is synthesized, so a long reply on a
+  local backend outlasted the proxy's shared 30-second timeout and showed "Node unreachable". The
+  setting covers only that wait: connecting to the node, and every other request the console
+  forwards, keep the shared timeout. Both are read per request, so a change in the Settings tab
+  applies without a restart. A stored value that is not a number falls back to the default, and
+  one out of range is clamped to the nearest bound.
 
 - **MCP servers on the 2026-07-28 revision (#679).** A connection probes `server/discover` and
   adopts 2026-07-28 when the server offers it; a server that refuses the probe gets the 2025-11-25
