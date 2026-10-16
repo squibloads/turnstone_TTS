@@ -59,7 +59,10 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"(?<=\d)\s*ms\b", " milliseconds"),
         (r"(?<=\d)\s*min\b", " minutes"),
         (r"(?<=\d)\s*W\b", " watts"),
-        (r"(?<=\d)\s*s\b", " seconds"),
+        # "13.9 s" and "3s" are seconds; "1990s" and "80s" are decades, so an attached
+        # "s" after a multi-digit number ending in 0 is left alone ("30s" too: rare).
+        (r"(?<=\d)\s+s\b", " seconds"),
+        (r"(?<=\d)(?<!\d0)s\b", " seconds"),
         # numeric ranges, but not dates (2026-10-16) or version/decimal tails
         (r"(?<![\d.-])(\d+)-(\d+)(?![\d.-])", "\\1 to \\2"),
         # abbreviations

@@ -25,6 +25,10 @@ RULE_CASES: list[tuple[str, str]] = [
     ("120 ms", "120 milliseconds"),
     ("3s", "3 seconds"),
     ("3 s later", "3 seconds later"),
+    ("40 s", "40 seconds"),
+    # decades are not seconds; an attached "s" after a round number is left alone
+    ("In the 1990s.", "In the 1990s."),
+    ("the 80s and 2020s", "the 80s and 2020s"),
     ("5min", "5 minutes"),
     ("10 min", "10 minutes"),
     ("13 GB/s", "13 gigabytes per second"),
