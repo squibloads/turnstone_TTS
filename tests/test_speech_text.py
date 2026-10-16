@@ -20,8 +20,8 @@ RULE_CASES: list[tuple[str, str]] = [
     ("1024x1024x3", "1024 by 1024 by 3"),
     ("a -> -> b", "a to  to b"),
     ("≈ 5", "approximately 5"),
-    ("±3", "plus or minus 3"),
-    ("± 3", "plus or minus 3"),
+    ("±3", "plus-or-minus 3"),
+    ("± 3", "plus-or-minus 3"),
     ("50%", "50 percent"),
     ("12.5 %", "12.5 percent"),
     # units
@@ -96,7 +96,7 @@ RULE_CASES: list[tuple[str, str]] = [
     ("see README.md and app.config.ts", "see README dot md and app.config dot ts"),
     ("a Node.js app", "a Node dot js app"),
     # common technical terms that voices mangle
-    ("the PostgreSQL logs", "the Postgres Q L logs"),
+    ("the PostgreSQL logs", "the Postgres logs"),
     ("run systemctl and kubectl", "run system control and kube control"),
     ("edit the YAML and JSON", "edit the yammel and jay-son"),
     ("open config.json", "open config dot jay-son"),

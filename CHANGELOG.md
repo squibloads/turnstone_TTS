@@ -136,7 +136,7 @@ frozen.
   "1 point 8 point 5", `->` "to", `60s` "60 seconds" (but `the 80s` stays a decade), `2026-10-16`
   "October 16th, 2026", a ten-digit phone number digit by digit, `speech_text.py` "speech_text dot
   py", and `e.g.` "for example". A few technical terms voices mangle get plain respellings
-  (`PostgreSQL`, `systemctl`, `kubectl`, `YAML`, `JSON`). It uses no model-specific syntax, so it
+  (`PostgreSQL` as "Postgres", `systemctl`, `kubectl`, `YAML`, `JSON`). It uses no model-specific syntax, so it
   behaves the same on Kokoro, OpenAI and vLLM-Omni backends. The new `audio.tts_normalize` setting
   (on by default) turns it off, and `audio.tts_pronunciations` takes one `word = respelling` per
   line for words the rules do not cover; an entry there overrides a built-in respelling.

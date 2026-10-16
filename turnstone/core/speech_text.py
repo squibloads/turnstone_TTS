@@ -107,7 +107,7 @@ def _speak_phone(match: re.Match[str]) -> str:
 # backend.  Universal terms only; an operator's audio.tts_pronunciations entry
 # for the same word wins.
 _TECH_TERMS = {
-    "PostgreSQL": "Postgres Q L",
+    "PostgreSQL": "Postgres",
     "systemctl": "system control",
     "kubectl": "kube control",
     "YAML": "yammel",
@@ -150,7 +150,7 @@ _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...]
         (r"(?<=\d)\s*×\s*(?=\d)", " by "),
         (r"(?<![\w.])(?!0x)\d+(?:x\d+)+", lambda m: m.group(0).replace("x", " by ")),
         (r"≈\s*", "approximately "),
-        (r"±\s*", "plus or minus "),
+        (r"±\s*", "plus-or-minus "),  # hyphenated: Kokoro paused after "plus"
         (r"(?<=\d)\s*%", " percent"),
         # units (case-sensitive: "MB" is not "mb"); rates before their parts
         (r"(?<=\d)\s*GB/s\b", " gigabytes per second"),
