@@ -3432,7 +3432,9 @@ class Pane {
   // items and none after the list (listening tests: the model's own
   // sentence-end pause was enough).  Table rows keep one clip each with a
   // 150 ms pause; a table row is never itself folded forward, but a short
-  // lead-in paragraph can fold into the first row.  Fenced code becomes a marker and rendered
+  // lead-in paragraph can fold into the first row.  Fenced code becomes a marker, a diagram
+  // (rendered, loading, errored or unrendered mermaid) becomes its own
+  // "Diagram omitted." marker, SVG/img/canvas/video/audio are skipped, and rendered
   // math (KaTeX's accessibility text) is dropped.  Inline code is spoken when
   // short (an identifier or flag) and replaced by the marker from
   // INLINE_CODE_MAX characters up (a command line or expression is noise
@@ -3451,6 +3453,10 @@ class Pane {
       TR: 150,
     };
     const CODE_OMITTED = "Code omitted.";
+    const DIAGRAM_OMITTED = "Diagram omitted.";
+    // Elements with no speakable text of their own: an inline SVG icon or a
+    // chart would otherwise leak its <title>, <text> and <style> content.
+    const SILENT = new Set(["SVG", "IMG", "CANVAS", "VIDEO", "AUDIO"]);
     const raw = [];
     // A segment keeps its text as parts plus a count of non-space characters,
     // so the list and cell logic below looks only at the tail and never
@@ -3539,8 +3545,20 @@ class Pane {
           if (!(cur && cur.marker && !cellSep)) addText(" " + CODE_OMITTED + " ", true);
           continue;
         }
-        if (child.tagName === "PRE") {
-          put(newSeg(400, { code: true }), CODE_OMITTED);
+        // SVG elements report a lowercase tagName, so compare upper-cased.
+        if (SILENT.has(child.tagName.toUpperCase())) continue;
+        // renderer.js turns a mermaid fence into .mermaid-container (loading,
+        // rendered SVG, or error message plus a <pre> of the source); until
+        // mermaid loads it is still <pre><code class="language-mermaid">.
+        // Every state is one diagram marker, never the node and edge labels.
+        const isDiagram =
+          cls.contains("mermaid-container") ||
+          (child.tagName === "PRE" &&
+            Array.from(child.childNodes).some(
+              (c) => c.nodeType === 1 && c.classList.contains("language-mermaid"),
+            ));
+        if (isDiagram || child.tagName === "PRE") {
+          put(newSeg(400, { code: true }), isDiagram ? DIAGRAM_OMITTED : CODE_OMITTED);
           cur = listDepth ? newSeg(0) : null;
           continue;
         }
@@ -3612,8 +3630,8 @@ class Pane {
       const text = r.text.replace(/\s+/g, " ").trim().replace(/,$/, "");
       if (!text) continue;
       const end = ENDS_SENTENCE.test(text) ? "" : ".";
-      // Adjacent fenced blocks are one omission, not one request each.
-      if (r.code && rows.length && rows[rows.length - 1].code) continue;
+      // Adjacent identical markers are one omission, not one request each.
+      if (r.code && rows.length && rows[rows.length - 1].code && rows[rows.length - 1].text === text + end) continue;
       rows.push({ text: text + end, pauseMs: r.pauseMs, code: !!r.code, table: !!r.table });
     }
     const merged = [];
