@@ -3455,7 +3455,7 @@ class Pane {
     // Written with hex escapes for the quote characters; see _shapeSpeechSegments.
     const ENDS = /[.!?:\u2026][\x22\x27)\]\u201d\u2019]*$/;
     const itemBreak = () => {
-      const t = cur.text.replace(/\s+$/, "").replace(/,$/, "");
+      const t = cur.text.trimEnd().replace(/,$/, "");
       if (!t.trim()) return;
       cur.text = t + (ENDS.test(t) ? " " : ". ");
     };
