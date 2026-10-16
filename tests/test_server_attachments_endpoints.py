@@ -1409,7 +1409,7 @@ class TestVoiceStreamLifecycle:
         from starlette.responses import StreamingResponse
 
         from turnstone.core.deadline import StreamAbortRef
-        from turnstone.server import _AbortOnExitStreamingResponse
+        from turnstone.core.web_helpers import AbortOnExitStreamingResponse
 
         handle = MagicMock()
         abort_ref = StreamAbortRef()
@@ -1419,7 +1419,7 @@ class TestVoiceStreamLifecycle:
             raise asyncio.CancelledError
 
         monkeypatch.setattr(StreamingResponse, "__call__", cancel_before_body)
-        response = _AbortOnExitStreamingResponse([], abort_ref=abort_ref)
+        response = AbortOnExitStreamingResponse([], abort_ref=abort_ref)
 
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(response({}, MagicMock(), MagicMock()))

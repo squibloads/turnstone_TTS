@@ -12,16 +12,16 @@ from typing import TYPE_CHECKING, Any
 
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
-from starlette.responses import FileResponse, PlainTextResponse, Response
+from starlette.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from starlette.middleware import Middleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse
-    from starlette.types import Scope
+    from starlette.types import Receive, Scope, Send
 
     from turnstone.core.storage import WorkstreamLeaseHeldError, WorkstreamLeaseLostError
 
@@ -556,9 +556,7 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
         )
     except BackendAuthUnavailableError:
         log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
-        return _JSONResponse(
-            {"error": "Model backend authentication unavailable"}, status_code=503
-        )
+        return _JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
     except AudioUnavailableError as exc:
         return _JSONResponse({"error": str(exc)}, status_code=503)
     except AudioBackendError as exc:
@@ -572,6 +570,253 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
         speech.audio_bytes,
         media_type=speech.media_type,
         headers={"X-Model-Alias": speech.model_alias},
+    )
+
+
+STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation clips
+
+_STT_NOT_CONFIGURED = (
+    "Speech-to-text is not configured. Assign an STT model role in Models → Roles."
+)
+
+
+class AbortOnExitStreamingResponse(StreamingResponse):
+    """Abort an upstream audio stream even before body iteration begins.
+
+    ``StreamingResponse.__call__`` can be cancelled (client gone) before the body
+    generator ever starts, in which case the generator's own ``finally`` never
+    runs and the backend connection would stay pinned.
+    """
+
+    def __init__(self, *args: Any, abort_ref: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._abort_ref = abort_ref
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._abort_ref.abort()
+
+
+async def speech_to_text_response(
+    request: Request,
+    *,
+    registry: Any | None,
+    authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
+) -> JSONResponse:
+    """Serve ``POST /v1/api/workstreams/{ws_id}/speech-to-text`` against *registry*.
+
+    Multipart body with a single ``audio`` field; returns the transcript for the
+    browser to place into the composer and never sends on the user's behalf.
+    A node and the console hold their registries under different ``app.state``
+    names and authorise ``ws_id`` differently (interactive vs coordinator), so
+    both are injected; ``authorize`` returns an error response or ``None``.
+    Everything else is one contract so the coordinator mic behaves like a node's.
+    """
+    import asyncio
+
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.audio import (
+        AudioBackendError,
+        AudioUnavailableError,
+        resolve_role_alias,
+        transcribe,
+    )
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.log import get_logger
+    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+
+    log = get_logger(__name__)
+    ws_id = request.path_params.get("ws_id", "")
+    if not ws_id:
+        return _JSONResponse({"error": "ws_id is required"}, status_code=400)
+    err = await authorize(request, ws_id)
+    if err is not None:
+        return err
+
+    config_store = getattr(request.app.state, "config_store", None)
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="stt")
+    if not alias:
+        return _JSONResponse({"error": _STT_NOT_CONFIGURED}, status_code=503)
+
+    got = await read_multipart_file_or_400(request, field="audio", max_bytes=STT_UPLOAD_CAP)
+    if isinstance(got, _JSONResponse):
+        return got
+    filename, _claimed_mime, data = got
+    if not data:
+        return _JSONResponse({"error": "Empty audio upload"}, status_code=400)
+
+    stt_prompt = ""
+    if config_store is not None:
+        stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
+    abort_ref = StreamAbortRef()
+    backend_auth_resolver = audio_backend_auth_resolver(request)
+    try:
+        # Blocking SDK round-trip — offload so the shared event loop (and SSE
+        # streaming) stays responsive.
+        result = await asyncio.to_thread(
+            transcribe,
+            registry=registry,
+            alias=alias,
+            data=data,
+            filename=filename or "speech.webm",
+            prompt=stt_prompt,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=abort_ref,
+        )
+    except BackendAuthUnavailableError:
+        log.warning("speech_to_text.backend_auth_unavailable", exc_info=True)
+        return _JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
+    except AudioUnavailableError as exc:
+        return _JSONResponse({"error": str(exc)}, status_code=503)
+    except AudioBackendError as exc:
+        # str(exc) wraps the backend SDK error, which can carry upstream
+        # response detail — log it, but return a static body to the caller.
+        log.warning("speech_to_text.backend_failed", error=str(exc), exc_info=True)
+        return _JSONResponse({"error": "Speech transcription backend failed"}, status_code=502)
+    finally:
+        abort_ref.abort()
+
+    if not result.transcript:
+        # Successful call that detected no speech (silence / non-speech audio)
+        # is not a backend failure — surface it as 422 so the UI can say so
+        # rather than treating a healthy backend as a bad gateway.
+        return _JSONResponse({"error": "No speech detected"}, status_code=422)
+
+    return _JSONResponse(
+        {
+            "status": "ok",
+            "transcript": result.transcript,
+            "model_alias": result.model_alias,
+        }
+    )
+
+
+async def speech_to_text_stream_response(
+    request: Request,
+    *,
+    registry: Any | None,
+    authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
+) -> Response:
+    """Serve ``POST .../speech-to-text/stream``: the transcript as plain-text deltas.
+
+    Lower perceived latency than the JSON route.  Resolve/transcode failures
+    surface as 503 / 502 before any bytes are sent; once streaming begins the
+    body is best-effort (a mid-stream backend error just ends the partial
+    stream).  *registry* / *authorize* as in :func:`speech_to_text_response`.
+    """
+    import asyncio
+    import threading
+
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.audio import (
+        AudioBackendError,
+        AudioUnavailableError,
+        resolve_role_alias,
+        transcribe_stream,
+    )
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.log import get_logger
+    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+
+    log = get_logger(__name__)
+    ws_id = request.path_params.get("ws_id", "")
+    if not ws_id:
+        return _JSONResponse({"error": "ws_id is required"}, status_code=400)
+    err = await authorize(request, ws_id)
+    if err is not None:
+        return err
+
+    config_store = getattr(request.app.state, "config_store", None)
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="stt")
+    if not alias:
+        return _JSONResponse({"error": _STT_NOT_CONFIGURED}, status_code=503)
+
+    got = await read_multipart_file_or_400(request, field="audio", max_bytes=STT_UPLOAD_CAP)
+    if isinstance(got, _JSONResponse):
+        return got
+    _filename, _claimed_mime, data = got
+    if not data:
+        return _JSONResponse({"error": "Empty audio upload"}, status_code=400)
+
+    stt_prompt = ""
+    if config_store is not None:
+        stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
+    abort_ref = StreamAbortRef()
+    backend_auth_resolver = audio_backend_auth_resolver(request)
+
+    # Resolve + transcode + open the stream eagerly (off the event loop) so the
+    # common failures map to a clean status before any bytes are sent.
+    try:
+        deltas = await asyncio.to_thread(
+            transcribe_stream,
+            registry=registry,
+            alias=alias,
+            data=data,
+            prompt=stt_prompt,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=abort_ref,
+        )
+    except BackendAuthUnavailableError:
+        abort_ref.abort()
+        log.warning("speech_to_text_stream.backend_auth_unavailable", exc_info=True)
+        return _JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
+    except AudioUnavailableError as exc:
+        abort_ref.abort()
+        return _JSONResponse({"error": str(exc)}, status_code=503)
+    except AudioBackendError:
+        abort_ref.abort()
+        log.warning("speech_to_text_stream.backend_failed", exc_info=True)
+        return _JSONResponse({"error": "Speech transcription backend failed"}, status_code=502)
+    except BaseException:
+        abort_ref.abort()
+        raise
+
+    # Drive the blocking stream from one worker thread that owns (and closes)
+    # the upstream connection, handing deltas to the loop via a queue.  A client
+    # disconnect sets ``stop`` so the thread releases the connection promptly
+    # instead of being pinned mid-``next()`` (which can't be cancelled).
+    async def _body() -> AsyncGenerator[bytes]:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        stop = threading.Event()
+
+        def _pump() -> None:
+            try:
+                for delta in deltas:
+                    if stop.is_set():
+                        break
+                    loop.call_soon_threadsafe(queue.put_nowait, delta.encode("utf-8"))
+            except Exception:
+                # Mid-stream backend failure: end the partial stream (logged).
+                if not abort_ref.aborted:
+                    log.warning("speech_to_text_stream.mid_stream_failed", exc_info=True)
+            finally:
+                close = getattr(deltas, "close", None)
+                if callable(close):
+                    close()
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        loop.run_in_executor(None, _pump)
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            stop.set()
+            abort_ref.abort()
+
+    return AbortOnExitStreamingResponse(
+        _body(),
+        media_type="text/plain; charset=utf-8",
+        abort_ref=abort_ref,
     )
 
 
