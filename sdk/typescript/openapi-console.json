@@ -2720,6 +2720,191 @@
         }
       }
     },
+    "/v1/api/workstreams/{ws_id}/speech-to-text": {
+      "post": {
+        "summary": "Transcribe a short audio clip for a coordinator composer (multipart/form-data, field 'audio') using the configured STT model role.  Returns the transcript for the client to place into the composer; this endpoint never sends on the user's behalf.  Returns 503 when no STT role is configured or the coordinator subsystem is down.",
+        "operationId": "v1_api_workstreams_{ws_id}_speech-to-text_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeechToTextResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error 422",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/speech-to-text/stream": {
+      "post": {
+        "summary": "Stream the transcript of a short audio clip as plain-text deltas (multipart/form-data, field 'audio') for lower perceived latency than the JSON route.  Setup failures surface as 502/503 before any bytes are sent.",
+        "operationId": "v1_api_workstreams_{ws_id}_speech-to-text_stream_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/skills": {
       "get": {
         "summary": "List available skills (summary)",
@@ -10184,6 +10369,33 @@
           "ws_id"
         ],
         "title": "CommandRequest",
+        "type": "object"
+      },
+      "SpeechToTextResponse": {
+        "description": "Transcript returned for the browser to place into the composer.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "description": "Request outcome",
+            "title": "Status",
+            "type": "string"
+          },
+          "transcript": {
+            "description": "Transcribed text",
+            "title": "Transcript",
+            "type": "string"
+          },
+          "model_alias": {
+            "default": "",
+            "description": "STT role alias used",
+            "title": "Model Alias",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transcript"
+        ],
+        "title": "SpeechToTextResponse",
         "type": "object"
       },
       "TextToSpeechRequest": {
