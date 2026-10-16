@@ -201,44 +201,80 @@ def test_existing_terminal_punctuation_is_not_doubled() -> None:
     ]
 
 
-def test_list_items_are_separate_segments_with_item_pause() -> None:
+def test_a_list_plays_as_one_clip_with_no_pause_after_it() -> None:
     assert _segs(
-        "<ul><li>First item in the list</li><li>Second item in the list</li></ul>"
-        "<p>Closing paragraph for the list.</p>"
+        "<h2>Colors</h2><ul><li>Red</li><li>Blue</li><li>Green</li></ul>"
+        "<p>Those are the primary colors.</p>"
+    ) == [("Colors. Red. Blue. Green.", 0), ("Those are the primary colors.", 0)]
+
+
+def test_a_short_lead_in_paragraph_carries_into_the_list_clip() -> None:
+    assert _segs(
+        "<p>To deploy:</p><ol><li>Pull the image</li><li>Restart the stack</li>"
+        "<li>Check the logs</li></ol><p>That's it.</p>"
     ) == [
-        ("First item in the list.", 300),
-        ("Second item in the list.", 300),
-        ("Closing paragraph for the list.", 0),
+        ("To deploy: Pull the image. Restart the stack. Check the logs.", 0),
+        ("That's it.", 0),
     ]
 
 
-def test_nested_list_items_become_their_own_segments() -> None:
+def test_nested_list_items_join_the_one_list_clip() -> None:
     assert _segs(
         "<ul><li>Parent item text here<ul><li>Child item one is here</li>"
         "<li>Child item two is here</li></ul></li><li>Sibling item text here</li></ul>"
+        "<p>A paragraph after the list.</p>"
     ) == [
-        ("Parent item text here.", 300),
-        ("Child item one is here.", 300),
-        ("Child item two is here.", 300),
-        ("Sibling item text here.", 0),
+        (
+            "Parent item text here. Child item one is here. Child item two is here."
+            " Sibling item text here.",
+            0,
+        ),
+        ("A paragraph after the list.", 0),
     ]
+
+
+def test_a_long_list_splits_at_item_ends_with_no_pause_between_clips() -> None:
+    items = "".join(f"<li>{'x' * 99}</li>" for _ in range(10))
+    rows = _extract(f"<ul>{items}</ul><p>A trailing paragraph of ordinary size.</p>")[0]
+    assert len(rows) == 3
+    assert all(len(r["text"]) <= 600 for r in rows)
+    assert " ".join(r["text"] for r in rows[:2]) == " ".join(["x" * 99 + "."] * 10)
+    assert [r["pauseMs"] for r in rows] == [0, 0, 0]
 
 
 def test_table_rows_join_cells_with_commas() -> None:
     assert _segs(
         "<table><thead><tr><th>Column name</th><th>Column value</th></tr></thead>"
         "<tbody><tr><td>alpha first</td><td>beta second</td></tr></tbody></table>"
-    ) == [("Column name, Column value.", 300), ("alpha first, beta second.", 0)]
+    ) == [("Column name, Column value.", 150), ("alpha first, beta second.", 0)]
 
 
-def test_blockquote_and_definition_lists_are_segments() -> None:
+def test_short_table_rows_are_never_merged() -> None:
+    assert _segs(
+        "<table><tr><th>Plan</th><th>Price</th></tr><tr><td>Pro</td><td>$9</td></tr>"
+        "<tr><td>Max</td><td>$20</td></tr></table><p>Prices are monthly.</p>"
+    ) == [
+        ("Plan, Price.", 150),
+        ("Pro, $9.", 150),
+        ("Max, $20.", 150),
+        ("Prices are monthly.", 0),
+    ]
+
+
+def test_blockquote_is_a_segment_and_a_definition_list_is_one_clip() -> None:
     assert _segs(
         "<blockquote>A quoted sentence of some length.</blockquote>"
-        "<dl><dt>The term being defined</dt><dd>Its definition goes right here.</dd></dl>"
+        "<dl><dt>The term being defined</dt><dd>Its definition goes right here.</dd>"
+        "<dt>Another term</dt><dd>And its own definition.</dd></dl>"
+        "<p>Closing paragraph for the list.</p>"
     ) == [
         ("A quoted sentence of some length.", 500),
-        ("The term being defined.", 300),
-        ("Its definition goes right here.", 0),
+        (
+            "The term being defined. Its definition goes right here. Another term."
+            " And its own definition.",
+            0,
+        ),
+        ("Closing paragraph for the list.", 0),
     ]
 
 
