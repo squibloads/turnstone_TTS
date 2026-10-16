@@ -34,16 +34,20 @@ _METHODS = ",\n".join(extract_braced(_SRC, sig) for sig in _SIGS)  # object-lite
 # initialise breaks them, as it blanked live transcripts on 2026-10-16.  The
 # constructor has non-ASCII comments and run_node_source writes the script in
 # the locale encoding (cp1252 on Windows), so they are escaped here.
-_PANE_SRC = "\n".join(
-    extract_braced(_SRC, sig)
-    for sig in (
-        "constructor(wsId, opts) {",
-        "reset() {",
-        "disconnectSSE() {",
-        "replayHistory(messages) {",
-        *_SIGS,
+_PANE_SRC = (
+    "\n".join(
+        extract_braced(_SRC, sig)
+        for sig in (
+            "constructor(wsId, opts) {",
+            "reset() {",
+            "disconnectSSE() {",
+            "replayHistory(messages) {",
+            *_SIGS,
+        )
     )
-).encode("ascii", "backslashreplace").decode("ascii")
+    .encode("ascii", "backslashreplace")
+    .decode("ascii")
+)
 
 # Just enough DOM for the walker: element/text nodes, classList.contains and
 # an HTML-subset parser so the cases below read as the markup they model.
