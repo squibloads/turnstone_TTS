@@ -52,8 +52,25 @@ _PANE_SRC = (
 # Just enough DOM for the walker: element/text nodes, classList.contains and
 # an HTML-subset parser so the cases below read as the markup they model.
 _DOM = r"""
+// childNodes is NodeList-like as in browsers: iterable, length, item(), and NO
+// array methods (no reduce/map/filter), so code that treats it as an Array
+// fails here as it does in Chrome.  The parser appends through _kids.
+class NodeList_ {
+  constructor(a) { this._a = a; }
+  get length() { return this._a.length; }
+  item(i) { return this._a[i] || null; }
+  [Symbol.iterator]() { return this._a[Symbol.iterator](); }
+}
 class Node_ {
-  constructor(nodeType) { this.nodeType = nodeType; this.childNodes = []; }
+  constructor(nodeType) {
+    this.nodeType = nodeType;
+    this._kids = [];
+    this.childNodes = new NodeList_(this._kids);
+  }
+  get textContent() {
+    return this.nodeType === 3 ? this._text : this._kids.map((k) => k.textContent).join("");
+  }
+  set textContent(v) { this._text = v; }
 }
 function el(tag, cls) {
   const n = new Node_(1);
@@ -71,12 +88,12 @@ function parse(html, cls) {
   let m;
   while ((m = re.exec(html))) {
     const top = stack[stack.length - 1];
-    if (m[4] !== undefined) top.childNodes.push(text(m[4]));
+    if (m[4] !== undefined) top._kids.push(text(m[4]));
     else if (m[1]) stack.pop();
     else {
       const c = /class="([^"]*)"/.exec(m[3]);
       const n = el(m[2], c ? c[1] : "");
-      top.childNodes.push(n);
+      top._kids.push(n);
       stack.push(n);
     }
   }

@@ -3460,10 +3460,6 @@ class Pane {
       if (!t.trim()) return;
       cur.text = t + (ENDS.test(t) ? " " : ". ");
     };
-    const textLength = (node) =>
-      node.nodeType === 3
-        ? node.textContent.length
-        : (node.childNodes || []).reduce((n, c) => n + textLength(c), 0);
     const walk = (node) => {
       for (const child of node.childNodes) {
         if (child.nodeType === 3) {
@@ -3474,7 +3470,7 @@ class Pane {
         if (child.nodeType !== 1) continue;
         const cls = child.classList;
         if (cls.contains("katex") || cls.contains("katex-display")) continue;
-        if (child.tagName === "CODE" && textLength(child) >= INLINE_CODE_MAX) {
+        if (child.tagName === "CODE" && child.textContent.length >= INLINE_CODE_MAX) {
           if (!cur) raw.push((cur = { text: "", pauseMs: 500 }));
           if (!/Code omitted\.\s*$/.test(cur.text)) cur.text += " Code omitted. ";
           continue;
