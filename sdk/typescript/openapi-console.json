@@ -2666,6 +2666,60 @@
         }
       }
     },
+    "/v1/api/tts": {
+      "post": {
+        "summary": "Synthesize text to speech audio for browser playback (coordinator read-aloud) using the configured TTS model role.  Returns audio bytes; 503 when no TTS role is configured.",
+        "operationId": "v1_api_tts_post",
+        "tags": [
+          "Models"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TextToSpeechRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/skills": {
       "get": {
         "summary": "List available skills (summary)",
@@ -10132,6 +10186,26 @@
         "title": "CommandRequest",
         "type": "object"
       },
+      "TextToSpeechRequest": {
+        "properties": {
+          "text": {
+            "description": "Text to synthesize",
+            "title": "Text",
+            "type": "string"
+          },
+          "voice": {
+            "default": "",
+            "description": "Optional voice override (else audio.tts_voice setting)",
+            "title": "Voice",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "TextToSpeechRequest",
+        "type": "object"
+      },
       "DequeueRequest": {
         "description": "Body for ``DELETE /v1/api/workstreams/{ws_id}/send``.\n\nRemoves a previously-queued message from the workstream's pending\nqueue. ``msg_id`` is the id returned in a prior ``send`` response\nwhen the workstream was busy and the message was queued.",
         "properties": {
@@ -14671,6 +14745,18 @@
           "judge_default_alias": {
             "default": "",
             "title": "Judge Default Alias",
+            "type": "string"
+          },
+          "stt_default_alias": {
+            "default": "",
+            "description": "Effective speech-to-text role alias (blank = voice input disabled)",
+            "title": "Stt Default Alias",
+            "type": "string"
+          },
+          "tts_default_alias": {
+            "default": "",
+            "description": "Effective text-to-speech role alias (blank = voice output disabled)",
+            "title": "Tts Default Alias",
             "type": "string"
           }
         },

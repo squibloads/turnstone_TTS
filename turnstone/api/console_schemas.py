@@ -1484,6 +1484,14 @@ class ListAvailableModelsResponse(BaseModel):
     channel_default_alias: str = ""
     coordinator_default_alias: str = ""
     judge_default_alias: str = ""
+    stt_default_alias: str = Field(
+        default="",
+        description="Effective speech-to-text role alias (blank = voice input disabled)",
+    )
+    tts_default_alias: str = Field(
+        default="",
+        description="Effective text-to-speech role alias (blank = voice output disabled)",
+    )
 
 
 # ---------------------------------------------------------------------------

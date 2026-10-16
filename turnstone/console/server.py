@@ -1714,6 +1714,17 @@ async def list_available_models(request: Request) -> JSONResponse:
     # the session model on.
     if not judge_default_alias or judge_default_alias not in enabled_aliases:
         judge_default_alias = coordinator_default_alias
+    # STT/TTS are media roles: advertise a default only when the alias exists in
+    # the coordinator registry AND is capability-eligible (the gate the TTS
+    # endpoint applies), so the UI offers read-aloud only where it will work.
+    from turnstone.core.audio import resolve_role_alias
+
+    stt_default_alias = (
+        resolve_role_alias(config_store=cs, registry=coord_registry, role="stt") or ""
+    )
+    tts_default_alias = (
+        resolve_role_alias(config_store=cs, registry=coord_registry, role="tts") or ""
+    )
     return JSONResponse(
         {
             "models": models,
@@ -1721,7 +1732,24 @@ async def list_available_models(request: Request) -> JSONResponse:
             "channel_default_alias": channel_default_alias,
             "coordinator_default_alias": coordinator_default_alias,
             "judge_default_alias": judge_default_alias,
+            "stt_default_alias": stt_default_alias,
+            "tts_default_alias": tts_default_alias,
         }
+    )
+
+
+async def text_to_speech(request: Request) -> Response:
+    """POST /v1/api/tts — read a coordinator reply aloud.
+
+    Coordinator sessions run in the console, not on a node, so the console must
+    serve the same TTS contract the node does; the registry here is the
+    coordinator's (``coord_registry``), which may be ``None`` when no models are
+    configured — that surfaces as the standard "not configured" 503.
+    """
+    from turnstone.core.web_helpers import text_to_speech_response
+
+    return await text_to_speech_response(
+        request, registry=getattr(request.app.state, "coord_registry", None)
     )
 
 
@@ -17786,6 +17814,7 @@ def create_app(
                     ),
                     Route("/api/route", route_lookup, methods=["GET"]),
                     Route("/api/models", list_available_models),
+                    Route("/api/tts", text_to_speech, methods=["POST"]),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
