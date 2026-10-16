@@ -351,7 +351,7 @@ console.log(JSON.stringify({ s0, s1, s2, s3, s4, maxInFlight, timers: log.timers
          pressed: btn.attrs["aria-pressed"], active: T._ttsBtnActive }, toasts: log.toasts }));
 """
     )
-    assert out["s0"] == {"fetches": 1, "busy": True, "disabled": True}
+    assert out["s0"] == {"fetches": 1, "busy": True, "disabled": False}
     # Clip 1 is prefetched as soon as clip 0 starts, never earlier.
     assert out["s1"] == {
         "fetches": 2,
@@ -624,3 +624,27 @@ console.log(JSON.stringify({ toasts: log.toasts, active: T._ttsBtnActive }));
 """
     )
     assert out == {"toasts": [["Audio playback failed", "error"]], "active": None}
+
+
+def test_the_button_can_stop_a_run_during_the_first_fetch() -> None:
+    out = _play(
+        """
+const btn = button();
+T._playMessageTTS(msg(), btn); await tick();
+const first = log.fetches[0];
+const during = { busy: btn.cls.has("is-busy"), disabled: btn.disabled };
+T._playMessageTTS(msg(), btn); await tick();   // the click lands while the first clip is pending
+first.reply(); await tick();
+console.log(JSON.stringify({ during, aborted: first.opts.signal.aborted, active: T._ttsBtnActive,
+  busy: btn.cls.has("is-busy"), audios: log.audios.length, fetches: log.fetches.length, toasts: log.toasts }));
+"""
+    )
+    assert out == {
+        "during": {"busy": True, "disabled": False},
+        "aborted": True,
+        "active": None,
+        "busy": False,
+        "audios": 0,
+        "fetches": 1,
+        "toasts": [],
+    }

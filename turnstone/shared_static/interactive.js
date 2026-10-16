@@ -3554,8 +3554,8 @@ class Pane {
     const abort = new AbortController();
     this._ttsAbort = abort;
     this._ttsBtnActive = btn;
+    // Not disabled: a click during the first fetch must still stop the run.
     btn.classList.add("is-busy");
-    btn.disabled = true;
     // Many self-hosted backends synthesize one request at a time, so exactly
     // one fetch is ever in flight: clip i+1 is requested once clip i starts.
     const fetchClip = async (text) => {
@@ -3587,7 +3587,6 @@ class Pane {
         this._ttsAudio = audio;
         if (i === 0) {
           btn.classList.remove("is-busy");
-          btn.disabled = false;
           btn.classList.add("is-playing");
           btn.setAttribute("aria-pressed", "true");
           voiceAnnounce("Playing response.");
@@ -3651,7 +3650,6 @@ class Pane {
     const btn = this._ttsBtnActive;
     if (btn) {
       btn.classList.remove("is-busy", "is-playing");
-      btn.disabled = false;
       btn.setAttribute("aria-pressed", "false");
       this._ttsBtnActive = null;
     }
