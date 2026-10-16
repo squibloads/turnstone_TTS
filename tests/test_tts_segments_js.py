@@ -740,10 +740,33 @@ console.log(JSON.stringify(state()));
 
 
 def test_destroy_stops_read_aloud() -> None:
-    """destroy() is a closure over the pane, so pin the call in source: it was
-    covered only through disconnectSSE(), which no longer stops playback."""
-    body = strip_js_comments(extract_braced(_SRC, "    destroy() {"))
-    assert "pane._stopTTS()" in body
+    """destroy() is a closure in createInteractivePane, so its real source is
+    run against the real Pane: it was covered only through disconnectSSE(),
+    which no longer stops playback."""
+    destroy = (
+        strip_js_comments(extract_braced(_SRC, "    destroy() {"))
+        .encode("ascii", "backslashreplace")
+        .decode("ascii")
+    )
+    out = _play(
+        _PLAYING
+        + """
+let active = true, connected = true, recoverTimer = null;
+const pane = T;
+pane._historyRepair = { clear() {} };
+pane._removeVisibilityHandler = () => {};
+pane._scrollFollow = { destroy() {} };
+pane.el = null;
+const ctl = {
+"""
+        + destroy
+        + """
+};
+ctl.destroy();
+console.log(JSON.stringify(state()));
+"""
+    )
+    assert out == {"playing": False, "active": False, "paused": True}
 
 
 def test_an_undecodable_clip_is_not_reported_as_an_autoplay_block() -> None:
