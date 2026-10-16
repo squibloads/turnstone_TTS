@@ -103,6 +103,8 @@ function parse(html, cls) {
 
 _PLAYER = r"""
 const log = { announce: 0, toasts: [], created: [], revoked: [], timers: [], audios: [], fetches: [] };
+let authGen = 0;
+const authGeneration = () => authGen;
 let inFlight = 0, maxInFlight = 0, playMode = "ok", ignoreAbort = false;
 const tick = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
 function voiceAnnounce() { log.announce++; }
@@ -598,6 +600,24 @@ console.log(JSON.stringify(res));
         "active": None,
         "playing": False,
     }
+
+
+def test_a_login_change_mid_run_stops_playback_at_the_next_clip_boundary() -> None:
+    out = _play(
+        """
+const btn = button();
+T._playMessageTTS(msg(), btn); await tick();
+log.fetches[0].reply(); await tick();
+authGen++;  // another account signed in while clip 0 plays
+log.audios[0].fire("ended"); await tick(); log.timers[0].fn(); await tick();
+console.log(JSON.stringify({ audios: log.audios.length, fetches: log.fetches.length,
+  fetch1Aborted: log.fetches[1] ? log.fetches[1].done : null,
+  playing: btn.cls.has("is-playing"), active: T._ttsBtnActive, toasts: log.toasts }));
+"""
+    )
+    assert out["audios"] == 1  # clip 1 never played
+    assert out["fetches"] == 2 and out["fetch1Aborted"] is True  # the prefetch was aborted
+    assert out["playing"] is False and out["active"] is None and out["toasts"] == []
 
 
 def test_play_blocked_by_autoplay_policy_shows_a_toast_and_stops() -> None:

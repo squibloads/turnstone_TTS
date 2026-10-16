@@ -57,7 +57,7 @@ import {
 } from "./transcript_presentation.js";
 import { redactCredentials, tryPrettyJson } from "./redact_credentials.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "./mcp_error.js";
-import { authFetch } from "./auth.js";
+import { authFetch, authGeneration } from "./auth.js";
 import { showToast } from "./toast.js";
 import { Composer } from "./composer.js";
 import {
@@ -3647,10 +3647,19 @@ class Pane {
           "warn",
         );
       }
+      // Clips are authenticated one by one; a logout or account switch mid-run
+      // must not keep speaking (or fetching) the previous session's reply.
+      const generation = authGeneration();
+      const authChanged = () => {
+        if (generation === authGeneration()) return false;
+        this._stopTTS();
+        return true;
+      };
       let next = fetchClip(segments[0].text);
       for (let i = 0; i < segments.length; i++) {
         const blob = await next;
         if (token !== this._ttsSeq) return; // superseded: nothing minted, nothing leaked
+        if (authChanged()) return;
         if (i + 1 < segments.length) {
           next = fetchClip(segments[i + 1].text);
           next.catch(() => {}); // surfaced when awaited; not unhandled meanwhile
@@ -3694,6 +3703,7 @@ class Pane {
             this._ttsTimer = setTimeout(resolve, segments[i].pauseMs);
           });
         }
+        if (token === this._ttsSeq && authChanged()) return;
       }
       this._stopTTS();
     } catch (err) {
