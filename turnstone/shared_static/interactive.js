@@ -510,7 +510,7 @@ class Pane {
     this._ttsAudio = null;
     this._ttsBtnActive = null;
     this._ttsSeq = 0;
-    // reset() and disconnectSSE() call _stopTTS() before any playback, so
+    // reset() and replayHistory() call _stopTTS() before any playback, so
     // these must exist from construction.
     this._ttsAbort = null;
     this._ttsTimer = null;
@@ -587,8 +587,11 @@ class Pane {
     // orphan grace timers silently dropped buffered steps.  Ws-switch and
     // full-reload cleanup happens in _loadHistoryThenConnect; terminal
     // cleanup in the factory's destroy().
+    //
+    // Read-aloud is NOT stopped here: hiding the tab closes the stream, and
+    // audio that stops when you switch tabs defeats listening.  It stops where
+    // its button goes away (reset, replayHistory, destroy).
     this._stopRecording(true);
-    this._stopTTS();
   }
 
   // composer.setBusy runs unconditionally so the Stop button label /
@@ -3843,6 +3846,9 @@ class Pane {
 
   replayHistory(messages) {
     const scrollTop = this.messagesEl.scrollTop;
+    // The rebuild detaches the speaker button; playback would otherwise go on
+    // with no control left to stop it.
+    this._stopTTS();
     this.messagesEl.replaceChildren();
     // A full committed-history render repairs any recorded truncation
     // gap — from the resync itself or an unrelated clear_ui rebuild — so
@@ -6264,6 +6270,7 @@ function createInteractivePane(root, wsId, opts) {
       }
       pane._reasoningActivity.finish();
       pane.disconnectSSE();
+      pane._stopTTS();
       // The document-level visibilitychange listener holds a strong ref
       // to the pane — leaving it registered would both leak the pane and
       // let a show edge reopen a stream for a destroyed controller.

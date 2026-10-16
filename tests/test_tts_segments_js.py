@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from tests._js_harness_helpers import extract_braced, node_skip, run_node_source
+from tests._js_harness_helpers import extract_braced, node_skip, run_node_source, strip_js_comments
 
 pytestmark = node_skip
 
@@ -40,6 +40,7 @@ _PANE_SRC = "\n".join(
         "constructor(wsId, opts) {",
         "reset() {",
         "disconnectSSE() {",
+        "replayHistory(messages) {",
         *_SIGS,
     )
 ).encode("ascii", "backslashreplace").decode("ascii")
@@ -130,9 +131,13 @@ class Pane {
   setBusy() {}
   _reconcileSendDisabled() {}
   _stopRecording() {}
+  showEmptyState() {}
+  _resetStreamingRefs() {}
+  _clearAgentTracking() {}
 }
 const T = new Pane("ws", {});
 T._base = "http://x";
+T.messagesEl = { scrollTop: 0, replaceChildren() {}, setAttribute() {} };
 // Three paragraphs long enough to avoid the short-segment merge.
 const msg = () => parse(
   "<p>First paragraph is long enough.</p><p>Second paragraph is long enough.</p><p>Third paragraph is long enough.</p>",
@@ -551,3 +556,54 @@ console.log(JSON.stringify({ whilePlaying, created: log.created, revoked: log.re
     assert out["created"] == ["blob:0", "blob:1"]
     assert out["revoked"] == ["blob:0"]
     assert out["src"] == "blob:1"
+
+
+_PLAYING = """
+const btn = button();
+T._playMessageTTS(msg(), btn);
+await tick(); log.fetches[0].reply(); await tick();
+const state = () => ({ playing: btn.cls.has("is-playing"), active: T._ttsBtnActive === btn,
+  paused: log.audios[0].paused });
+"""
+
+
+def test_hiding_the_tab_does_not_stop_read_aloud() -> None:
+    """The visibility handler closes the stream with disconnectSSE(); listening
+    to a reply in another tab is the point of audio, so it must keep playing."""
+    out = _play(
+        _PLAYING
+        + """
+T.disconnectSSE();
+console.log(JSON.stringify({ state: state(), toasts: log.toasts }));
+"""
+    )
+    assert out == {"state": {"playing": True, "active": True, "paused": False}, "toasts": []}
+
+
+def test_a_history_rebuild_stops_read_aloud_before_the_button_is_detached() -> None:
+    out = _play(
+        _PLAYING
+        + """
+T.replayHistory([]);
+console.log(JSON.stringify(state()));
+"""
+    )
+    assert out == {"playing": False, "active": False, "paused": True}
+
+
+def test_reset_stops_read_aloud() -> None:
+    out = _play(
+        _PLAYING
+        + """
+T.reset();
+console.log(JSON.stringify(state()));
+"""
+    )
+    assert out == {"playing": False, "active": False, "paused": True}
+
+
+def test_destroy_stops_read_aloud() -> None:
+    """destroy() is a closure over the pane, so pin the call in source: it was
+    covered only through disconnectSSE(), which no longer stops playback."""
+    body = strip_js_comments(extract_braced(_SRC, "    destroy() {"))
+    assert "pane._stopTTS()" in body

@@ -266,6 +266,9 @@ frozen.
   synthesized rather than after the whole reply, using the same `/v1/api/tts` endpoint with one
   request in flight at a time. A request that fails, or a browser that blocks playback, now shows an
   error toast and stops.
+- **Read-aloud keeps playing when the tab is hidden** — it used to stop, because hiding the tab
+  closes the live stream and the stream teardown also stopped the audio. It now stops on Stop,
+  when the conversation is rebuilt from history, and when the pane is closed.
 - **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
   `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
   (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP
