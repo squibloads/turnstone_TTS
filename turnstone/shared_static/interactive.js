@@ -510,6 +510,11 @@ class Pane {
     this._ttsAudio = null;
     this._ttsBtnActive = null;
     this._ttsSeq = 0;
+    // reset() and disconnectSSE() call _stopTTS() before any playback, so
+    // these must exist from construction.
+    this._ttsAbort = null;
+    this._ttsTimer = null;
+    this._ttsUrls = new Set();
     this._createDOM();
   }
 
