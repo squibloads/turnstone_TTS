@@ -41,6 +41,44 @@ def _speak_version(match: re.Match[str]) -> str:
     return text.replace(".", " point ")
 
 
+_DECADE_CUE = re.compile(r"(?:\b(?:the|early|mid|late)[\s-]+|')$", re.IGNORECASE)
+_DECADE_BEFORE = re.compile(
+    r"(?<![\w.])(\d0|\d{3}0)s(?:\s*,\s*|\s+(?:and|or|to|through)\s+)$", re.IGNORECASE
+)
+
+
+def _is_decade(text: str, start: int, number: str) -> bool:
+    """Whether ``<number>s`` at *start* is a decade rather than a duration.
+
+    TTS models read "60s" as "sixties" whatever the context, so this decides.
+    Round four-digit years (1000s-2090s) always are decades; 3600s is not.  A
+    round two-digit number is one only with a cue just before it: "the", an
+    apostrophe, early/mid/late, or an earlier decade in a list ("the 80s and
+    90s").  A bare "60s" in a technical reply is a timeout far more often than
+    an era.
+    """
+    for _ in range(8):  # decade lists are short; this bounds the walk back
+        if len(number) == 4:
+            return re.fullmatch(r"1\d\d0|20\d0", number) is not None
+        if len(number) != 2 or not number.endswith("0"):
+            return False
+        before = text[max(0, start - 24) : start]
+        if _DECADE_CUE.search(before):
+            return True
+        previous = _DECADE_BEFORE.search(before)
+        if previous is None:
+            return False
+        start, number = start - len(before) + previous.start(1), previous.group(1)
+    return False
+
+
+def _seconds_unless_decade(match: re.Match[str]) -> str:
+    number = match.group(1)
+    if "." not in number and _is_decade(match.string, match.start(), number):
+        return match.group(0)
+    return f"{number} seconds"
+
+
 # Ordered (pattern, replacement); a replacement is a string or a callback.
 # Order matters: ``GB/s`` before ``GB`` and ``s``.  The two version rows stay at
 # the head so no later rule (ranges, units, "x") can eat their digits.
@@ -75,10 +113,10 @@ _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...]
         (r"(?<=\d)\s*ms\b", " milliseconds"),
         (r"(?<=\d)\s*min\b", " minutes"),
         (r"(?<=\d)\s*W\b", " watts"),
-        # "13.9 s" and "3s" are seconds; "1990s" and "80s" are decades, so an attached
-        # "s" after a multi-digit number ending in 0 is left alone ("30s" too: rare).
+        # "13.9 s", "3s" and "60s" are seconds; "1990s" and "the 80s" are decades
+        # (see _is_decade).  Not inside a word: "k8s" stays.
         (r"(?<=\d)\s+s\b", " seconds"),
-        (r"(?<=\d)(?<!\d0)s\b", " seconds"),
+        (r"(?<![\w.])(\d+(?:\.\d+)?)s\b", _seconds_unless_decade),
         # numeric ranges, but not dates (2026-10-16), version/decimal tails,
         # identifiers (Qwen3-8B) or calibers (30-06: a right side starting 0)
         (r"(?<![\w.-])(\d+)-(?!0)(\d+)(?![\w.-])", "\\1 to \\2"),
