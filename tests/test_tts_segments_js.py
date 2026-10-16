@@ -375,6 +375,17 @@ def test_an_unbroken_run_over_the_limit_is_hard_cut() -> None:
     assert [len(r["text"]) for r in rows] == [600, 600, 101]  # 100 x's plus the added period
 
 
+def test_a_hard_cut_never_splits_a_surrogate_pair() -> None:
+    # "x" shifts the run so the 600-unit cut lands between a pair's halves.
+    rows = _extract("<p>x" + "😀" * 400 + "</p>")[0]
+    assert len(rows) > 1
+    for r in rows:  # a lone surrogate would encode to U+FFFD on the wire
+        r["text"].encode("utf-8")
+    joined = "".join(r["text"] for r in rows)
+    assert joined.count("😀") == 400
+    assert all(len(r["text"]) <= 600 for r in rows)
+
+
 def test_plain_text_body_falls_back_to_one_flattened_segment() -> None:
     assert _segs("  hello   world \n there ") == [("hello world there.", 0)]
     assert _segs("Plain <b>bold</b> words, no blocks") == [("Plain bold words, no blocks.", 0)]

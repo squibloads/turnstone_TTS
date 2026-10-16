@@ -3555,7 +3555,12 @@ class Pane {
       while (s.length > MAX_CHARS) {
         const comma = s.lastIndexOf(",", MAX_CHARS - 1);
         const space = s.lastIndexOf(" ", MAX_CHARS);
-        const cut = comma > 0 ? comma + 1 : space > 0 ? space : MAX_CHARS;
+        let cut = comma > 0 ? comma + 1 : space > 0 ? space : MAX_CHARS;
+        // A hard cut must not land between the halves of a surrogate pair.
+        if (cut === MAX_CHARS && comma <= 0 && space <= 0) {
+          const hi = s.charCodeAt(cut - 1);
+          if (hi >= 0xd800 && hi <= 0xdbff) cut--;
+        }
         parts.push(s.slice(0, cut).trim());
         s = s.slice(cut).trim();
       }
