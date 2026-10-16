@@ -32,22 +32,16 @@ _METHODS = ",\n".join(extract_braced(_SRC, sig) for sig in _SIGS)  # object-lite
 # The real constructor and the lifecycle methods that call _stopTTS() (reset,
 # replayHistory; disconnectSSE deliberately does not); the
 # player tests build their pane from these so a field the constructor fails to
-# initialise breaks them, as it blanked live transcripts on 2026-10-16.  The
-# constructor has non-ASCII comments and run_node_source writes the script in
-# the locale encoding (cp1252 on Windows), so they are escaped here.
-_PANE_SRC = (
-    "\n".join(
-        extract_braced(_SRC, sig)
-        for sig in (
-            "constructor(wsId, opts) {",
-            "reset() {",
-            "disconnectSSE() {",
-            "replayHistory(messages) {",
-            *_SIGS,
-        )
+# initialise breaks them, as it blanked live transcripts on 2026-10-16.
+_PANE_SRC = "\n".join(
+    extract_braced(_SRC, sig)
+    for sig in (
+        "constructor(wsId, opts) {",
+        "reset() {",
+        "disconnectSSE() {",
+        "replayHistory(messages) {",
+        *_SIGS,
     )
-    .encode("ascii", "backslashreplace")
-    .decode("ascii")
 )
 
 # Just enough DOM for the walker: element/text nodes, classList.contains and
@@ -751,11 +745,7 @@ def test_destroy_stops_read_aloud() -> None:
     """destroy() is a closure in createInteractivePane, so its real source is
     run against the real Pane: it was covered only through disconnectSSE(),
     which no longer stops playback."""
-    destroy = (
-        strip_js_comments(extract_braced(_SRC, "    destroy() {"))
-        .encode("ascii", "backslashreplace")
-        .decode("ascii")
-    )
+    destroy = strip_js_comments(extract_braced(_SRC, "    destroy() {"))
     out = _play(
         _PLAYING
         + """
