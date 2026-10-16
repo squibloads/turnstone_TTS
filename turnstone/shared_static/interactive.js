@@ -514,7 +514,6 @@ class Pane {
     // these must exist from construction.
     this._ttsAbort = null;
     this._ttsTimer = null;
-    this._ttsUrls = new Set();
     this._createDOM();
   }
 
@@ -3567,21 +3566,20 @@ class Pane {
         const b = await r.json().catch(() => null);
         throw new Error((b && b.error) || "Speech synthesis failed");
       }
-      const blob = await r.blob();
-      if (token !== this._ttsSeq) return null; // superseded: nothing to leak
-      const url = URL.createObjectURL(blob);
-      this._ttsUrls.add(url);
-      return url;
+      return r.blob();
     };
     try {
       let next = fetchClip(segments[0].text);
       for (let i = 0; i < segments.length; i++) {
-        const url = await next;
-        if (token !== this._ttsSeq) return;
+        const blob = await next;
+        if (token !== this._ttsSeq) return; // superseded: nothing minted, nothing leaked
         if (i + 1 < segments.length) {
           next = fetchClip(segments[i + 1].text);
           next.catch(() => {}); // surfaced when awaited; not unhandled meanwhile
         }
+        // Minted only now so a prefetched clip holds no object URL; _stopTTS
+        // revokes the playing clip's, the "ended" path below the finished one.
+        const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
         this._ttsAudio = audio;
         if (i === 0) {
@@ -3605,7 +3603,7 @@ class Pane {
             );
         });
         URL.revokeObjectURL(url);
-        this._ttsUrls.delete(url);
+        this._ttsAudio = null;
         if (segments[i].pauseMs) {
           await new Promise((resolve) => {
             this._ttsTimer = setTimeout(resolve, segments[i].pauseMs);
@@ -3636,10 +3634,9 @@ class Pane {
       } catch (e) {
         /* ignore */
       }
+      URL.revokeObjectURL(this._ttsAudio.src);
       this._ttsAudio = null;
     }
-    this._ttsUrls.forEach((u) => URL.revokeObjectURL(u));
-    this._ttsUrls.clear();
     const btn = this._ttsBtnActive;
     if (btn) {
       btn.classList.remove("is-busy", "is-playing");

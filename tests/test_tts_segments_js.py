@@ -424,7 +424,7 @@ console.log(JSON.stringify({ cleared: timer.cleared, audios: log.audios.length,
     assert out["cleared"] is True
     assert out["audios"] == 1
     assert out["fetches"] == 2
-    # Clip 1 was fetched (URL created) before the stop and must still be revoked.
+    # Whatever was minted before the stop (the playing clip) must be revoked.
     assert sorted(out["revoked"]) == sorted(out["created"])
 
 
@@ -477,7 +477,7 @@ log.fetches[2].fail("network down"); await tick();
 // The failure is held until the next clip is due: the current clip is not cut off.
 res.during = { toasts: log.toasts.length, paused: log.audios[0].paused };
 log.audios[0].fire("ended"); await tick(); log.timers[0].fn(); await tick();
-res.network = { toasts: [...log.toasts], paused: log.audios[0].paused, active: T._ttsBtnActive,
+res.network = { toasts: [...log.toasts], audio: T._ttsAudio, active: T._ttsBtnActive,
   playing: btn.cls.has("is-playing") };
 console.log(JSON.stringify(res));
 """
@@ -491,7 +491,7 @@ console.log(JSON.stringify(res));
     assert out["during"] == {"toasts": 0, "paused": False}
     assert out["network"] == {
         "toasts": [["network down", "error"]],
-        "paused": True,
+        "audio": None,  # the finished clip was released, not left dangling
         "active": None,
         "playing": False,
     }
@@ -532,3 +532,22 @@ console.log(JSON.stringify({{ missing }}));
 """
     )
     assert out == {"missing": []}
+
+
+def test_a_prefetched_clip_is_a_blob_until_it_plays() -> None:
+    out = _play(
+        """
+const btn = button();
+T._playMessageTTS(msg(), btn);
+await tick(); log.fetches[0].reply(); await tick();
+log.fetches[1].reply(); await tick();          // clip 1 arrives while clip 0 plays
+const whilePlaying = { created: [...log.created], audios: log.audios.length };
+log.audios[0].fire("ended"); await tick(); log.timers[0].fn(); await tick();
+console.log(JSON.stringify({ whilePlaying, created: log.created, revoked: log.revoked,
+  src: log.audios[1].src }));
+"""
+    )
+    assert out["whilePlaying"] == {"created": ["blob:0"], "audios": 1}
+    assert out["created"] == ["blob:0", "blob:1"]
+    assert out["revoked"] == ["blob:0"]
+    assert out["src"] == "blob:1"
