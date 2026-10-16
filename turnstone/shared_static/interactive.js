@@ -3508,9 +3508,11 @@ class Pane {
   _shapeSpeechSegments(raw) {
     const MIN_CHARS = 20;
     const MAX_CHARS = 600;
-    // Closing quotes/brackets may follow the mark (a string: the test harness
-    // slices methods with a brace walker that mistakes quotes in a regex literal).
-    const ENDS_SENTENCE = new RegExp("[.!?:\\u2026][\"')\\]\\u201d\\u2019]*$");
+    // Closing quotes/brackets may follow the mark.  The quotes are written as
+    // hex escapes (x22 and x27) because the test harness slices methods with a
+    // brace walker that treats a quote character inside a regex literal as the
+    // start of a string.
+    const ENDS_SENTENCE = /[.!?:\u2026][\x22\x27)\]\u201d\u2019]*$/;
     const rows = [];
     for (const r of raw) {
       const text = r.text.replace(/\s+/g, " ").trim().replace(/,$/, "");
