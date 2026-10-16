@@ -3728,7 +3728,9 @@ class Pane {
       // Clips are authenticated one by one; a logout or account switch mid-run
       // must not keep speaking (or fetching) the previous session's reply.
       const generation = authGeneration();
-      const authChanged = () => {
+      // Stops the pane's CURRENT run, so a caller must already know it is this
+      // run (the token test) or it would silence a newer one.
+      const stopIfAuthChanged = () => {
         if (generation === authGeneration()) return false;
         this._stopTTS();
         return true;
@@ -3737,7 +3739,7 @@ class Pane {
       for (let i = 0; i < segments.length; i++) {
         const blob = await next;
         if (token !== this._ttsSeq) return; // superseded: nothing minted, nothing leaked
-        if (authChanged()) return;
+        if (stopIfAuthChanged()) return;
         if (i + 1 < segments.length) {
           next = fetchClip(segments[i + 1].text);
           next.catch(() => {}); // surfaced when awaited; not unhandled meanwhile
@@ -3781,7 +3783,7 @@ class Pane {
             this._ttsTimer = setTimeout(resolve, segments[i].pauseMs);
           });
         }
-        if (token === this._ttsSeq && authChanged()) return;
+        if (token === this._ttsSeq && stopIfAuthChanged()) return;
       }
       this._stopTTS();
     } catch (err) {
