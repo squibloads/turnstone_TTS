@@ -82,7 +82,7 @@ function parse(html, cls) {
 
 _PLAYER = r"""
 const log = { announce: 0, toasts: [], created: [], revoked: [], timers: [], audios: [], fetches: [] };
-let inFlight = 0, maxInFlight = 0, playMode = "ok";
+let inFlight = 0, maxInFlight = 0, playMode = "ok", ignoreAbort = false;
 const tick = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
 function voiceAnnounce() { log.announce++; }
 function showToast(msg, kind) { log.toasts.push([msg, kind]); }
@@ -101,7 +101,9 @@ globalThis.Audio = class {
   }
   fire(n) { this.l[n](); }
 };
-// Manual fetch: each call parks until the test settles it; honours abort.
+// Manual fetch: each call parks until the test settles it; honours abort unless
+// ignoreAbort is set, which models a reply already in flight when the run is
+// superseded (the response still resolves after the abort).
 function authFetch(url, opts) {
   inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
   return new Promise((resolve, reject) => {
@@ -110,7 +112,7 @@ function authFetch(url, opts) {
     f.reply = () => finish(resolve, { ok: true, blob: async () => "audio" });
     f.refuse = (error) => finish(resolve, { ok: false, json: async () => ({ error }) });
     f.fail = (msg) => finish(reject, new Error(msg));
-    opts.signal.addEventListener("abort", () => finish(reject, new Error("aborted")));
+    opts.signal.addEventListener("abort", () => { if (!ignoreAbort) finish(reject, new Error("aborted")); });
     log.fetches.push(f);
   });
 }
@@ -457,6 +459,7 @@ console.log(JSON.stringify({ cleared: timer.cleared, audios: log.audios.length,
 def test_a_superseded_run_is_ignored_and_the_active_button_toggles_off() -> None:
     out = _play(
         """
+ignoreAbort = true;                      // A's reply still lands after the abort
 const a = button(), b = button();
 T._playMessageTTS(msg(), a);
 await tick();
