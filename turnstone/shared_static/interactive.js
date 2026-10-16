@@ -66,6 +66,7 @@ import {
   getVoiceRoles,
   shapeSpeechSegments,
 } from "./tts_player.js";
+import { createMicController } from "./stt_mic.js";
 import { showToast } from "./toast.js";
 import { Composer } from "./composer.js";
 import {
@@ -482,16 +483,7 @@ class Pane {
     this._pendingEditSend = null;
     // Voice I/O (mic STT + per-message TTS playback)
     this._voiceRoles = { stt: false, tts: false };
-    this._micBtn = null;
-    this._micIcon = null;
-    this._micDenied = false;
-    this._recorder = null;
-    this._recordingStream = null;
-    this._isRecording = false;
-    this._discardRecording = false;
-    this._recordAborted = false;
-    this._recordTimer = null;
-    this._recordStartMs = 0;
+    this._mic = null;
     // reset() and replayHistory() call _stopTTS() before any playback, so the
     // player exists from construction (the base is read per request: a console
     // pane's is fixed, but a test or host may set it after construction).
@@ -605,14 +597,7 @@ class Pane {
     if (edge && !next) this.queue.onIdleEdge();
     // The mic produces composer input the user can only send when idle — keep
     // it in lockstep with the send button (which composer.setBusy gates).
-    if (this._micBtn && !this._micDenied) {
-      if (next) {
-        this._stopRecording(true); // abandon any in-flight recording
-        this._micBtn.disabled = true;
-      } else if (!this._micBtn.classList.contains("is-busy")) {
-        this._micBtn.disabled = false;
-      }
-    }
+    if (this._mic) this._mic.syncBusy();
   }
 
   // Shared-workstream send gate: while another participant's turn is in flight,
@@ -1445,17 +1430,19 @@ class Pane {
 
     // Voice input: mic button, hidden until the STT role is confirmed
     // available (so it never appears when voice isn't configured).
-    this._buildMicButton();
+    this._mic = createMicController({
+      composer: this.composer,
+      base: () => this._base,
+      wsId: () => this.wsId,
+      announce: voiceAnnounce,
+      isBusy: () => this.busy,
+    });
     getVoiceRoles(this._base).then((roles) => this._applyVoiceRoles(roles));
   }
 
   _applyVoiceRoles(roles) {
     this._voiceRoles = roles;
-    if (this._micBtn) this._micBtn.style.display = roles.stt ? "" : "none";
-    // Right-align the mic next to send (instead of stranded by the model
-    // chip) only when STT is actually available; .has-mic drives the CSS.
-    if (this.composer && this.composer.actionsRowEl)
-      this.composer.actionsRowEl.classList.toggle("has-mic", !!roles.stt);
+    if (this._mic) this._mic.setAvailable(!!roles.stt);
     // The roles resolve asynchronously, usually after the first replay has
     // already built bubbles; give those their speaker now.
     this._addTtsActionsToFinished();
@@ -3126,271 +3113,9 @@ class Pane {
   // Voice I/O: microphone dictation (STT) + per-message playback (TTS)
   // -------------------------------------------------------------------------
 
-  _buildMicButton() {
-    if (!this.composer || !this.composer.actionsRowEl) return;
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "composer-mic-btn";
-    btn.style.display = "none"; // revealed once the STT role is confirmed
-    btn.title = "Record speech to text";
-    btn.setAttribute("aria-label", "Record speech to text");
-    btn.setAttribute("aria-pressed", "false");
-    const icon = document.createElement("span");
-    icon.className = "composer-mic-icon icon-mic";
-    icon.setAttribute("aria-hidden", "true");
-    btn.appendChild(icon);
-    this._micIcon = icon;
-    btn.addEventListener("click", () => this._toggleRecording());
-    this.composer.actionsRowEl.insertBefore(btn, this.sendBtn || null);
-    this._micBtn = btn;
-  }
-
-  _syncMicButton() {
-    if (!this._micBtn) return;
-    const rec = !!this._isRecording;
-    this._micBtn.classList.toggle("is-recording", rec);
-    this._micBtn.setAttribute("aria-pressed", rec ? "true" : "false");
-    if (this._micIcon) {
-      this._micIcon.classList.toggle("icon-stop", rec);
-      this._micIcon.classList.toggle("icon-mic", !rec);
-    }
-    const label = rec
-      ? "Stop recording and transcribe"
-      : "Record speech to text";
-    this._micBtn.title = label;
-    this._micBtn.setAttribute("aria-label", label);
-  }
-
-  _toggleRecording() {
-    if (this._isRecording) {
-      this._stopRecording(false);
-    } else {
-      this._startRecording();
-    }
-  }
-
-  _startRecording() {
-    if (this._isRecording || this.busy) return;
-    if (
-      !navigator.mediaDevices ||
-      !navigator.mediaDevices.getUserMedia ||
-      typeof MediaRecorder === "undefined"
-    ) {
-      showToast("Microphone capture is not supported in this browser", "error");
-      return;
-    }
-    // Synchronous abort latch: if teardown (reset / pane switch) runs while the
-    // permission prompt is open, the stream the promise later hands us must be
-    // stopped instead of going hot after teardown.
-    this._recordAborted = false;
-    navigator.mediaDevices
-      .getUserMedia({ audio: true })
-      .then((stream) => {
-        if (this._recordAborted) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        this._recordingStream = stream;
-        let mimeType = "";
-        const candidates = [
-          "audio/webm;codecs=opus",
-          "audio/webm",
-          "audio/ogg;codecs=opus",
-          "audio/mp4",
-        ];
-        for (let i = 0; i < candidates.length; i++) {
-          if (
-            MediaRecorder.isTypeSupported &&
-            MediaRecorder.isTypeSupported(candidates[i])
-          ) {
-            mimeType = candidates[i];
-            break;
-          }
-        }
-        const rec = mimeType
-          ? new MediaRecorder(stream, { mimeType })
-          : new MediaRecorder(stream);
-        const chunks = [];
-        rec.addEventListener("dataavailable", (e) => {
-          if (e.data && e.data.size) chunks.push(e.data);
-        });
-        rec.addEventListener("stop", () => {
-          this._teardownRecordingStream();
-          this._isRecording = false;
-          this._stopRecordTimer();
-          this._syncMicButton();
-          const discard = this._discardRecording;
-          this._discardRecording = false;
-          if (discard) return;
-          const blob = new Blob(chunks, {
-            type: rec.mimeType || mimeType || "audio/webm",
-          });
-          if (blob.size) this._uploadForTranscription(blob);
-        });
-        this._recorder = rec;
-        this._isRecording = true;
-        this._discardRecording = false;
-        this._startRecordTimer();
-        this._syncMicButton();
-        voiceAnnounce(
-          "Recording. Activate the microphone button again to stop.",
-        );
-        rec.start();
-      })
-      .catch(() => {
-        // Denied / hardware unavailable: leave a persistent disabled state with
-        // guidance — a hot button reads as dead once the browser blocks re-prompts.
-        this._teardownRecordingStream();
-        this._isRecording = false;
-        this._stopRecordTimer();
-        this._setMicDenied();
-      });
-  }
-
-  _setMicDenied() {
-    this._micDenied = true;
-    showToast("Microphone access was denied", "error");
-    this._syncMicButton();
-    if (this._micBtn) {
-      this._micBtn.disabled = true;
-      const msg =
-        "Microphone blocked — enable it in your browser's site settings";
-      this._micBtn.title = msg;
-      this._micBtn.setAttribute("aria-label", msg);
-    }
-  }
-
-  _startRecordTimer() {
-    this._recordStartMs = Date.now();
-    this._stopRecordTimer();
-    this._recordTimer = window.setInterval(() => this._tickRecordTimer(), 500);
-  }
-
-  _stopRecordTimer() {
-    if (this._recordTimer) {
-      window.clearInterval(this._recordTimer);
-      this._recordTimer = null;
-    }
-  }
-
-  _tickRecordTimer() {
-    if (!this._isRecording || !this._micBtn) return;
-    const secs = Math.max(
-      0,
-      Math.floor((Date.now() - this._recordStartMs) / 1000),
-    );
-    const mmss =
-      Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
-    this._micBtn.title = "Recording " + mmss + " — activate to stop";
-  }
-
+  // The recorder lives in stt_mic.js; reset / hide / destroy reach it here.
   _stopRecording(discard) {
-    this._discardRecording = !!discard;
-    this._recordAborted = true; // abort a getUserMedia still in flight
-    if (this._recorder && this._recorder.state !== "inactive") {
-      try {
-        this._recorder.stop();
-      } catch (e) {
-        /* already stopped */
-      }
-      return;
-    }
-    this._teardownRecordingStream();
-    this._stopRecordTimer();
-    if (this._isRecording) {
-      this._isRecording = false;
-      this._syncMicButton();
-    }
-  }
-
-  _teardownRecordingStream() {
-    if (this._recordingStream) {
-      this._recordingStream.getTracks().forEach((t) => t.stop());
-      this._recordingStream = null;
-    }
-    this._recorder = null;
-  }
-
-  _uploadForTranscription(blob) {
-    if (!this.wsId) return;
-    const ext =
-      blob.type.indexOf("ogg") !== -1
-        ? "ogg"
-        : blob.type.indexOf("mp4") !== -1
-          ? "mp4"
-          : "webm";
-    const fd = new FormData();
-    fd.append("audio", blob, "speech." + ext);
-    if (this._micBtn) {
-      this._micBtn.disabled = true;
-      this._micBtn.classList.add("is-busy");
-    }
-    voiceAnnounce("Transcribing…");
-    const resetMic = () => {
-      if (this._micBtn && !this._micDenied) {
-        this._micBtn.disabled = !!this.busy;
-        this._micBtn.classList.remove("is-busy");
-      }
-    };
-    authFetch(
-      this._base +
-        "/v1/api/workstreams/" +
-        encodeURIComponent(this.wsId) +
-        "/speech-to-text/stream",
-      { method: "POST", body: fd },
-    )
-      .then(async (r) => {
-        if (!r.ok) {
-          let msg = "Transcription failed";
-          try {
-            const body = await r.json();
-            if (body && body.error) msg = body.error;
-          } catch (_e) {
-            /* non-JSON error body */
-          }
-          showToast(msg, "error");
-          return;
-        }
-        // Stream transcript deltas into the composer as they arrive (first word
-        // in ~0.3s) instead of waiting for the whole transcript.
-        const reader = r.body.getReader();
-        const decoder = new TextDecoder();
-        let started = false;
-        let got = false;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          if (!chunk || !this.inputEl) continue;
-          got = true;
-          if (!started) {
-            // Read the composer's value now (not before the await) so text the
-            // user typed while transcribing isn't clobbered.
-            const cur = this.inputEl.value || "";
-            this.inputEl.value = cur
-              ? cur.replace(/\s*$/, "") + " " + chunk
-              : chunk;
-            started = true;
-          } else {
-            this.inputEl.value += chunk;
-          }
-          // Drive the composer's auto-resize + send-enable listeners.
-          this.inputEl.dispatchEvent(new Event("input", { bubbles: true }));
-        }
-        if (got) {
-          if (this.inputEl) this.inputEl.focus();
-          voiceAnnounce("Transcript added to message.");
-        } else {
-          showToast("No speech detected", "error");
-        }
-      })
-      .catch((err) => {
-        showToast(
-          "Transcription failed: " + (err && err.message ? err.message : err),
-          "error",
-        );
-      })
-      .finally(resetMic);
+    if (this._mic) this._mic.stop(discard);
   }
 
   _addTtsAction(el) {
