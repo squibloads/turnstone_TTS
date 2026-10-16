@@ -3460,19 +3460,31 @@ class Pane {
       if (!t.trim()) return;
       cur.text = t + (ENDS.test(t) ? " " : ". ");
     };
+    // A cell after the first sets cellSep; the ", " is written only once the
+    // cell has text, so an empty cell adds no separator and padding around
+    // the cell text does not leave "Plan , Price".
+    let cellSep = false;
+    const addText = (str) => {
+      if (!cur) raw.push((cur = { text: "", pauseMs: 500 }));
+      if (!cellSep) {
+        cur.text += str;
+        return;
+      }
+      if (!str.trim()) return;
+      cur.text = cur.text.trimEnd() + ", " + str.trimStart();
+      cellSep = false;
+    };
     const walk = (node) => {
       for (const child of node.childNodes) {
         if (child.nodeType === 3) {
-          if (!cur) raw.push((cur = { text: "", pauseMs: 500 }));
-          cur.text += child.textContent;
+          addText(child.textContent);
           continue;
         }
         if (child.nodeType !== 1) continue;
         const cls = child.classList;
         if (cls.contains("katex") || cls.contains("katex-display")) continue;
         if (child.tagName === "CODE" && child.textContent.length >= INLINE_CODE_MAX) {
-          if (!cur) raw.push((cur = { text: "", pauseMs: 500 }));
-          if (!/Code omitted\.\s*$/.test(cur.text)) cur.text += " Code omitted. ";
+          if (!/Code omitted\.\s*$/.test(cur ? cur.text : "")) addText(" Code omitted. ");
           continue;
         }
         if (child.tagName === "PRE") {
@@ -3499,12 +3511,13 @@ class Pane {
           continue;
         }
         const isCell = child.tagName === "TD" || child.tagName === "TH";
-        if (isCell && cur && cur.text.trim()) cur.text += ", ";
+        if (isCell && cur && cur.text.trim()) cellSep = true;
         const pauseMs = PAUSE[child.tagName];
         if (pauseMs === undefined) {
           walk(child);
           continue;
         }
+        cellSep = false;
         raw.push((cur = { text: "", pauseMs, table: child.tagName === "TR" }));
         walk(child);
         cur = null; // a nested block ends this one; later text starts anew

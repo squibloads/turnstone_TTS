@@ -269,6 +269,13 @@ def test_table_rows_join_cells_with_commas() -> None:
     ) == [("Column name, Column value.", 150), ("alpha first, beta second.", 0)]
 
 
+def test_empty_and_padded_table_cells_do_not_leave_stray_separators() -> None:
+    assert _segs(
+        "<table><tr><td>first cell</td><td></td><td> </td><td>last cell</td></tr>"
+        "<tr><th> Plan </th><th> Price </th></tr></table>"
+    ) == [("first cell, last cell.", 150), ("Plan, Price.", 0)]
+
+
 def test_short_table_rows_are_never_merged() -> None:
     assert _segs(
         "<table><tr><th>Plan</th><th>Price</th></tr><tr><td>Pro</td><td>$9</td></tr>"
