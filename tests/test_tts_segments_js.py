@@ -376,8 +376,14 @@ def test_an_unbroken_run_over_the_limit_is_hard_cut() -> None:
 
 
 def test_plain_text_body_falls_back_to_one_flattened_segment() -> None:
-    assert _segs("  hello   world \n there ") == [("hello world there", 0)]
-    assert _segs("Plain <b>bold</b> words, no blocks") == [("Plain bold words, no blocks", 0)]
+    assert _segs("  hello   world \n there ") == [("hello world there.", 0)]
+    assert _segs("Plain <b>bold</b> words, no blocks") == [("Plain bold words, no blocks.", 0)]
+
+
+def test_block_less_text_is_capped_like_any_other_reply() -> None:
+    rows = _extract(("word " * 300).strip())[0]
+    assert len(rows) > 1
+    assert all(len(r["text"]) <= 600 for r in rows)
 
 
 def test_empty_bodies_yield_no_segments() -> None:

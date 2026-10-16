@@ -3451,7 +3451,6 @@ class Pane {
     };
     const raw = [];
     let cur = null; // segment taking inline text; null until the next text
-    let sawBlock = false;
     let listDepth = 0; // inside a list everything folds into the one list row
     // Written with hex escapes for the quote characters; see _shapeSpeechSegments.
     const ENDS = /[.!?:\u2026][\x22\x27)\]\u201d\u2019]*$/;
@@ -3476,7 +3475,6 @@ class Pane {
           continue;
         }
         if (child.tagName === "PRE") {
-          sawBlock = true;
           raw.push({ text: "Code omitted.", pauseMs: 400, code: true });
           cur = listDepth ? { text: "", pauseMs: 0, list: true } : null;
           if (cur) raw.push(cur);
@@ -3484,7 +3482,6 @@ class Pane {
         }
         const tag = child.tagName;
         if (tag === "UL" || tag === "OL" || tag === "DL") {
-          sawBlock = true;
           if (listDepth) itemBreak();
           else raw.push((cur = { text: "", pauseMs: 0, list: true }));
           listDepth++;
@@ -3507,21 +3504,15 @@ class Pane {
           walk(child);
           continue;
         }
-        sawBlock = true;
         raw.push((cur = { text: "", pauseMs, table: child.tagName === "TR" }));
         walk(child);
         cur = null; // a nested block ends this one; later text starts anew
       }
     };
     walk(bodyEl);
-    if (sawBlock) return this._shapeSpeechSegments(raw);
-    // No block structure (plain text): speak it as one clip, as before.
-    const text = raw
-      .map((r) => r.text)
-      .join("")
-      .replace(/\s+/g, " ")
-      .trim();
-    return text ? [{ text, pauseMs: 0 }] : [];
+    // Plain text (no block structure) is shaped like any other reply, so the
+    // clip cap applies to it too.
+    return this._shapeSpeechSegments(raw);
   }
 
   // Normalise raw block text into clips a TTS model reads well: terminal
