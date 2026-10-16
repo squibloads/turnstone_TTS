@@ -3427,8 +3427,12 @@ class Pane {
   // The speakable reply as [{text, pauseMs}], one row per block element so a
   // heading, list item or table row gets its own clip and a pause instead of
   // running into the next sentence.  Fenced code becomes a marker and rendered
-  // math (KaTeX's accessibility text) is dropped; inline code is spoken.
+  // math (KaTeX's accessibility text) is dropped.  Inline code is spoken when
+  // short (an identifier or flag) and replaced by the marker from
+  // INLINE_CODE_MAX characters up (a command line or expression is noise
+  // read aloud), in place so the paragraph around it stays one clip.
   _extractSpeechSegments(bodyEl) {
+    const INLINE_CODE_MAX = 40;
     const PAUSE = {
       H1: 600,
       H2: 600,
@@ -3446,6 +3450,10 @@ class Pane {
     const raw = [];
     let cur = null; // segment taking inline text; null until the next text
     let sawBlock = false;
+    const textLength = (node) =>
+      node.nodeType === 3
+        ? node.textContent.length
+        : (node.childNodes || []).reduce((n, c) => n + textLength(c), 0);
     const walk = (node) => {
       for (const child of node.childNodes) {
         if (child.nodeType === 3) {
@@ -3456,6 +3464,11 @@ class Pane {
         if (child.nodeType !== 1) continue;
         const cls = child.classList;
         if (cls.contains("katex") || cls.contains("katex-display")) continue;
+        if (child.tagName === "CODE" && textLength(child) >= INLINE_CODE_MAX) {
+          if (!cur) raw.push((cur = { text: "", pauseMs: 500 }));
+          if (!/Code omitted\.\s*$/.test(cur.text)) cur.text += " Code omitted. ";
+          continue;
+        }
         if (child.tagName === "PRE") {
           sawBlock = true;
           raw.push({ text: "Code omitted.", pauseMs: 400, code: true });
@@ -3501,6 +3514,8 @@ class Pane {
       const text = r.text.replace(/\s+/g, " ").trim().replace(/,$/, "");
       if (!text) continue;
       const end = ENDS_SENTENCE.test(text) ? "" : ".";
+      // Adjacent fenced blocks are one omission, not one request each.
+      if (r.code && rows.length && rows[rows.length - 1].code) continue;
       rows.push({ text: text + end, pauseMs: r.pauseMs, code: !!r.code });
     }
     const merged = [];

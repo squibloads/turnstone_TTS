@@ -682,3 +682,37 @@ console.log(JSON.stringify({ active: T._ttsBtnActive, busy: btn.cls.has("is-busy
 """
     )
     assert out == {"active": None, "busy": False, "fetches": 0, "toasts": []}
+
+
+def test_inline_code_under_the_threshold_is_spoken_and_longer_is_omitted() -> None:
+    short = "a" * 39
+    long_ = "a" * 40
+    assert _segs(f"<p>Call the <code>{short}</code> function afterwards.</p>") == [
+        (f"Call the {short} function afterwards.", 0)
+    ]
+    # At the threshold the code is replaced in place; the paragraph is not split.
+    assert _segs(f"<p>Call the <code>{long_}</code> function afterwards.</p>") == [
+        ("Call the Code omitted. function afterwards.", 0)
+    ]
+
+
+def test_inline_code_length_counts_nested_markup() -> None:
+    parts = "<b>" + "b" * 20 + "</b>" + "c" * 20
+    assert _segs(f"<p>Use <code>{parts}</code> to proceed now.</p>") == [
+        ("Use Code omitted. to proceed now.", 0)
+    ]
+
+
+def test_consecutive_code_markers_collapse_into_one() -> None:
+    assert _segs(
+        "<p>Run these two commands now:</p><pre>a</pre>\n<pre>b</pre><pre>c</pre>"
+        "<p>Then continue with the rest.</p>"
+    ) == [
+        ("Run these two commands now:", 500),
+        ("Code omitted.", 400),
+        ("Then continue with the rest.", 0),
+    ]
+    long_ = "x" * 40
+    assert _segs(f"<p>See <code>{long_}</code> <code>{long_}</code> for details here.</p>") == [
+        ("See Code omitted. for details here.", 0)
+    ]
