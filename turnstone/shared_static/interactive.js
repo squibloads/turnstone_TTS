@@ -3502,7 +3502,9 @@ class Pane {
   // Normalise raw block text into clips a TTS model reads well: terminal
   // punctuation so it pauses and drops pitch, fragments folded into the next
   // clip (a five-word clip sounds clipped), long blocks cut at sentence ends
-  // (long inputs raise latency and fail on some backends).
+  // (long inputs raise latency and fail on some backends, and the server
+  // rejects more than 8000 characters).  A sentence that is itself longer than
+  // that is wrapped at its last comma, else its last space.
   _shapeSpeechSegments(raw) {
     const MIN_CHARS = 20;
     const MAX_CHARS = 600;
@@ -3530,6 +3532,18 @@ class Pane {
       carry = "";
       merged.push({ text, pauseMs: r.pauseMs });
     });
+    const wrapLong = (s) => {
+      const parts = [];
+      while (s.length > MAX_CHARS) {
+        const comma = s.lastIndexOf(",", MAX_CHARS - 1);
+        const space = s.lastIndexOf(" ", MAX_CHARS);
+        const cut = comma > 0 ? comma + 1 : space > 0 ? space : MAX_CHARS;
+        parts.push(s.slice(0, cut).trim());
+        s = s.slice(cut).trim();
+      }
+      parts.push(s);
+      return parts;
+    };
     const out = [];
     for (const seg of merged) {
       if (seg.text.length <= MAX_CHARS) {
@@ -3538,7 +3552,11 @@ class Pane {
       }
       // Lookbehind is avoided: an unsupported regex fails the whole script.
       let piece = "";
-      for (const s of seg.text.replace(/([.!?])\s+/g, "$1\n").split("\n")) {
+      const sentences = seg.text
+        .replace(/([.!?])\s+/g, "$1\n")
+        .split("\n")
+        .flatMap(wrapLong);
+      for (const s of sentences) {
         if (piece && piece.length + 1 + s.length > MAX_CHARS) {
           out.push({ text: piece, pauseMs: 0 });
           piece = s;

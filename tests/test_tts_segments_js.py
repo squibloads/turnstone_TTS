@@ -293,10 +293,27 @@ def test_long_segment_splits_at_sentence_boundaries() -> None:
     assert [r["pauseMs"] for r in rows] == [0, 500, 0]
 
 
-def test_a_single_sentence_over_the_limit_stays_whole() -> None:
-    word_run = " ".join(["word"] * 200) + "."  # 1000 chars, no inner boundary
-    rows = _extract(f"<p>{word_run}</p>")[0]
-    assert [r["text"] for r in rows] == [word_run]
+def test_a_sentence_over_the_limit_is_wrapped_at_the_last_comma() -> None:
+    para = ", ".join(["word"] * 600) + "."  # 3,598 chars, commas but no sentence end
+    rows = _extract(f"<p>{para}</p>")[0]
+    assert len(rows) > 5
+    assert all(len(r["text"]) <= 600 for r in rows)
+    assert all(r["text"].endswith(",") for r in rows[:-1])
+    assert " ".join(r["text"] for r in rows) == para
+    assert [r["pauseMs"] for r in rows] == [0] * len(rows)  # the last piece's pause is dropped
+
+
+def test_a_sentence_over_the_limit_without_commas_is_wrapped_at_a_space() -> None:
+    words = " ".join(["word"] * 700)  # 3,499 chars, no punctuation at all
+    rows = _extract(f"<p>{words}</p><p>A trailing paragraph of ordinary size.</p>")[0]
+    assert all(len(r["text"]) <= 600 for r in rows)
+    assert " ".join(r["text"] for r in rows[:-1]) == words + "."
+    assert rows[-2]["pauseMs"] == 500  # the wrapped paragraph keeps its pause on its last piece
+
+
+def test_an_unbroken_run_over_the_limit_is_hard_cut() -> None:
+    rows = _extract("<p>" + "x" * 1300 + "</p>")[0]
+    assert [len(r["text"]) for r in rows] == [600, 600, 101]  # 100 x's plus the added period
 
 
 def test_plain_text_body_falls_back_to_one_flattened_segment() -> None:
