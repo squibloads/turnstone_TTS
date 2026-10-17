@@ -4,8 +4,8 @@
    sections, each section a role="tabpanel" host in index.html.  This file owns
    the shell and the Settings section; the Dictionary and Styles editors are
    separate slices and mount through window.TS_VOICE.registerSection(section,
-   loader) — see _loadVoiceSection.  Each loader runs once, the first time its
-   section is opened, so a large dictionary costs nothing until it is asked for.
+   loader) — see _loadVoiceSection.  A loader runs each time its section is
+   opened and is handed its container; nothing is fetched until it is asked for.
 
    The Settings section edits the audio.* settings the general Settings tab no
    longer shows.  The stt/tts model aliases stay in Models → Roles, and the two
@@ -13,7 +13,6 @@
 
 let _voiceSettings = [];
 const _voiceSectionLoaders = {};
-const _voiceSectionLoaded = {};
 
 // The Settings tab's deliberate order, split by direction.  This is also the
 // sort order for _voiceSettingsFrom; a future audio.* setting with no group
@@ -104,7 +103,6 @@ function _voiceSectionLabel(section) {
 }
 
 function _loadVoiceSection(section) {
-  if (_voiceSectionLoaded[section]) return;
   const registered = _voiceSectionLoaders[section];
   let loader = typeof registered === "function" ? registered : null;
   // Conventional names let a slice stay a plain classic script without
@@ -119,12 +117,13 @@ function _loadVoiceSection(section) {
       typeof window.loadVoiceStyles === "function"
         ? window.loadVoiceStyles
         : null;
+  const container = document.getElementById(section + "-container");
   if (loader) {
-    loader();
-    _voiceSectionLoaded[section] = true;
+    // Editors take their container and are idempotent: re-running on every
+    // open re-reads the stored list, so an edit made elsewhere shows up.
+    loader(container);
     return;
   }
-  const container = document.getElementById(section + "-container");
   if (container) {
     setSafeHtml(
       container,
@@ -143,6 +142,8 @@ window.TS_VOICE.registerSection = function (section, loader) {
 };
 window.TS_VOICE.switchSection = switchVoiceSection;
 window.TS_VOICE.reload = loadVoiceTab;
+// The name the Styles editor calls after a save.
+window.voiceSettingsRefresh = loadVoiceTab;
 
 // ---------------------------------------------------------------------------
 // Load

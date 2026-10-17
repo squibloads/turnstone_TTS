@@ -6343,6 +6343,7 @@ const _MODEL_CAP_KEYS = [
   "supports_pro_mode",
   "supports_transcription",
   "supports_speech_synthesis",
+  "supports_speech_instructions",
   "supports_audio_input",
   "supports_rerank",
 ];
@@ -6358,6 +6359,7 @@ const _MODEL_CAP_DEFAULTS = {
   supports_pro_mode: false,
   supports_transcription: false,
   supports_speech_synthesis: false,
+  supports_speech_instructions: false,
   supports_audio_input: false,
   supports_rerank: false,
 };

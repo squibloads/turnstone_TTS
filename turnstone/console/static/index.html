@@ -16,6 +16,8 @@
     <link rel="stylesheet" href="/shared/cards.css" />
     <link rel="stylesheet" href="/static/style.css" />
     <link rel="stylesheet" href="/static/voice.css" />
+    <link rel="stylesheet" href="/static/voice_dictionary.css" />
+    <link rel="stylesheet" href="/static/voice_styles.css" />
     <link rel="stylesheet" href="/shared/shell.css" />
     <link rel="stylesheet" href="/shared/katex-0.19.0/katex.min.css" />
     <link rel="stylesheet" href="/static/coordinator/coordinator.css" />
@@ -2236,6 +2238,13 @@
                 <label class="cap"
                   ><input
                     type="checkbox"
+                    data-cap="supports_speech_instructions"
+                  /><span class="cap-led"></span
+                  ><span class="cap-name">Speaking styles</span></label
+                >
+                <label class="cap"
+                  ><input
+                    type="checkbox"
                     data-cap="supports_audio_input"
                   /><span class="cap-led"></span
                   ><span class="cap-name">Audio input</span></label
@@ -4423,6 +4432,8 @@
     <script src="/static/admin.js"></script>
     <script src="/static/governance.js"></script>
     <script src="/static/voice.js"></script>
+    <script src="/static/voice_dictionary.js"></script>
+    <script src="/static/voice_styles.js"></script>
     <script src="/static/app.js"></script>
     <!-- L-shell (ES module) — deferred, so it runs after the classic scripts
          above and drives window.TS_APP.boot().  It imports the coordinator +
