@@ -11,7 +11,12 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from turnstone.core.voice_config import DEFAULT_STYLES, validate_dictionary, validate_styles
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass(frozen=True)
@@ -31,6 +36,10 @@ class SettingDef:
     help: str = ""  # plain-English explanation for non-experts
     reference_url: str = ""  # link to arXiv, docs, or provider reference
     strict_int: bool = False  # reject bool/float/non-canonical strings before int coercion
+    # Write-path check for structured "str" values (JSON lists): returns the
+    # canonical value or raises ValueError.  Skipped on the lenient read path
+    # (``clamp_range``), where the consumer's tolerant parser handles old data.
+    validator: Callable[[str], str] | None = field(default=None, hash=False, compare=False)
 
 
 # Default auto-compaction trigger as a fraction of the context window.  Shared
@@ -718,6 +727,58 @@ def _build_registry() -> dict[str, SettingDef]:
             "overrides a built-in respelling, and a later duplicate line wins. Only used when "
             "text normalisation is on.",
         ),
+        SettingDef(
+            "audio.voice_dictionary",
+            "str",
+            "[]",
+            "Voice dictionary: how read-aloud says terms and how dictation writes them",
+            "audio",
+            validator=validate_dictionary,
+            help="A JSON list edited in Admin › Voice › Dictionary. Each entry has a `term`, a "
+            "`kind` (`respelling` or `ipa`), the `respelling` every model can read, an optional "
+            "`ipa` for models that accept IPA, `match_case`, and `also_hears`: phrases a "
+            "transcript may contain that dictation replaces with the term. Read-aloud applies "
+            "it after audio.tts_pronunciations, so an entry here wins. At most 200 entries.",
+        ),
+        SettingDef(
+            "audio.tts_styles",
+            "str",
+            DEFAULT_STYLES,
+            "Speaking styles offered beside the read-aloud button",
+            "audio",
+            validator=validate_styles,
+            help="A JSON list edited in Admin › Voice › Styles. Each style has a `name`, an "
+            "`instruction` sent to TTS models that accept instructions (empty = plain delivery) "
+            "and `in_menu`. Models without instruction support ignore styles. At most 20.",
+        ),
+        SettingDef(
+            "audio.tts_style",
+            "str",
+            "",
+            "Default speaking style (a name from audio.tts_styles; empty = no instruction)",
+            "audio",
+            help="The style used when a read-aloud request names none. An unknown name falls "
+            "back to no instruction.",
+        ),
+        SettingDef(
+            "audio.stt_dictionary_hint",
+            "bool",
+            True,
+            "Append voice dictionary terms to the transcription prompt",
+            "audio",
+            help="Adds the dictionary's terms after audio.stt_prompt, which biases models that "
+            "read a prompt (Whisper-style) towards spelling them right. Models that ignore the "
+            "prompt are unaffected.",
+        ),
+        SettingDef(
+            "audio.stt_dictionary_correct",
+            "bool",
+            True,
+            "Replace dictionary 'also hears' phrases in transcripts with the term",
+            "audio",
+            help="After transcription, each whole-phrase match of an entry's also_hears is "
+            "replaced with its term. Works with every model, since it runs on the transcript.",
+        ),
         # -- judge ----------------------------------------------------------
         SettingDef(
             "judge.enabled",
@@ -1170,6 +1231,12 @@ def validate_value(key: str, raw_value: Any, *, clamp_range: bool = False) -> An
     # Choices validation
     if defn.choices is not None and typed not in defn.choices:
         raise ValueError(f"{key}: {typed!r} not in {defn.choices}")
+
+    if defn.validator is not None and not clamp_range:
+        try:
+            typed = defn.validator(typed)
+        except ValueError as exc:
+            raise ValueError(f"{key}: {exc}") from None
 
     return typed
 
