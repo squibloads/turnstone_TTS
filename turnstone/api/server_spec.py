@@ -54,6 +54,7 @@ from turnstone.api.server_schemas import (
     SkillSummary,
     SpeechToTextResponse,
     TextToSpeechRequest,
+    TextToSpeechStylesResponse,
     UploadAttachmentResponse,
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
@@ -509,6 +510,16 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "role is configured.",
         request_model=TextToSpeechRequest,
         error_codes=[400, 502, 503],
+        tags=["Chat"],
+    ),
+    EndpointSpec(
+        "/v1/api/tts/styles",
+        "GET",
+        "List the speaking styles the read-aloud UI may offer.  Names and "
+        "in_menu flags only; instruction text stays server-side.  "
+        "instructions_supported is false when no TTS role is configured or "
+        "the configured model does not accept instructions.",
+        response_model=TextToSpeechStylesResponse,
         tags=["Chat"],
     ),
     # --- Saved workstreams ---

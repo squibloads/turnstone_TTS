@@ -480,6 +480,57 @@ def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | 
     return _resolve
 
 
+def tts_style_instruction(
+    *, config_store: Any, registry: Any | None, alias: str, style_name: str
+) -> str:
+    """The ``instructions`` text for one read-aloud request ("" = send none).
+
+    ``style_name`` is the caller's selection — the request's ``style``, or
+    ``audio.tts_style`` when the request omitted one.  An empty or unknown
+    name, a style with no instruction, and a model whose definition lacks
+    ``supports_speech_instructions`` all resolve to no instruction: a stored
+    default can outlive the style it names, and speech must never fail over a
+    preference.
+    """
+    from turnstone.core.audio import model_supports_speech_instructions
+    from turnstone.core.voice_config import parse_styles, resolve_style
+
+    if config_store is None or registry is None or not alias:
+        return ""
+    style = resolve_style(parse_styles(config_store.get("audio.tts_styles") or ""), style_name)
+    if style is None or not style.instruction:
+        return ""
+    if not model_supports_speech_instructions(registry.get_config(alias)):
+        return ""
+    return style.instruction
+
+
+def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, Any]:
+    """The body of ``GET /v1/api/tts/styles``: the style picker's choices.
+
+    Instruction text never leaves the server; the browser only needs names and
+    ``in_menu``.  ``instructions_supported`` is the exact gate the POST path
+    applies, so the picker can hide itself rather than offer choices the
+    configured model would ignore.  An unconfigured TTS role reads as
+    unsupported.
+    """
+    from turnstone.core.audio import model_supports_speech_instructions, resolve_role_alias
+    from turnstone.core.voice_config import parse_styles
+
+    styles = parse_styles(config_store.get("audio.tts_styles") or "") if config_store else []
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
+    supported = bool(
+        alias
+        and registry is not None
+        and model_supports_speech_instructions(registry.get_config(alias))
+    )
+    return {
+        "styles": [{"name": s.name, "in_menu": s.in_menu} for s in styles],
+        "default": str(config_store.get("audio.tts_style") or "") if config_store else "",
+        "instructions_supported": supported,
+    }
+
+
 async def text_to_speech_response(request: Request, *, registry: Any | None) -> Response:
     """Serve ``POST /v1/api/tts`` against *registry*.
 
@@ -530,6 +581,18 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
     if not voice and config_store is not None:
         voice = (config_store.get("audio.tts_voice") or "").strip()
 
+    # An absent/null ``style`` takes the configured default; an explicit name
+    # (including "") is resolved as given.  Unknown names are never an error.
+    style = body.get("style")
+    if style is None and config_store is not None:
+        style = config_store.get("audio.tts_style")
+    instructions = tts_style_instruction(
+        config_store=config_store,
+        registry=registry,
+        alias=alias,
+        style_name=str(style or ""),
+    )
+
     # On by default (the registry default applies); a missing config store
     # means defaults, not "off".
     if config_store is None or config_store.get("audio.tts_normalize"):
@@ -550,6 +613,7 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
             alias=alias,
             text=text,
             voice=voice,
+            instructions=instructions,
             config_store=config_store,
             backend_auth_resolver=backend_auth_resolver,
             cancel_ref=abort_ref,
