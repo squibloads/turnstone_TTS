@@ -32,6 +32,7 @@ const VOICE_SETTING_GROUPS = [
     label: "Read aloud",
     keys: [
       "audio.tts_voice",
+      "audio.tts_playback_rate",
       "audio.tts_max_chars",
       "audio.tts_timeout_seconds",
       "audio.tts_normalize",

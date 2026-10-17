@@ -53,7 +53,7 @@ export function getVoiceRoles(base) {
 // "no picker, no style" rather than an error.
 const _ttsStylesPromises = {};
 
-export function getTtsStyles(base) {
+function _ttsConfig(base) {
   base = base || "";
   if (!_ttsStylesPromises[base]) {
     // Promise.resolve().then keeps a synchronous throw (a degraded page whose
@@ -61,10 +61,29 @@ export function getTtsStyles(base) {
     _ttsStylesPromises[base] = Promise.resolve()
       .then(() => authFetch(base + "/v1/api/tts/styles"))
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => _normalizeStyles(d))
       .catch(() => null);
   }
   return _ttsStylesPromises[base];
+}
+
+const _ttsStyleMenus = {};
+
+export function getTtsStyles(base) {
+  base = base || "";
+  if (!_ttsStyleMenus[base]) {
+    _ttsStyleMenus[base] = _ttsConfig(base).then((d) => _normalizeStyles(d));
+  }
+  return _ttsStyleMenus[base];
+}
+
+// The admin playback rate (audio.tts_playback_rate) for this base.  It rides
+// the styles probe but is independent of instruction support: speed applies
+// to every model.  A failed probe or an out-of-range value plays at 1.
+export function getTtsPlaybackRate(base) {
+  return _ttsConfig(base).then((d) => {
+    const rate = d && d.playback_rate;
+    return typeof rate === "number" && rate >= 0.5 && rate <= 2 ? rate : 1;
+  });
 }
 
 // Keep only what the picker can act on: a model that takes instructions and
@@ -746,6 +765,15 @@ export function createTtsPlayer(opts) {
       } catch (e) {
         requestStyle = ""; // a failed probe is Default, never a broken play
       }
+      let rate = 1;
+      try {
+        rate = await getTtsPlaybackRate(baseOf());
+      } catch (e) {
+        rate = 1; // a failed probe plays at normal speed
+      }
+      // preservesPitch is the browsers' default; set it so a faster read
+      // never turns into a chipmunk on an engine that defaults otherwise.
+      audio.preservesPitch = true;
       if (token !== seq) return;
       if (stopIfAuthChanged()) return;
       let next = fetchClip(segments[0].text, requestStyle);
@@ -781,7 +809,11 @@ export function createTtsPlayer(opts) {
           const onError = () => settle(reject, new Error("Audio playback failed"));
           audio.addEventListener("ended", onEnded);
           audio.addEventListener("error", onError);
+          // Loading a src resets playbackRate to defaultPlaybackRate, so set
+          // both, every clip: otherwise speed snaps back at each paragraph.
+          audio.defaultPlaybackRate = rate;
           audio.src = url;
+          audio.playbackRate = rate;
           // NotAllowedError is the autoplay policy; anything else (an
           // undecodable clip) must not be blamed on the browser.
           audio

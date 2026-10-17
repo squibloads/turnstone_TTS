@@ -223,6 +223,7 @@ def test_styles_lists_names_and_menu_flags_without_instructions() -> None:
         ],
         "default": "",
         "instructions_supported": False,
+        "playback_rate": 1.0,
     }
 
 
@@ -367,3 +368,11 @@ def test_models_role_aliases_blank_without_config_store(storage: Any) -> None:
     body = client.get("/v1/api/models").json()
     assert body["tts_default_alias"] == ""
     assert body["stt_default_alias"] == ""
+
+
+def test_styles_reports_the_admin_playback_rate() -> None:
+    client = _client(settings=_style_settings(**{"audio.tts_playback_rate": 1.25}))
+    assert client.get("/v1/api/tts/styles").json()["playback_rate"] == 1.25
+    assert (
+        _client(settings=_style_settings()).get("/v1/api/tts/styles").json()["playback_rate"] == 1.0
+    )

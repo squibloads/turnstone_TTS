@@ -16991,6 +16991,12 @@
             "description": "Whether the configured TTS model accepts instructions; false when no TTS role is configured",
             "title": "Instructions Supported",
             "type": "boolean"
+          },
+          "playback_rate": {
+            "default": 1.0,
+            "description": "Read-aloud playback speed from audio.tts_playback_rate (0.5-2.0)",
+            "title": "Playback Rate",
+            "type": "number"
           }
         },
         "required": [

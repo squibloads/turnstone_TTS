@@ -90,7 +90,7 @@ late = "/node/second";                              // read per request, not at 
 for (const [p, r] of [[same, reply1], [proxied, reply2], [bound, reply3]]) {
   p.play(r, new El("button")); await tick(); p.stop();
 }
-console.log(JSON.stringify(log.fetches.map((f) => f.url)));
+console.log(JSON.stringify(log.fetches.filter((f) => f.method === "POST").map((f) => f.url)));
 """
     )
     assert out == ["/v1/api/tts", "/node/n7/v1/api/tts", "/node/second/v1/api/tts"]
@@ -596,3 +596,53 @@ console.log(JSON.stringify({
     # The read fallback is Default; a write that throws still keeps the in-page
     # choice (it just will not survive a reload).
     assert out == {"first": "Default", "after": "Social", "stored": None}
+
+
+# -- playback rate (admin setting audio.tts_playback_rate) -------------------
+# The rate is a deployment-wide admin choice, applied in the browser so it
+# works for every TTS model.  It must ride every clip: a browser resets an
+# element's playbackRate to defaultPlaybackRate when a new src loads.
+
+
+def test_the_admin_playback_rate_applies_to_every_clip_without_styles() -> None:
+    out = _run(
+        """
+stubRate = 1.25;                                   // instructions unsupported ("off")
+"""
+        + _two_paragraph_reply_js()
+        + """
+const player = createTtsPlayer({ base: "" });
+player.play(el, new El("button"));
+await tick();
+const a = log.audios[0];
+const first = [a.defaultPlaybackRate, a.playbackRate, a.preservesPitch];
+a.playbackRate = 1;                                 // what a browser does on a new src
+a.fire("ended");
+await new Promise((r) => setTimeout(r, 1200));     // the real pause between paragraphs
+await tick();
+const second = [a.defaultPlaybackRate, a.playbackRate];
+console.log(JSON.stringify({ first, second }));
+"""
+    )
+    assert out["first"] == [1.25, 1.25, True]
+    # Forced back to 1 between clips (as a browser does on a new src); only
+    # the second clip's own load can have restored it.
+    assert out["second"] == [1.25, 1.25]
+
+
+def test_an_unusable_or_missing_playback_rate_plays_at_normal_speed() -> None:
+    out = _run(
+        """
+const rates = [];
+for (const [mode, rate] of [["off", 7], ["off", "fast"], ["off", undefined], ["down", 1.5]]) {
+  stylesMode = mode; stubRate = rate;
+  const player = createTtsPlayer({ base: "/node/" + rates.length });
+  player.play(reply("A reply long enough to be read."), new El("button"));
+  await tick();
+  rates.push(log.audios[log.audios.length - 1].playbackRate);
+  player.stop();
+}
+console.log(JSON.stringify(rates));
+"""
+    )
+    assert out == [1, 1, 1, 1]

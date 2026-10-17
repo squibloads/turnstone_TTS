@@ -507,7 +507,8 @@ def tts_style_instruction(
 
 
 def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, Any]:
-    """The body of ``GET /v1/api/tts/styles``: the style picker's choices.
+    """The body of ``GET /v1/api/tts/styles``: the style picker's choices, plus
+    the admin playback rate every read-aloud plays at.
 
     Instruction text never leaves the server; the browser only needs names and
     ``in_menu``.  ``instructions_supported`` is the exact gate the POST path
@@ -529,7 +530,22 @@ def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, 
         "styles": [{"name": s.name, "in_menu": s.in_menu} for s in styles],
         "default": str(config_store.get("audio.tts_style") or "") if config_store else "",
         "instructions_supported": supported,
+        "playback_rate": _tts_playback_rate(config_store),
     }
+
+
+def _tts_playback_rate(config_store: Any) -> float:
+    """``audio.tts_playback_rate`` for the player; anything unusable reads as 1.0.
+
+    It rides the styles probe because that is the one read-aloud config fetch
+    the player already makes per transport base.
+    """
+    raw = config_store.get("audio.tts_playback_rate") if config_store is not None else None
+    try:
+        rate = float(raw) if raw is not None else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+    return rate if 0.5 <= rate <= 2.0 else 1.0
 
 
 async def text_to_speech_response(request: Request, *, registry: Any | None) -> Response:

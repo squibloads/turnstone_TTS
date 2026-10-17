@@ -170,6 +170,10 @@ class TextToSpeechStylesResponse(BaseModel):
             "is configured"
         )
     )
+    playback_rate: float = Field(
+        default=1.0,
+        description="Read-aloud playback speed from audio.tts_playback_rate (0.5-2.0)",
+    )
 
 
 class ApproveRequest(BaseModel):

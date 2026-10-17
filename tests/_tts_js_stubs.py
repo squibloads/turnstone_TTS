@@ -127,6 +127,8 @@ let authGen = 0, fetchMode = "ok";
 // Speaking-style probe: "off" (instructions unsupported), "ok" (three menu
 // styles + one hidden), "empty" (supported but nothing in the menu) or "down".
 let stylesMode = "off";
+// Playback rate the styles probe reports; undefined omits the field (pre-rate server).
+let stubRate;
 const _store = new Map();
 let storageGetThrows = false, storageSetThrows = false;
 globalThis.localStorage = {
@@ -155,6 +157,18 @@ function authFetch(url, opts) {
   if (fetchMode === "down") return Promise.reject(new Error("down"));
   if (url.endsWith("/v1/api/tts/styles")) {
     if (stylesMode === "down") return Promise.reject(new Error("down"));
+    return _stylesResponse().then((r) => ({ ok: r.ok, json: async () => {
+      const d = await r.json();
+      return stubRate === undefined ? d : { ...d, playback_rate: stubRate };
+    } }));
+  }
+  if (url.endsWith("/v1/api/models")) {
+    return Promise.resolve({ ok: true, json: async () => ({ tts_default_alias: fetchMode === "tts" ? "tts-1" : undefined, stt_default_alias: "stt-1" }) });
+  }
+  return Promise.resolve({ ok: true, blob: async () => "audio" });
+}
+function _stylesResponse() {
+  {
     if (stylesMode === "empty") {
       return Promise.resolve({ ok: true, json: async () => ({ styles: [{ name: "Hidden", in_menu: false }], default: "", instructions_supported: true }) });
     }
@@ -174,10 +188,6 @@ function authFetch(url, opts) {
     // instructions unsupported, so addTtsAction adds no style button.
     return Promise.resolve({ ok: true, json: async () => ({ styles: [], default: "", instructions_supported: false }) });
   }
-  if (url.endsWith("/v1/api/models")) {
-    return Promise.resolve({ ok: true, json: async () => ({ tts_default_alias: fetchMode === "tts" ? "tts-1" : undefined, stt_default_alias: "stt-1" }) });
-  }
-  return Promise.resolve({ ok: true, blob: async () => "audio" });
 }
 // A finished reply: a bubble with a .msg-body holding one paragraph of text.
 function reply(text) {

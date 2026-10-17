@@ -761,6 +761,18 @@ def _build_registry() -> dict[str, SettingDef]:
             "back to no instruction.",
         ),
         SettingDef(
+            "audio.tts_playback_rate",
+            "float",
+            1.0,
+            "Read-aloud playback speed (0.5-2.0; 1.0 = as the model speaks)",
+            "audio",
+            min_value=0.5,
+            max_value=2.0,
+            help="Applied by the browser to every read-aloud clip, with pitch kept, so it works "
+            "the same for every TTS model. Use it to even out a model that speaks noticeably "
+            "slowly or quickly; it changes playback only, not what the model synthesizes.",
+        ),
+        SettingDef(
             "audio.stt_dictionary_hint",
             "bool",
             True,

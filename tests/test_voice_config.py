@@ -223,6 +223,7 @@ def test_registry_declares_the_voice_settings() -> None:
         ("audio.tts_style", "str", ""),
         ("audio.stt_dictionary_hint", "bool", True),
         ("audio.stt_dictionary_correct", "bool", True),
+        ("audio.tts_playback_rate", "float", 1.0),
     ]:
         d = validate_key(key)
         assert (d.type, d.default, d.section) == (typ, default, "audio")
@@ -240,3 +241,10 @@ def test_registry_read_path_does_not_raise_on_a_bad_stored_value() -> None:
     # clamp_range=True is the lenient read path; a bad stored blob must not
     # break the settings page — the tolerant parser handles it at use time.
     assert validate_value("audio.voice_dictionary", "not json", clamp_range=True) == "not json"
+
+
+def test_playback_rate_is_bounded() -> None:
+    assert validate_value("audio.tts_playback_rate", "1.25") == 1.25
+    for bad in ("0.4", "2.5"):
+        with pytest.raises(ValueError):
+            validate_value("audio.tts_playback_rate", bad)
