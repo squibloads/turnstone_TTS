@@ -11,6 +11,7 @@ is not a coordinator must 404 rather than leak an interactive workstream.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -296,3 +297,122 @@ def test_stt_prompt_setting_is_forwarded() -> None:
     with patch("turnstone.core.audio.transcribe", return_value=_result()) as tr:
         _client(settings=settings).post(_url(), files=_audio())
     assert tr.call_args.kwargs["prompt"] == "GRT, Hodgdon"
+
+
+# -- voice dictionary --------------------------------------------------------
+
+
+def _dict_entry(term: str, hears: list[str]) -> dict[str, Any]:
+    return {"term": term, "respelling": "spoken", "also_hears": hears}
+
+
+def _dictionary(*entries: dict[str, Any]) -> str:
+    return json.dumps(list(entries))
+
+
+def _settings(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {**_SETTINGS, **(overrides or {})}
+
+
+_DICT = _dictionary(_dict_entry("BAA", ["bay a"]), _dict_entry("nginx", ["engine x"]))
+
+
+def test_dictionary_terms_are_appended_to_the_stt_prompt() -> None:
+    settings = _settings(
+        {
+            "audio.stt_prompt": "  GRT, Hodgdon  ",
+            "audio.voice_dictionary": _DICT,
+            "audio.stt_dictionary_hint": True,
+        }
+    )
+    with patch("turnstone.core.audio.transcribe", return_value=_result()) as tr:
+        _client(settings=settings).post(_url(), files=_audio())
+    assert tr.call_args.kwargs["prompt"] == "GRT, Hodgdon Vocabulary: BAA, nginx."
+
+
+def test_dictionary_hint_off_leaves_the_operator_prompt_alone() -> None:
+    settings = _settings(
+        {
+            "audio.stt_prompt": "GRT, Hodgdon",
+            "audio.voice_dictionary": _DICT,
+            "audio.stt_dictionary_hint": False,
+        }
+    )
+    with patch("turnstone.core.audio.transcribe", return_value=_result()) as tr:
+        _client(settings=settings).post(_url(), files=_audio())
+    assert tr.call_args.kwargs["prompt"] == "GRT, Hodgdon"
+
+
+def test_transcript_phrases_are_corrected() -> None:
+    settings = _settings({"audio.voice_dictionary": _DICT, "audio.stt_dictionary_correct": True})
+    with patch("turnstone.core.audio.transcribe", return_value=_result("the bay a was signed")):
+        resp = _client(settings=settings).post(_url(), files=_audio())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["transcript"] == "the BAA was signed"
+
+
+def test_transcript_correction_off_returns_the_raw_text() -> None:
+    settings = _settings({"audio.voice_dictionary": _DICT, "audio.stt_dictionary_correct": False})
+    with patch("turnstone.core.audio.transcribe", return_value=_result("the bay a was signed")):
+        resp = _client(settings=settings).post(_url(), files=_audio())
+    assert resp.json()["transcript"] == "the bay a was signed"
+
+
+def test_correction_runs_when_the_hint_is_off() -> None:
+    settings = _settings(
+        {
+            "audio.voice_dictionary": _DICT,
+            "audio.stt_dictionary_hint": False,
+            "audio.stt_dictionary_correct": True,
+        }
+    )
+    with patch("turnstone.core.audio.transcribe", return_value=_result("the bay a was signed")):
+        resp = _client(settings=settings).post(_url(), files=_audio())
+    assert resp.json()["transcript"] == "the BAA was signed"
+
+
+def test_malformed_dictionary_is_ignored() -> None:
+    settings = _settings(
+        {
+            "audio.stt_prompt": "GRT",
+            "audio.voice_dictionary": "not json",
+            "audio.stt_dictionary_hint": True,
+            "audio.stt_dictionary_correct": True,
+        }
+    )
+    with patch(
+        "turnstone.core.audio.transcribe", return_value=_result("the bay a was signed")
+    ) as tr:
+        resp = _client(settings=settings).post(_url(), files=_audio())
+    assert tr.call_args.kwargs["prompt"] == "GRT"
+    assert resp.json()["transcript"] == "the bay a was signed"
+
+
+def test_stream_prompt_includes_dictionary_terms() -> None:
+    settings = _settings({"audio.voice_dictionary": _DICT, "audio.stt_dictionary_hint": True})
+    with patch("turnstone.core.audio.transcribe_stream", return_value=iter(["ok"])) as stream:
+        resp = _client(settings=settings).post(_url(stream=True), files=_audio())
+    assert resp.status_code == 200, resp.text
+    assert stream.call_args.kwargs["prompt"] == "Vocabulary: BAA, nginx."
+
+
+def test_stream_deltas_are_forwarded_unrewritten() -> None:
+    # The stream route has no final transcript event: raw deltas go straight
+    # into the composer, so dictionary correction applies to the JSON route only.
+    settings = _settings({"audio.voice_dictionary": _DICT, "audio.stt_dictionary_correct": True})
+    with patch(
+        "turnstone.core.audio.transcribe_stream",
+        return_value=iter(["the bay ", "a was signed"]),
+    ):
+        resp = _client(settings=settings).post(_url(stream=True), files=_audio())
+    assert resp.text == "the bay a was signed"
+
+
+def test_stt_helpers_without_a_config_store_are_inert() -> None:
+    from turnstone.core.voice_config import parse_dictionary
+    from turnstone.core.web_helpers import correct_stt_transcript, stt_dictionary, stt_prompt
+
+    entries = parse_dictionary(_DICT)
+    assert stt_dictionary(None) == []
+    assert stt_prompt(None, entries) == ""
+    assert correct_stt_transcript(None, entries, "the bay a was signed") == ("the bay a was signed")
