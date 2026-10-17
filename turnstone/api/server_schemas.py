@@ -138,6 +138,38 @@ class TextToSpeechRequest(BaseModel):
     voice: str = Field(
         default="", description="Optional voice override (else audio.tts_voice setting)"
     )
+    style: str | None = Field(
+        default=None,
+        description=(
+            "Optional speaking-style name from audio.tts_styles.  Null or absent uses the "
+            'audio.tts_style default; an unknown name (or "") sends no instruction, never '
+            "an error.  Only applied when the configured TTS model accepts instructions."
+        ),
+    )
+
+
+class TextToSpeechStyleInfo(BaseModel):
+    """One configured speaking style, as offered to the read-aloud UI."""
+
+    name: str = Field(description="Style name (the value to send as `style`)")
+    in_menu: bool = Field(description="Whether the picker should offer this style")
+
+
+class TextToSpeechStylesResponse(BaseModel):
+    """The style choices a read-aloud client may offer for the TTS role."""
+
+    styles: list[TextToSpeechStyleInfo] = Field(
+        description="Every configured style, in stored order; instruction text stays server-side"
+    )
+    default: str = Field(
+        description="Default style name from audio.tts_style (empty = no instruction)"
+    )
+    instructions_supported: bool = Field(
+        description=(
+            "Whether the configured TTS model accepts instructions; false when no TTS role "
+            "is configured"
+        )
+    )
 
 
 class ApproveRequest(BaseModel):

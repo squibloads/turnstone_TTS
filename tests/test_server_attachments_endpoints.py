@@ -1229,6 +1229,56 @@ class TestTextToSpeech:
         # audio.tts_voice setting supplies the voice when the body omits one.
         create = mock_client.audio.speech.with_streaming_response.create
         assert create.call_args.kwargs["voice"] == "alloy"
+        # No style requested: the backend never sees an instructions field.
+        assert "instructions" not in create.call_args.kwargs
+
+    def test_styles_endpoint_lists_the_configured_styles(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.get("/v1/api/tts/styles", headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {
+            "styles": [
+                {"name": "Professional", "in_menu": True},
+                {"name": "Social", "in_menu": True},
+                {"name": "Plain", "in_menu": True},
+            ],
+            "default": "",
+            "instructions_supported": False,
+        }
+
+    def test_style_instruction_reaches_the_backend_when_capable(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_styles"] = json.dumps(
+            [{"name": "Warm", "instruction": "Speak warmly.", "in_menu": True}]
+        )
+        store._values["audio.tts_style"] = "Warm"
+        client.app.state.registry.get_config("voice").capabilities[
+            "supports_speech_instructions"
+        ] = True
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["instructions"] == "Speak warmly."
+
+    def test_style_instruction_is_dropped_without_capability(self, voice_app_client):
+        client, mock_client = voice_app_client
+        client.app.state.config_store._values["audio.tts_styles"] = json.dumps(
+            [{"name": "Warm", "instruction": "Speak warmly.", "in_menu": True}]
+        )
+        resp = client.post(
+            "/v1/api/tts", json={"text": "hello", "style": "Warm"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert "instructions" not in create.call_args.kwargs
+
+    def test_unknown_style_is_not_an_error(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.post(
+            "/v1/api/tts", json={"text": "hello", "style": "No Such Style"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
 
     def test_empty_text_returns_400(self, voice_app_client):
         client, _ = voice_app_client
