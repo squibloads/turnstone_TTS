@@ -14,8 +14,11 @@ without symbols passes through unchanged.
 Deliberately skipped (do not add without a measured need):
 
 - non-English text
-- IPA / SSML or any other model-specific pronunciation syntax (operators use
-  plain respellings via ``parse_pronunciations`` instead)
+- IPA / SSML or any other model-specific pronunciation syntax sent to the
+  backend: read-aloud always sends an entry's plain ``respelling``, including
+  for dictionary entries of kind ``ipa`` (teaching a model to accept IPA is
+  out of scope), and operators can still use ``parse_pronunciations`` for
+  legacy ``word = respelling`` lines
 - math expressions
 - dates other than ISO: ``16.10.2026`` is left alone (day/month order is
   ambiguous), and a two-digit-year dotted date such as ``16.10.26`` reads as a
@@ -37,7 +40,9 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
+
+    from turnstone.core.voice_config import DictionaryEntry
 
 
 def _speak_version(match: re.Match[str]) -> str:
@@ -142,7 +147,7 @@ def _speak_phone(match: re.Match[str]) -> str:
 
 # Technical terms most voices mangle, as plain respellings that work on every
 # backend.  Universal terms only; an operator's audio.tts_pronunciations entry
-# for the same word wins.
+# or a dictionary entry for the same word wins.
 _TECH_TERMS = {
     "PostgreSQL": "Postgres",
     "systemctl": "system control",
@@ -263,40 +268,81 @@ def parse_pronunciations(raw: str) -> dict[str, str]:
     return out
 
 
-def _apply_pronunciations(text: str, pronunciations: Mapping[str, str]) -> str:
-    """Replace whole-word, case-insensitive keys in a single pass.
+# A (key, replacement, match_case) row.  Case-insensitive keys are already
+# folded, so each row becomes one branch of a single alternation.
+_Replacement = tuple[str, str, bool]
+
+
+def _replacement_rows(
+    pronunciations: Mapping[str, str] | None,
+    dictionary: Sequence[DictionaryEntry] | None,
+) -> list[_Replacement]:
+    """Collect every respelling into one precedence-ordered row list.
+
+    Later sources win: built-in technical terms, then the legacy
+    ``audio.tts_pronunciations`` mapping, then dictionary entries.  A
+    dictionary entry without a respelling is dictation-only and is skipped.
+    """
+    # Keys match case-insensitively, so merge them folded: an operator's "yaml"
+    # replaces the built-in "YAML".
+    folded: dict[str, str] = {key.lower(): value for key, value in _TECH_TERMS.items()}
+    if pronunciations:
+        folded.update({key.lower(): value for key, value in pronunciations.items() if key})
+    exact: dict[str, str] = {}
+    for entry in dictionary or ():
+        if not entry.term or not entry.respelling:
+            continue  # no term to match, or dictation-only with nothing to say
+        if entry.match_case:
+            exact[entry.term] = entry.respelling
+        else:
+            folded[entry.term.lower()] = entry.respelling
+    rows: list[_Replacement] = [(key, value, False) for key, value in folded.items()]
+    rows.extend((key, value, True) for key, value in exact.items())
+    # Longest key first so a key cannot shadow a longer one.  On equal length
+    # the case-sensitive row goes first, so it wins for text spelled exactly
+    # its way while the folded row still covers every other casing.
+    rows.sort(key=lambda row: (-len(row[0]), not row[2]))
+    return rows
+
+
+def _apply_replacements(text: str, rows: Sequence[_Replacement]) -> str:
+    """Replace whole-word keys in a single pass.
 
     One alternation (longest key first) keeps a respelling from being
-    re-substituted by another key, so the result does not depend on dict order.
+    re-substituted by another key, so the result does not depend on input
+    order.  Case-insensitive keys are scoped with ``(?i:...)``, so
+    case-sensitive keys can share the same regex, and a replacement is never
+    rescanned.
     """
-    # The only caller passes lower-cased, unique, non-empty keys (a later
-    # duplicate line already won in ``parse_pronunciations``), so there is
-    # nothing to fold or dedupe here.
-    ordered = sorted(pronunciations.items(), key=lambda kv: len(kv[0]), reverse=True)
-    folded_keys = [key for key, _ in ordered]
-    values = [value for _, value in ordered]
-    if not values:
+    if not rows:
         return text
+    alternation = "|".join(
+        f"((?i:{re.escape(key)}))" if not match_case else f"({re.escape(key)})"
+        for key, _value, match_case in rows
+    )
+    values = [value for _key, value, _match_case in rows]
     # One capturing group per key: the group index names the value directly, so
     # a Unicode case fold ("ſ" matching "s") cannot miss a re-derived dict key.
-    pattern = re.compile(
-        r"(?<!\w)(?:" + "|".join(f"({re.escape(k)})" for k in folded_keys) + r")(?!\w)",
-        re.IGNORECASE,
-    )
+    pattern = re.compile(r"(?<!\w)(?:" + alternation + r")(?!\w)")
     return pattern.sub(lambda m: values[(m.lastindex or 1) - 1], text)
 
 
-def normalize_for_speech(text: str, pronunciations: Mapping[str, str] | None = None) -> str:
+def normalize_for_speech(
+    text: str,
+    pronunciations: Mapping[str, str] | None = None,
+    dictionary: Sequence[DictionaryEntry] | None = None,
+) -> str:
     """Rewrite symbols, units and versions in *text* into speakable English.
 
-    Respellings (the built-in technical terms, then the operator's own, which
-    win) run last so they can override anything the rules produced.
+    Respellings run last so they can override anything the rules produced.
+    Precedence, strongest first: *dictionary* entries, the legacy
+    *pronunciations* mapping, then the built-in technical terms.  Dictionary
+    keys match whole-word and case-insensitively unless ``match_case`` is set,
+    in which case only the exact case matches.  Entries without a
+    ``respelling`` are dictation-only and are skipped; for ``kind == "ipa"``
+    the entry's ``respelling`` is read aloud (sending IPA to a model that
+    accepts it is out of scope here).
     """
     for pattern, repl in _RULES:
         text = pattern.sub(repl, text)
-    # Keys match case-insensitively, so merge them folded: an operator's "yaml"
-    # replaces the built-in "YAML".
-    terms = {key.lower(): value for key, value in _TECH_TERMS.items()}
-    if pronunciations:
-        terms.update({key.lower(): value for key, value in pronunciations.items() if key})
-    return _apply_pronunciations(text, terms)
+    return _apply_replacements(text, _replacement_rows(pronunciations, dictionary))

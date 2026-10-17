@@ -502,6 +502,7 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
     from turnstone.core.log import get_logger
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
     from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
+    from turnstone.core.voice_config import parse_dictionary
 
     log = get_logger(__name__)
     body = await read_json_or_400(request)
@@ -534,11 +535,18 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
     # means defaults, not "off".
     if config_store is None or config_store.get("audio.tts_normalize"):
         pronunciations = ""
+        dictionary = ""
         if config_store is not None:
             pronunciations = config_store.get("audio.tts_pronunciations") or ""
+            dictionary = config_store.get("audio.voice_dictionary") or ""
         # Every rule is linear and the length cap bounds the work; a thread would
-        # not help (the regex holds the GIL).
-        text = normalize_for_speech(text, parse_pronunciations(pronunciations))
+        # not help (the regex holds the GIL).  Both parsers are tolerant, so a
+        # bad stored value never breaks read-aloud.
+        text = normalize_for_speech(
+            text,
+            parse_pronunciations(pronunciations),
+            parse_dictionary(dictionary),
+        )
 
     abort_ref = StreamAbortRef()
     backend_auth_resolver = audio_backend_auth_resolver(request)
