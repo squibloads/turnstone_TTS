@@ -8,6 +8,7 @@ pending-list, GET /content, DELETE, auth isolation, and the extended
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 from typing import Any
@@ -1302,6 +1303,66 @@ class TestTextToSpeech:
         assert resp.status_code == 200, resp.text
         create = mock_client.audio.speech.with_streaming_response.create
         assert create.call_args.kwargs["input"] == "Use sequel"
+
+    def test_normalisation_applies_the_voice_dictionary(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.voice_dictionary"] = json.dumps(
+            [{"term": "SQL", "respelling": "sequel"}]
+        )
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use sequel"
+
+    def test_voice_dictionary_beats_pronunciations(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_pronunciations"] = "SQL = ess cue ell"
+        store._values["audio.voice_dictionary"] = json.dumps(
+            [{"term": "SQL", "respelling": "sequel"}]
+        )
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use sequel"
+
+    def test_voice_dictionary_honours_match_case(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.voice_dictionary"] = json.dumps(
+            [{"term": "BAA", "respelling": "B A A", "match_case": True}]
+        )
+        create = mock_client.audio.speech.with_streaming_response.create
+        resp = client.post(
+            "/v1/api/tts", json={"text": "the sheep said baa"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
+        assert create.call_args.kwargs["input"] == "the sheep said baa"
+        resp = client.post("/v1/api/tts", json={"text": "BAA is the code"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        assert create.call_args.kwargs["input"] == "B A A is the code"
+
+    def test_bad_voice_dictionary_does_not_break_read_aloud(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.voice_dictionary"] = "not json"
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use SQL"
+
+    def test_voice_dictionary_follows_the_normalisation_switch(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_normalize"] = False
+        store._values["audio.voice_dictionary"] = json.dumps(
+            [{"term": "SQL", "respelling": "sequel"}]
+        )
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use SQL"
 
     def test_normalisation_can_be_disabled(self, voice_app_client):
         client, mock_client = voice_app_client
