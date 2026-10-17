@@ -1,0 +1,28 @@
+/* Admin › Voice — the settings note and the one multi-line setting
+   (audio.tts_pronunciations), which the shared .settings-row component renders
+   as a textarea.  Everything else on the page uses style.css unchanged. */
+
+.voice-settings-note {
+  padding: 0 12px 10px;
+}
+
+.settings-input textarea {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  width: 100%;
+  max-width: 480px;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.settings-input textarea:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}

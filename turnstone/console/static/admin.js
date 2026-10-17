@@ -87,6 +87,7 @@ const ADMIN_IA = [
       { tab: "models", label: "Models", perm: "admin.models" },
       { tab: "node-metadata", label: "Nodes", perm: null },
       { tab: "settings", label: "Settings", perm: "admin.settings" },
+      { tab: "voice", label: "Voice", perm: "admin.settings" },
       { tab: "tls", label: "TLS", perm: "admin.settings" },
     ],
   },
@@ -206,6 +207,7 @@ function switchAdminTab(tab) {
     "models",
     "node-metadata",
     "settings",
+    "voice",
     "tls",
     "mcp",
     "prompt-policies",
@@ -247,6 +249,7 @@ function switchAdminTab(tab) {
   if (tab === "models") loadAdminModels();
   if (tab === "node-metadata") loadAdminNodeMetadata();
   if (tab === "settings") loadSettings();
+  if (tab === "voice") loadVoiceTab();
   if (tab === "tls") loadTlsCerts();
   if (tab === "mcp") loadAdminMcp();
   if (tab === "prompt-policies") loadPromptPolicies();
@@ -3786,6 +3789,10 @@ function loadSettings() {
       for (let j = 0; j < valuesArr.length; j++) {
         const v = valuesArr[j];
         if (v.key.startsWith("judge.")) continue;
+        // Speech settings (models, voices, styles, the dictionary) live on
+        // Admin › Voice now; the stt/tts aliases among them are pickers in
+        // Models → Roles.
+        if (v.key.startsWith("audio.")) continue;
         if (roleKeys[v.key]) continue;
         const s = schemaMap[v.key] || {};
         merged[v.key] = {
@@ -4082,6 +4089,17 @@ function _renderSettingRow(item) {
       maxAttr +
       nullableAttr +
       ">";
+  } else if (item.multiline) {
+    // Multi-line strings (the legacy audio.tts_pronunciations list) need a
+    // textarea; the CSS mirrors the text input's voice in voice.css.
+    html +=
+      '<textarea data-setting-key="' +
+      escapedKey +
+      '" aria-label="' +
+      escapedShort +
+      '" rows="6" spellcheck="false">' +
+      escapeHtml(String(item.value != null ? item.value : "")) +
+      "</textarea>";
   } else {
     // str
     html +=
