@@ -212,6 +212,18 @@ def model_supports_role(cfg: Any, role: str) -> bool:
     return _infer_audio_capability(getattr(cfg, "model", ""), role)
 
 
+def model_supports_speech_instructions(cfg: Any) -> bool:
+    """Whether the alias's TTS backend accepts a natural-language ``instructions``.
+
+    Explicit ``capabilities["supports_speech_instructions"]`` only — unlike the
+    role gate there is no model-name inference: a style is an optional extra,
+    and sending a field a backend never heard of is not harmless if that
+    backend rejects unknown parameters.  An operator opts a model in.
+    """
+    caps = getattr(cfg, "capabilities", None) or {}
+    return bool(caps.get("supports_speech_instructions"))
+
+
 def is_speech_only_model(capabilities: Mapping[str, Any], model: str) -> bool:
     """Whether a definition is a dedicated speech model, which can't hold a chat.
 
@@ -679,11 +691,17 @@ def synthesize(
     text: str,
     voice: str,
     response_format: str = "mp3",
+    instructions: str = "",
     config_store: Any | None = None,
     backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     cancel_ref: Any = None,
 ) -> SpeechResult:
-    """Synthesize ``text`` to speech using the TTS role alias's audio backend."""
+    """Synthesize ``text`` to speech using the TTS role alias's audio backend.
+
+    ``instructions`` is the resolved speaking style.  It is sent only when
+    non-empty, so a request to a backend that never heard of the field stays
+    byte-identical to the pre-style wire shape.
+    """
     binding = _resolve_audio_binding(
         registry=registry,
         alias=alias,
@@ -701,12 +719,15 @@ def synthesize(
     refuse_aborted_request(cancel_ref)
     try:
         client = lane_call_client(lane, cancel_ref=cancel_ref)
-        manager = client.audio.speech.with_streaming_response.create(
-            model=model,
-            voice=voice or _DEFAULT_VOICE,
-            input=text,
-            response_format=response_format,
-        )
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "voice": voice or _DEFAULT_VOICE,
+            "input": text,
+            "response_format": response_format,
+        }
+        if instructions:
+            create_kwargs["instructions"] = instructions
+        manager = client.audio.speech.with_streaming_response.create(**create_kwargs)
         refuse_aborted_request(cancel_ref)
         with manager as response:
             _capture_audio_handle(cancel_ref, response)

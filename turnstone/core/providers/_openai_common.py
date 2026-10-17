@@ -474,6 +474,9 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         supports_tools=False,
         supports_speech_synthesis=True,
+        # The only OpenAI speech model whose create call documents
+        # ``instructions``; ``tts-1`` has no such parameter.
+        supports_speech_instructions=True,
     ),
 }
 
