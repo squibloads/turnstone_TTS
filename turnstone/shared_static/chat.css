@@ -1725,6 +1725,114 @@
 }
 
 /* ==========================================================================
+   Speaking-style picker — beside the read-aloud speaker
+   The button shows a style name, so it opts out of the square
+   .msg-action-btn box; the dropdown reuses the .tab-menu chrome and
+   keyboard contract from pane.js openPopupMenu.  The standalone coordinator
+   page loads chat.css but not shell.css, where .tab-menu lives, so the
+   menu's token vocabulary is repeated below — keep the two in step.
+   ========================================================================== */
+.msg-style-btn {
+  width: auto;
+  max-width: 168px;
+  padding: 0 6px;
+  gap: 4px;
+  font-family: var(--font-ui);
+}
+.msg-style-btn[aria-expanded="true"] {
+  background: var(--hair-2);
+  color: var(--ink);
+}
+.msg-style-label {
+  overflow: hidden;
+  max-width: 132px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Same chevron geometry as shell.css .tab-caret::before — a small down caret
+   that inherits the button's colour and focus treatment. */
+.msg-style-caret {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-1px) rotate(45deg);
+}
+
+/* The popup itself.  openPopupMenu positions it fixed; these rules mirror
+   shell.css `.tab-menu` for pages that do not load that sheet. */
+.msg-style-menu {
+  position: fixed;
+  z-index: 300;
+  min-width: 184px;
+  /* never taller than the viewport — scroll instead */
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  padding: 4px 0;
+  background: var(--panel-2);
+  border: 1px solid var(--hair-2);
+  border-radius: var(--r-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  animation: msg-style-menu-in 0.1s ease-out;
+}
+[data-theme="light"] .msg-style-menu {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+.msg-style-menu .tab-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 7px 14px;
+  border: none;
+  background: none;
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.msg-style-menu .tab-menu-item:hover,
+.msg-style-menu .tab-menu-item:focus-visible {
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel-2));
+}
+.msg-style-menu .tab-menu-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.msg-style-menu .tab-menu-label {
+  flex: 1;
+}
+/* The check glyph (openPopupMenu's item.key slot).  Accent, unlike the
+   dimmed shortcut hints in a tab menu: this is the current state, not a
+   secondary hint. */
+.msg-style-menu .tab-menu-key {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent);
+}
+@keyframes msg-style-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg-style-menu {
+    animation: none;
+  }
+}
+
+/* ==========================================================================
    Per-message rewind / edit / retry (#549) + copy affordances
    Icon glyphs rendered inside the .msg-action-btn toolbar above, plus the
    inline edit-in-place form. Shared by the interactive pane (ui/static) and
