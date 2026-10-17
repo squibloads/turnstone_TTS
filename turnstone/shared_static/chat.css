@@ -1743,6 +1743,13 @@
   background: var(--hair-2);
   color: var(--ink);
 }
+/* The actions bar is hover/focus-revealed.  Opening the picker moves focus
+   into the portalled popup, so pin the bar visible for the menu's lifetime —
+   otherwise the button (and its anchor) fades out from under its own menu. */
+.msg-actions.is-style-menu-open {
+  opacity: 1;
+  pointer-events: auto;
+}
 .msg-style-label {
   overflow: hidden;
   max-width: 132px;

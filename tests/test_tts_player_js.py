@@ -343,11 +343,13 @@ document.body.append(el);                                  // openPopupMenu need
 addTtsAction(el, () => {});
 await tick();
 const btn = el.querySelector(".msg-style-btn");
+const bar = el.querySelector(".msg-actions");
 btn.click();
 const menu = document.body.querySelector(".tab-menu");
 const items = menu.querySelectorAll(".tab-menu-item");
 const snap = {
   expanded: btn.attrs["aria-expanded"],
+  barPinned: bar.classList.contains("is-style-menu-open"),
   role: menu.attrs.role,
   label: menu.attrs["aria-label"],
   itemRoles: items.map((i) => i.attrs.role),
@@ -361,12 +363,14 @@ console.log(JSON.stringify({
   snap,
   closed: document.body.querySelector(".tab-menu") === null,
   expanded: btn.attrs["aria-expanded"],
+  barPinned: bar.classList.contains("is-style-menu-open"),
   focus: document.activeElement === btn,
 }));
 """
     )
     assert out["snap"] == {
         "expanded": "true",
+        "barPinned": True,
         "role": "menu",
         "label": "Speaking style",
         "itemRoles": ["menuitemradio"] * 4,
@@ -382,6 +386,7 @@ console.log(JSON.stringify({
     }
     assert out["closed"] is True
     assert out["expanded"] == "false"
+    assert out["barPinned"] is False
     assert out["focus"] is True
 
 

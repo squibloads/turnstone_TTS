@@ -258,11 +258,15 @@ function _toggleStyleMenu(picker) {
     returnFocusEl: picker.btn,
     ignoreEl: picker.btn,
     onClose: () => {
+      // The actions bar is hover/focus-revealed; focus lives in the menu now,
+      // so pin the bar visible until the menu closes.
+      picker.bar.classList.remove("is-style-menu-open");
       if (_openStyleMenu && _openStyleMenu.handle === handle) {
         _openStyleMenu = null;
       }
     },
   });
+  picker.bar.classList.add("is-style-menu-open");
   // The helper builds generic menu items; a single-choice list must announce
   // itself as radio items with a checked state.
   const nodes = Array.from(handle.menu.querySelectorAll(".tab-menu-item"));
@@ -279,7 +283,7 @@ function _toggleStyleMenu(picker) {
   _openStyleMenu = { picker, handle };
 }
 
-function _buildStylePicker(config) {
+function _buildStylePicker(bar, config) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "msg-action-btn msg-style-btn";
@@ -292,7 +296,7 @@ function _buildStylePicker(config) {
   caret.className = "msg-style-caret";
   caret.setAttribute("aria-hidden", "true");
   btn.appendChild(caret);
-  const picker = { btn, label, config };
+  const picker = { btn, label, bar, config };
   _paintStylePicker(picker);
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -312,7 +316,7 @@ function _attachStylePicker(bar, base) {
     if (bar.querySelector(".msg-style-btn")) return;
     // A bar whose speaker was torn down has no anchor to sit beside.
     if (!bar.querySelector(".msg-tts-btn")) return;
-    const picker = _buildStylePicker(config);
+    const picker = _buildStylePicker(bar, config);
     _pruneStylePickers();
     _stylePickers.add(picker);
     bar.insertBefore(picker.btn, bar.querySelector(".msg-copy-btn"));
