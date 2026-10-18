@@ -7,8 +7,17 @@ import time
 
 import pytest
 
-from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
-from turnstone.core.voice_config import DictionaryEntry, parse_dictionary
+from turnstone.core.speech_text import (
+    _RULES,
+    normalize_for_speech,
+    parse_pronunciations,
+)
+from turnstone.core.voice_config import (
+    CLEANUP_GROUPS,
+    CleanupOptions,
+    DictionaryEntry,
+    parse_dictionary,
+)
 
 RULE_CASES: list[tuple[str, str]] = [
     # symbols
@@ -445,3 +454,53 @@ def test_timing_file_name_rule() -> None:
 def test_timing_arrow_and_decade_runs() -> None:
     assert _elapsed("a " + "-" * 50_000 + "> b") < 0.2
     assert _elapsed("10s, " * 10_000) < 1.0  # measured ~0.17 s: decade walk
+
+
+# -- cleanup groups -----------------------------------------------------------
+
+
+def test_every_rule_row_has_a_known_group() -> None:
+    known = {group.id for group in CLEANUP_GROUPS}
+    tagged = {group for group, _pattern, _repl in _RULES}
+    assert tagged <= known
+    # identifiers runs as its own stage, so it need not own a _RULES row.
+    assert known - {"identifiers"} <= tagged
+
+
+@pytest.mark.parametrize(
+    ("group", "text"),
+    [
+        ("phone_numbers", "call 555-123-4567"),
+        ("dates", "on 2026-10-16"),
+        ("file_names", "open notes.txt"),
+        ("versions", "upgrade to v1.8.5"),
+        ("symbols", "~5 users"),
+        ("dimensions", "a 1024x768 screen"),
+        ("units", "120ms and 32GB"),
+        ("seconds_decades", "timeout is 60s"),
+        ("ranges", "takes 10-20 minutes"),
+        ("abbreviations", "e.g. this"),
+        ("identifiers", "user_id"),
+    ],
+)
+def test_disabling_a_group_skips_its_rules(group: str, text: str) -> None:
+    options = CleanupOptions(disabled_groups=frozenset({group}))
+    assert normalize_for_speech(text, options=options) == text
+
+
+def test_disabling_one_group_leaves_the_others_running() -> None:
+    options = CleanupOptions(disabled_groups=frozenset({"units"}))
+    assert normalize_for_speech("~5 files at 32GB", options=options) == "about 5 files at 32GB"
+
+
+def test_builtin_terms_off_leaves_those_terms_alone() -> None:
+    options = CleanupOptions(builtin_terms_off=frozenset({"YAML", "JSON"}))
+    assert normalize_for_speech("edit YAML and JSON", options=options) == "edit YAML and JSON"
+    assert normalize_for_speech("run systemctl", options=options) == "run system control"
+
+
+def test_builtin_term_off_does_not_block_an_operator_respelling() -> None:
+    options = CleanupOptions(builtin_terms_off=frozenset({"YAML"}))
+    assert normalize_for_speech("edit YAML", {"YAML": "yah-mul"}, options=options) == "edit yah-mul"
+    entries = [_entry("YAML", "why-ammel")]
+    assert normalize_for_speech("edit YAML", None, entries, options) == "edit why-ammel"
