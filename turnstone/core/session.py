@@ -8134,6 +8134,14 @@ class ChatSession:
                 else memory_access.project_id
             ),
         )
+        # Deployment facts the operator wants every agent to know, e.g. where
+        # the host filesystem is mounted.  ConfigStore rather than the
+        # persisted workstream config: this describes the host, so a spawned
+        # child built by the node factory reads the same text instead of
+        # inheriting a parent's copy.
+        environment_notes = ""
+        if self._config_store is not None:
+            environment_notes = str(self._config_store.get("session.environment_notes") or "")
         composed = compose_system_message(
             client_type=self._client_type,
             context=ctx,
@@ -8145,6 +8153,7 @@ class ChatSession:
             # CONTEXT / TOOLS / POLICIES keep composing, so mandatory
             # prompt policies ride on top of every persona.
             base_override=self._persona_prompt or None,
+            environment_notes=environment_notes,
         )
         dev_parts = [composed]
         # Capability-gated additions read the same resolved lane snapshot the

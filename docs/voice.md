@@ -821,6 +821,14 @@ Edit both in Admin › Settings, section **Coordinator**. They are read when a
 spawn is prepared, so a saved change applies to the next spawn without
 reopening the session.
 
+A voice brief carries any path or location you named verbatim, and tells the
+agent to work from that path only: if it cannot be found, the agent reports
+that and stops instead of reading a different directory as a substitute. This
+matters when a path you say out loud exists on the host but not inside the
+agent's container — the agent should say so, not fall back to an older
+worktree. Set [`session.environment_notes`](settings.md#environment-notes) so
+every agent is told where the host filesystem is mounted in your deployment.
+
 
 ## Agent reports
 

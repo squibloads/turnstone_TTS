@@ -51,6 +51,26 @@ pending approval cycles remain in memory.
 
 ---
 
+## Environment notes
+
+`session.environment_notes` is operator-authored free text that every new
+session appends to its system message under an **Environment** heading. The
+default is empty, which leaves the prompt byte-identical.
+
+Use it for facts about the host that an agent cannot infer from the code — for
+example that the host filesystem is mounted read-only at `/host`, that a host
+path `/x` is `/host/x` inside the process, or which directories are developers'
+scratch copies rather than the deployed tree. It applies to every agent,
+including children started by a coordinator, so state deployment facts rather
+than task-specific instructions. Agents are told separately to report a missing
+path and stop rather than read a different directory as a substitute.
+
+The value is read when a session composes its system prompt, so a saved change
+reaches sessions created afterwards. An existing workstream keeps the prefix it
+already composed; resuming it or rebuilding its prompt picks up the new text.
+
+---
+
 ## Per-Model Sampling Overrides
 
 The global `model.temperature`, `model.max_tokens`, and `model.reasoning_effort`
@@ -305,7 +325,7 @@ initialization:
 | Section | Settings |
 |---------|----------|
 | `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
-| `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
+| `session` | instructions, environment_notes, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |
 | `cluster` | node_fan_out_limit, mcp_max_servers |
