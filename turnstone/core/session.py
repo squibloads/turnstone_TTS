@@ -251,6 +251,7 @@ from turnstone.core.session_worker import WorkerClaim, current_worker_claim
 from turnstone.core.settings_registry import (
     DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     DEFAULT_AUTO_COMPACT_PCT,
+    SETTINGS,
     TOOL_TRUNCATION_MAX_CHARS,
 )
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
@@ -319,6 +320,7 @@ from turnstone.core.truncation import (
     source_chars,
     truncate_text,
 )
+from turnstone.core.voice_config import is_voice_persona
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import (
     UrlBlockedError,
@@ -3244,6 +3246,15 @@ class ChatSession:
         self._trust_send: bool = False
         self._revoked_tools: frozenset[str] = frozenset()
         self._governance_lock = threading.Lock()
+        # Voice sessions hear spoken asides that can sound like requests, so
+        # their child spawns are budgeted per genuine USER turn.  The count is
+        # reset only where such a turn is admitted
+        # (``_append_genuine_user_turn``) — nudges, wakes and tool results are
+        # not user turns and must not reopen the budget.  Sibling tool calls in
+        # one assistant message execute on a thread pool, so a slot is reserved
+        # before its spawn attempt and released if the child never starts.
+        self._voice_spawns_this_turn: int = 0
+        self._voice_spawn_lock = threading.Lock()
         # The session owns ONE immutable binding snapshot.  Registry-backed
         # construction resolves provider/client/model/config/generation under
         # one lock hold; direct no-registry callers get the same lane shape
@@ -21278,6 +21289,12 @@ class ChatSession:
         after_user: Callable[[], None] | None = None,
     ) -> None:
         """Publish a human USER row and its derived turns in ledger order."""
+        # This is the one admission funnel for genuine USER turns (direct
+        # sends and queued flushes alike), so it is also where a voice
+        # coordinator's per-turn spawn budget reopens.  Placing the reset
+        # here, not in ``_plan_genuine_user_turn``, means a plan that loses
+        # generation admission never spends the budget it did not open.
+        self._voice_reset_spawn_budget()
         self._append_user_turn(
             plan.content,
             attachments,
@@ -21876,6 +21893,131 @@ class ChatSession:
         the sanitized value."""
         return " ".join((value or "").split())[:cap]
 
+    def _voice_spawn_guard_active(self) -> bool:
+        """Whether this session is a voice coordinator.
+
+        Voice sessions hear spoken asides that look like requests, so their
+        spawns carry a per-turn budget and a default child model.  Keying off
+        the persona stamp instead of a caller-supplied flag keeps every
+        surface agreeing; the kind check keeps a session that merely happens
+        to carry the stamp from growing orchestration behavior it has no
+        tools for.
+        """
+        return self._kind == WorkstreamKind.COORDINATOR and is_voice_persona(self._persona_name)
+
+    def _voice_max_agents_per_turn(self) -> int:
+        """Live per-turn child cap for a voice coordinator.
+
+        Read through the config store so an operator's change applies to the
+        next spawn.  A store-less session (CLI, tests) uses the registry
+        default.  Coerce defensively: a hand-built store or an old row can
+        bypass the write path's typing, and a negative cap would otherwise
+        make every spawn look allowed.
+        """
+        cs = self._config_store
+        raw = (
+            cs.get("coordinator.voice_max_agents_per_turn")
+            if cs is not None
+            else SETTINGS["coordinator.voice_max_agents_per_turn"].default
+        )
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return int(SETTINGS["coordinator.voice_max_agents_per_turn"].default)
+
+    def _voice_child_model_alias(self) -> str:
+        """Model alias an unnamed child of a voice coordinator gets.
+
+        Empty means "leave the field unset" so the child falls back to the
+        normal default model, matching the setting's documented meaning.  A
+        store-less session (CLI, tests) uses the registry default, the same
+        way the per-turn cap does.
+        """
+        cs = self._config_store
+        value = (
+            cs.get("coordinator.voice_child_model")
+            if cs is not None
+            else SETTINGS["coordinator.voice_child_model"].default
+        )
+        return value.strip() if isinstance(value, str) else ""
+
+    @staticmethod
+    def _voice_spawn_denial(cap: int) -> str:
+        """Model-readable refusal for a voice spawn over the turn budget."""
+        if cap <= 0:
+            return "Voice mode is set to start no agents."
+        noun = "agent" if cap == 1 else "agents"
+        return (
+            f"Voice mode starts at most {cap} {noun} per turn. "
+            "Ask the user before starting another."
+        )
+
+    @staticmethod
+    def _voice_batch_spawn_denial(count: int, cap: int) -> str:
+        """Refusal for a whole batch — partial spawns would split one request
+        into children the user never got to approve as a set."""
+        if cap <= 0:
+            return "Voice mode is set to start no agents; this batch was not started."
+        noun = "agent" if cap == 1 else "agents"
+        return (
+            f"Voice mode starts at most {cap} {noun} per turn; this batch would "
+            f"start {count}, so the whole batch was not started. Ask the user "
+            "before starting another."
+        )
+
+    def _voice_spawn_denial_locked(self, count: int, *, batch: bool) -> str:
+        """Denial text for *count* spawns; caller holds ``_voice_spawn_lock``."""
+        cap = self._voice_max_agents_per_turn()
+        if self._voice_spawns_this_turn + count <= cap:
+            return ""
+        if batch:
+            return self._voice_batch_spawn_denial(count, cap)
+        return self._voice_spawn_denial(cap)
+
+    def _voice_spawn_peek(self, count: int, *, batch: bool = False) -> str:
+        """Prepare-time check: would *count* spawns exceed the budget now?
+
+        Deliberately non-reserving.  A prepared call may still be denied at
+        approval or cancelled, and a reservation taken here would then be
+        spent on a child that never existed.  The binding check is
+        :meth:`_voice_reserve_spawns` at exec time.
+        """
+        with self._voice_spawn_lock:
+            return self._voice_spawn_denial_locked(count, batch=batch)
+
+    def _voice_reserve_spawns(self, count: int, *, batch: bool = False) -> str:
+        """Reserve *count* per-turn spawn slots, or return the denial text.
+
+        The reservation happens before the spawn attempt so two sibling tool
+        calls cannot both pass the same check on the parallel executor; the
+        caller releases a slot when its child never starts, so the count ends
+        up reflecting children that actually exist.
+        """
+        with self._voice_spawn_lock:
+            denial = self._voice_spawn_denial_locked(count, batch=batch)
+            if not denial:
+                self._voice_spawns_this_turn += count
+            return denial
+
+    def _voice_reset_spawn_budget(self) -> None:
+        """Reopen the per-turn budget at the start of a genuine USER turn."""
+        with self._voice_spawn_lock:
+            self._voice_spawns_this_turn = 0
+
+    def _voice_release_spawns(self, count: int) -> None:
+        """Give back reserved slots whose children never started."""
+        with self._voice_spawn_lock:
+            self._voice_spawns_this_turn = max(0, self._voice_spawns_this_turn - count)
+
+    def _voice_spawn_failure(self, call_id: str, func_name: str, denial: str) -> tuple[str, str]:
+        """Exec-time refusal: report it as a tool error and return nothing.
+
+        The caller already failed to reserve, so no slot is held here.
+        """
+        msg = f"Error: {denial}"
+        self._report_tool_result(call_id, func_name, msg, is_error=True)
+        return call_id, msg
+
     def _prepare_spawn_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
             return self._coord_tool_error(
@@ -21887,6 +22029,18 @@ class ChatSession:
         initial_message = (args.get("initial_message") or "").strip()
         model = (args.get("model") or "").strip()
         project = (args.get("project") or "").strip()
+        # A voice coordinator's budget is checked before any other gate runs a
+        # storage lookup: a spawn over the cap must cost the model one clear
+        # refusal, not a persona round trip and an approval card first.
+        if self._voice_spawn_guard_active():
+            denial = self._voice_spawn_peek(1)
+            if denial:
+                return self._coord_tool_error(call_id, "spawn_workstream", denial)
+            if not model:
+                # An unnamed child of a voice coordinator takes the configured
+                # alias so it never waits on a model the fleet hasn't loaded.
+                # An explicit model is the caller's call and is never replaced.
+                model = self._voice_child_model_alias()
         # Flatten whitespace + cap the fields that reach the trusted approval-
         # header chrome (skill/persona/target_node) or the child's stored
         # metadata (name) before they get there — all model-authored and, when
@@ -21965,6 +22119,15 @@ class ChatSession:
 
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
+        # Voice sessions spend one budget slot per started child.  The reserve
+        # (not a peek) is what holds when sibling calls in one assistant
+        # message run concurrently; a slot whose child never starts goes back
+        # below, so a failed spawn does not cost the turn an agent.
+        voice = self._voice_spawn_guard_active()
+        if voice:
+            denial = self._voice_reserve_spawns(1)
+            if denial:
+                return self._voice_spawn_failure(call_id, "spawn_workstream", denial)
         try:
             result = self._coord_client.spawn(
                 initial_message=item["initial_message"],
@@ -21978,10 +22141,14 @@ class ChatSession:
                 persona=item["persona"],
             )
         except Exception as e:
+            if voice:
+                self._voice_release_spawns(1)
             msg = f"Error: spawn_workstream failed: {e}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
         if result.get("error"):
+            if voice:
+                self._voice_release_spawns(1)
             msg = f"Error: {result['error']}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
@@ -21993,6 +22160,8 @@ class ChatSession:
         # ``_exec_spawn_batch`` (denied row on empty ws_id).
         child_ws_id = str(result.get("ws_id") or "")
         if not child_ws_id:
+            if voice:
+                self._voice_release_spawns(1)
             msg = "Error: spawn returned no ws_id"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
@@ -22051,6 +22220,10 @@ class ChatSession:
         # exec time rather than failing the whole batch — we want
         # partial-success semantics so a single malformed row doesn't
         # poison the other approved spawns.
+        voice = self._voice_spawn_guard_active()
+        # Resolved once per prepare call, like the persona verdicts below: a
+        # fan-out usually leaves the model unset on every row.
+        voice_child_model = self._voice_child_model_alias() if voice else ""
         normalised: list[dict[str, Any]] = []
         preview_rows: list[str] = []
         # Persona prechecks hit storage; a fan-out batch usually repeats one
@@ -22066,6 +22239,10 @@ class ChatSession:
                 continue
             initial_message = self._coord_str_arg(raw, "initial_message").strip()
             model = self._coord_str_arg(raw, "model").strip()
+            if voice and not model:
+                # Same rule as spawn_workstream: an unnamed child of a voice
+                # coordinator takes the configured alias, an explicit model wins.
+                model = voice_child_model
             # Flatten + cap the fields that reach the per-child preview chrome
             # (skill/persona/target_node) or stored metadata (name) — the same
             # one-pass treatment spawn_workstream applies.
@@ -22133,6 +22310,16 @@ class ChatSession:
             )
             return self._coord_tool_error(call_id, "spawn_batch", first_err or "batch rejected")
 
+        # A voice coordinator's budget is checked as one whole-batch request:
+        # refusing a batch part-way would hand the user a partial fan-out they
+        # never approved.  Only rows that can actually start count — a row
+        # already denied at normalisation is reported as such and never
+        # reaches the spawn call.
+        if voice:
+            denial = self._voice_spawn_peek(valid_count, batch=True)
+            if denial:
+                return self._coord_tool_error(call_id, "spawn_batch", denial)
+
         header = f"\u2699 spawn_batch: {len(normalised)} children"
         preview_body = f"{DIM}{chr(10).join(preview_rows)}{RESET}"
         return {
@@ -22150,6 +22337,22 @@ class ChatSession:
         call_id = item["call_id"]
         children: list[dict[str, Any]] = item["children"]
         total = len(children)
+
+        # Voice budget is reserved for the whole batch up front: a batch that
+        # does not fit is refused whole rather than starting a partial set the
+        # user never approved.  Only rows that can start hold a slot; each one
+        # that ends up not starting releases it immediately, so a later call in
+        # this turn sees the true count instead of the reservation.
+        voice = self._voice_spawn_guard_active()
+        planned = sum(1 for spec in children if "_error" not in spec)
+        if voice:
+            denial = self._voice_reserve_spawns(planned, batch=True)
+            if denial:
+                return self._voice_spawn_failure(call_id, "spawn_batch", denial)
+
+        def _child_not_started() -> None:
+            if voice:
+                self._voice_release_spawns(1)
 
         # Emit ``batch_started`` so the coordinator sidebar can show a
         # "spawning N children" indicator.  Mirrors wait_for_workstream's
@@ -22175,9 +22378,11 @@ class ChatSession:
             # already-spawned ws_ids.
             if self._cancel_event.is_set():
                 denied.append({"idx": idx, "reason": "not spawned: cancelled"})
+                _child_not_started()
                 continue
             # Validation failures from _prepare surface here as denied
             # rows — partial-success: don't abort the rest of the batch.
+            # The row never held a budget slot, so there is none to release.
             if "_error" in spec:
                 denied.append({"idx": idx, "reason": spec["_error"]})
                 continue
@@ -22194,13 +22399,16 @@ class ChatSession:
                 )
             except Exception as e:
                 denied.append({"idx": idx, "reason": f"spawn failed: {e}"})
+                _child_not_started()
                 continue
             if result.get("error"):
                 denied.append({"idx": idx, "reason": str(result["error"])})
+                _child_not_started()
                 continue
             ws_id = str(result.get("ws_id") or "")
             if not ws_id:
                 denied.append({"idx": idx, "reason": "spawn returned no ws_id"})
+                _child_not_started()
                 continue
             results[str(idx)] = {
                 # ``child_ws_id`` (not ``ws_id``) — see the matching
