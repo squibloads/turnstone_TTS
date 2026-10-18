@@ -130,6 +130,7 @@ from turnstone.core.metacognition import (
 )
 from turnstone.core.nudge_queue import WAKE_CHANNEL
 from turnstone.core.trajectory import Role
+from turnstone.core.voice_config import is_voice_persona
 from turnstone.core.workstream import WorkstreamKind, WorkstreamState
 
 if TYPE_CHECKING:
@@ -457,6 +458,19 @@ class CoordinatorIdleObserver:
         if ws is None or ws.session is None:
             return
         if ws.kind is not WorkstreamKind.COORDINATOR:
+            return
+        # A voice coordinator gets NEITHER nudge.  Both bodies are written
+        # for a text coordinator: the liveness roster ends by telling the
+        # model to block on ``wait_for_workstream``, a tool voice does not
+        # have (its call would park a spoken turn with nobody listening),
+        # and the advice body carries the same wait call in its
+        # blocked-on-a-child branch.  The wake's purpose is also already
+        # served differently there: finished children leave a report row
+        # that the next spoken turn offers, so no result is abandoned — and
+        # a wake in a voice session would make it speak unprompted, which
+        # its prompt forbids.  Skipping at the event head is smaller than
+        # two body variants, and it keeps the pair consistent.
+        if is_voice_persona(ws.persona):
             return
         # Bind the non-Optional session — mypy's narrowing from the
         # check above does not reach into the paths' closures.
