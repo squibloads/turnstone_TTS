@@ -827,7 +827,70 @@ Stub: a finished agent's report is saved and offered on your next spoken turn
 
 ## Auto-stop
 
-Stub: `audio.stt_auto_stop`, `audio.stt_silence_ms`, `audio.stt_vad_threshold`.
+Auto-stop ends a recording when you stop talking, so a spoken turn is one
+click instead of two. While the microphone is recording, the page watches the
+audio it is already capturing and stops the clip once you have been quiet
+long enough. The clip is then transcribed exactly as if you had clicked the
+button yourself — the dictionary hint, correction and every other dictation
+behavior apply unchanged.
+
+The detector runs inside the browser against the microphone stream dictation
+already captured. Nothing is sent anywhere until the clip is uploaded for
+transcription, and no extra permission prompt appears: it uses the same
+microphone grant as the recording itself.
+
+#### Turning it on
+
+`audio.stt_auto_stop` · default off · boolean
+
+Off keeps today's behavior: the recording runs until you click the microphone
+button again. On, the recording also ends itself once you have been quiet for
+[`audio.stt_silence_ms`](#how-long-you-must-be-quiet). The button stays the
+manual override in both directions — clicking it still stops a recording
+immediately, and it is the only way to stop when the detector is unavailable.
+
+Turn it on for hands-free spoken turns. Leave it off if you dictate long
+answers with deliberate pauses (or think out loud between sentences) and would
+rather decide when the clip ends.
+
+#### How long you must be quiet
+
+`audio.stt_silence_ms` · default `900` · range 300–5000
+
+How long the input must stay quiet before the recording ends. Raise it if
+dictation cuts you off mid-thought or while you are looking something up;
+lower it for snappier turns. A value below a few hundred milliseconds starts
+cutting normal pauses between words.
+
+#### What counts as talking
+
+`audio.stt_vad_threshold` · default `0.5` · range 0.1–0.9
+
+For each audio frame the detector reports a speech probability between 0 and
+1. A frame at or above this value is you talking; a frame below this value
+minus 0.15 is silence. The gap between the two lines keeps a frame that
+wobbles around the threshold during speech from starting the silence clock.
+
+The recording can only stop after it has started. If you click the mic and say
+nothing, it keeps recording until you click again, so a pause before your
+first word never ends a turn early.
+
+Audio between the two lines is neither speech nor silence. It cannot start a
+recording, and because a stop needs an *unbroken* run of quiet it also
+restarts the silence clock. That protects a pause from being cut short by one
+noisy frame, at the cost of a room whose background noise sits in that band
+never auto-stopping. Raise the threshold until the room's noise reads as
+silence; lower it when quiet speech is missed.
+
+#### When the detector is unavailable
+
+The detector ships with the application, so a normal deployment has it. If the
+browser cannot load it — an older build without the files, or a browser that
+refuses the module — dictation falls back to click-to-stop and
+`audio.stt_auto_stop` has no effect. Nothing else about dictation changes.
+
+The mic reads these three settings when it first needs them on a page, so a
+saved change reaches recordings started after a page reload.
 
 ## Streaming read-aloud
 
