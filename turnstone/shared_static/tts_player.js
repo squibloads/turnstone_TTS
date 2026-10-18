@@ -86,6 +86,92 @@ export function getTtsPlaybackRate(base) {
   });
 }
 
+// The read-aloud profile (audio.tts_profiles, keyed by the TTS role's model
+// alias) for this base.  It rides the styles probe like the playback rate:
+// one fetch per base per page.  Every field is always present in the result;
+// a missing profile, a failed probe and a malformed field each read as this
+// module's built-in defaults, which are the constants the player used before
+// profiles existed — a model with no profile sounds exactly as it did.
+export function getTtsProfile(base) {
+  return _ttsConfig(base).then((d) => _normalizeProfile(d && d.profile));
+}
+
+// The built-in profile.  Bounds, defaults and choices mirror TtsProfile,
+// DEFAULT_PROFILE and PROFILE_FIELDS in turnstone/core/voice_config.py — that
+// table is the source of truth; keep this copy in step.  Bounds are enforced
+// here as well as on the server because a stale node, a hand-edited JSON
+// setting or a future release's value must not reach the walker as a broken
+// number (a negative pause is a TypeError inside setTimeout).
+const MAX_MARKER_CHARS = 60;
+const DEFAULT_TTS_PROFILE = Object.freeze({
+  pause_heading_ms: 600,
+  pause_paragraph_ms: 500,
+  pause_table_row_ms: 150,
+  pause_code_ms: 400,
+  pause_list_item_ms: 0, // 0 = a whole list is one clip
+  table_cell_joiner: "comma",
+  table_header_mode: "row",
+  inline_code_max_chars: 40,
+  code_marker: "Code omitted.", // "" = skip silently
+  diagram_marker: "Diagram omitted.", // "" = skip silently
+  clip_min_chars: 20,
+  clip_max_chars: 600,
+  max_clips: 200,
+});
+const TTS_PROFILE_FIELDS = Object.freeze({
+  pause_heading_ms: { kind: "int", min: 0, max: 5000 },
+  pause_paragraph_ms: { kind: "int", min: 0, max: 5000 },
+  pause_table_row_ms: { kind: "int", min: 0, max: 5000 },
+  pause_code_ms: { kind: "int", min: 0, max: 5000 },
+  pause_list_item_ms: { kind: "int", min: 0, max: 5000 },
+  table_cell_joiner: { kind: "choice", choices: ["comma", "semicolon", "pause"] },
+  table_header_mode: { kind: "choice", choices: ["row", "prefix", "skip"] },
+  inline_code_max_chars: { kind: "int", min: 0, max: 500 },
+  code_marker: { kind: "str" },
+  diagram_marker: { kind: "str" },
+  clip_min_chars: { kind: "int", min: 0, max: 200 },
+  clip_max_chars: { kind: "int", min: 100, max: 4000 },
+  max_clips: { kind: "int", min: 1, max: 1000 },
+});
+
+// One profile with every field present: valid overrides are kept, anything
+// missing or unusable reads as its default.  Per-field tolerance matches
+// parse_profiles (one stale choice must not reset the operator's other
+// tuning); the clip_min/clip_max pair falls back together when inverted.
+function _normalizeProfile(value) {
+  const out = { ...DEFAULT_TTS_PROFILE };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+  for (const key of Object.keys(TTS_PROFILE_FIELDS)) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    const spec = TTS_PROFILE_FIELDS[key];
+    const raw = value[key];
+    if (spec.kind === "int") {
+      if (
+        typeof raw !== "number" ||
+        !Number.isInteger(raw) ||
+        raw < spec.min ||
+        raw > spec.max
+      ) {
+        continue;
+      }
+    } else if (spec.kind === "choice") {
+      if (typeof raw !== "string" || !spec.choices.includes(raw)) continue;
+    } else {
+      if (typeof raw !== "string") continue;
+      const text = raw.trim();
+      if (text.length > MAX_MARKER_CHARS) continue;
+      out[key] = text;
+      continue;
+    }
+    out[key] = raw;
+  }
+  if (out.clip_min_chars >= out.clip_max_chars) {
+    out.clip_min_chars = DEFAULT_TTS_PROFILE.clip_min_chars;
+    out.clip_max_chars = DEFAULT_TTS_PROFILE.clip_max_chars;
+  }
+  return out;
+}
+
 // Keep only what the picker can act on: a model that takes instructions and
 // at least one style offered in the menu.  A style is usable only when it is
 // an object with a non-empty string name; anything else is a server bug this
@@ -369,34 +455,31 @@ export function addTtsActionsToFinished(messagesEl, skipEl, onPlay, base) {
 
 // The speakable reply as [{text, pauseMs}], one row per block element so a
 // heading, paragraph or table row gets its own clip and a pause instead of
-// running into the next sentence.  A whole list (UL, OL or DL, nested lists
-// included) is ONE row: each item gets a full stop if it lacks terminal
+// running into the next sentence.  Every pacing and structure decision comes
+// from *profile* — a TtsProfile the caller resolved through getTtsProfile;
+// omitted or unusable fields read as this module's built-in defaults, so a
+// caller that predates profiles gets exactly the old reading.
+//
+// A whole list (UL, OL or DL, nested lists included) is ONE row while
+// pause_list_item_ms is 0: each item gets a full stop if it lacks terminal
 // punctuation and the items are joined with a space, with no pause between
 // items and none after the list (listening tests: the model's own
-// sentence-end pause was enough).  Table rows keep one clip each with a
-// 150 ms pause; a table row is never itself folded forward, but a short
-// lead-in paragraph can fold into the first row.  Fenced code becomes a marker, a diagram
-// (rendered, loading, errored or unrendered mermaid) becomes its own
-// "Diagram omitted." marker, SVG/img/canvas/video/audio are skipped, and rendered
-// math (KaTeX's accessibility text) is dropped.  Inline code is spoken when
-// short (an identifier or flag) and replaced by the marker from
-// INLINE_CODE_MAX characters up (a command line or expression is noise
-// read aloud), in place so the paragraph around it stays one clip.
-export function extractSpeechSegments(bodyEl) {
-  const INLINE_CODE_MAX = 40;
-  const PAUSE = {
-    H1: 600,
-    H2: 600,
-    H3: 600,
-    H4: 600,
-    H5: 600,
-    H6: 600,
-    P: 500,
-    BLOCKQUOTE: 500,
-    TR: 150,
-  };
-  const CODE_OMITTED = "Code omitted.";
-  const DIAGRAM_OMITTED = "Diagram omitted.";
+// sentence-end pause was enough).  Above 0 every item is its own clip
+// followed by that pause.  Table rows keep one clip each, separated by
+// pause_table_row_ms; table_cell_joiner decides what goes between cells
+// (comma or semicolon) or makes each cell its own clip.  table_header_mode
+// decides whether the header row is read like any other row, spoken as
+// "<header>: <cell>" prefixes, or skipped.  A short lead-in paragraph can
+// fold into the first row.  Fenced code becomes code_marker, a diagram
+// (rendered, loading, errored or unrendered mermaid) becomes diagram_marker,
+// SVG/img/canvas/video/audio are skipped, and rendered math (KaTeX's
+// accessibility text) is dropped.  Inline code is spoken when short (an
+// identifier or flag) and replaced by the marker from inline_code_max_chars
+// up (a command line or expression is noise read aloud), in place so the
+// paragraph around it stays one clip.  An empty marker skips the element
+// silently: no marker clip and no marker pause.
+export function extractSpeechSegments(bodyEl, profile) {
+  const p = _normalizeProfile(profile);
   // Elements with no speakable text of their own: an inline SVG icon or a
   // chart would otherwise leak its <title>, <text> and <style> content.
   const SILENT = new Set(["SVG", "IMG", "CANVAS", "VIDEO", "AUDIO"]);
@@ -438,11 +521,25 @@ export function extractSpeechSegments(bodyEl) {
     }
     return t;
   };
+  const listItemMs = p.pause_list_item_ms;
+  const listPerItem = listItemMs > 0;
+  const PAUSE = {
+    H1: p.pause_heading_ms,
+    H2: p.pause_heading_ms,
+    H3: p.pause_heading_ms,
+    H4: p.pause_heading_ms,
+    H5: p.pause_heading_ms,
+    H6: p.pause_heading_ms,
+    P: p.pause_paragraph_ms,
+    BLOCKQUOTE: p.pause_paragraph_ms,
+    TR: p.pause_table_row_ms,
+  };
   let cur = null; // segment taking inline text; null until the next text
   let listDepth = 0; // inside a list everything folds into the one list row
   // Written with hex escapes for the quote characters; see shapeSpeechSegments.
   const ENDS = /[.!?:…][\x22\x27)\]”’]*$/;
   const itemBreak = () => {
+    if (!cur) return;
     // Looked at before anything is trimmed: a blank item leaves the text as is.
     const p = cur.parts;
     let i = p.length - 1;
@@ -456,24 +553,123 @@ export function extractSpeechSegments(bodyEl) {
     }
     put(cur, ENDS.test(tail(cur, 16)) ? " " : ". ");
   };
-  // A cell after the first sets cellSep; the ", " is written only once the
-  // cell has text, so an empty cell adds no separator and padding around
-  // the cell text does not leave "Plan , Price".
-  let cellSep = false;
+  // A cell after the first arms cellSep; the joiner is written only once the
+  // cell has text, so an empty cell adds no separator and padding around the
+  // cell text does not leave "Plan , Price".  In prefix mode cellPrefix is the
+  // same deferral for "Header: ", consumed by the cell's first text.
+  let cellSep = "";
+  let cellPrefix = "";
+  let cellIndex = 0; // column of the cell being walked, for header prefixes
   let rowBase = 0; // non-space count at the start of the current row
   const addText = (str, isMarker) => {
-    if (!cur) cur = newSeg(500);
+    if (!cur) cur = newSeg(listDepth && listPerItem ? listItemMs : p.pause_paragraph_ms);
+    if (cellPrefix) {
+      if (!str.trim()) return;
+      const prefix = cellPrefix;
+      cellPrefix = "";
+      if (cellSep) {
+        trimEnd(cur);
+        put(cur, cellSep);
+        cellSep = "";
+      }
+      put(cur, prefix + ": ");
+      put(cur, str.trimStart(), isMarker);
+      return;
+    }
     if (!cellSep) {
       put(cur, str, isMarker);
       return;
     }
     if (!str.trim()) return;
     trimEnd(cur);
-    put(cur, ", ");
+    put(cur, cellSep);
+    cellSep = "";
     put(cur, str.trimStart(), isMarker);
-    cellSep = false;
   };
-  const walk = (node) => {
+  const cellsOf = (row) => {
+    const cells = [];
+    for (const c of row.childNodes) {
+      if (c.nodeType === 1 && (c.tagName === "TD" || c.tagName === "TH")) cells.push(c);
+    }
+    return cells;
+  };
+  // The table's header row and the per-column texts a prefix mode speaks.  A
+  // THEAD row is a header; without one, a first row made only of TH is (both
+  // shapes renderers emit for a markdown table).  Row mode never reads any of
+  // it, so the scan is skipped there: a 500-row table stays one linear walk.
+  const tableInfo = (tableEl) => {
+    const mode = p.table_header_mode;
+    const info = { mode, joiner: p.table_cell_joiner, headers: [], headerRows: new Set() };
+    if (mode === "row") return info;
+    const rows = [];
+    const collect = (node, inHead) => {
+      for (const c of node.childNodes) {
+        if (c.nodeType !== 1) continue;
+        if (c.tagName === "TR") rows.push({ el: c, inHead });
+        else if (c.tagName !== "TABLE") collect(c, inHead || c.tagName === "THEAD");
+      }
+    };
+    collect(tableEl, false);
+    for (const row of rows) if (row.inHead) info.headerRows.add(row.el);
+    let headerRow = rows.find((r) => r.inHead);
+    if (!headerRow && rows.length) {
+      const cells = cellsOf(rows[0].el);
+      if (cells.length && cells.every((c) => c.tagName === "TH")) headerRow = rows[0];
+    }
+    if (headerRow) {
+      info.headerRows.add(headerRow.el);
+      info.headers = cellsOf(headerRow.el).map((c) =>
+        c.textContent.replace(/\s+/g, " ").trim(),
+      );
+    }
+    return info;
+  };
+  // One table row.  Row mode folds into an enclosing list clip (a row is a
+  // sentence of the list); otherwise the row is its own clip carrying the
+  // table-row pause.  A header row is silent in prefix/skip mode, and the
+  // pause joiner gives every cell its own clip instead.
+  const walkRow = (row, info) => {
+    if (info && info.mode !== "row" && info.headerRows.has(row)) return;
+    cellIndex = 0;
+    cellSep = "";
+    if (info && info.joiner === "pause") {
+      walk(row, info);
+      cellSep = "";
+      return;
+    }
+    if (info && listDepth && cur) {
+      // A row inside a list item is a sentence of that item's clip: it starts
+      // and ends a sentence, and starts clean so its first cell never sees
+      // the previous row's text.
+      itemBreak();
+      rowBase = cur.sig;
+      walk(row, info);
+      itemBreak();
+      cellSep = "";
+      return;
+    }
+    rowBase = 0;
+    cur = newSeg(p.pause_table_row_ms, { table: true });
+    walk(row, info);
+    cur = null;
+    cellSep = "";
+  };
+  // One list, nested ones included.  In per-item mode the enclosing item's
+  // clip ends where the nested list starts; otherwise every item is a
+  // sentence of the one enclosing clip (a whole list, or the paragraph that
+  // introduced it).
+  const walkList = (listEl, table) => {
+    if (listPerItem) cur = null;
+    else if (listDepth) itemBreak();
+    else cur = newSeg(0);
+    listDepth++;
+    walk(listEl, table);
+    listDepth--;
+    if (listPerItem) cur = null;
+    else if (listDepth) itemBreak();
+    else cur = null;
+  };
+  const walk = (node, table) => {
     for (const child of node.childNodes) {
       if (child.nodeType === 3) {
         addText(child.textContent);
@@ -482,10 +678,13 @@ export function extractSpeechSegments(bodyEl) {
       if (child.nodeType !== 1) continue;
       const cls = child.classList;
       if (cls.contains("katex") || cls.contains("katex-display")) continue;
-      if (child.tagName === "CODE" && child.textContent.length >= INLINE_CODE_MAX) {
+      if (child.tagName === "CODE" && child.textContent.length >= p.inline_code_max_chars) {
         // Adjacent markers collapse, except across a cell boundary: each
-        // long-code cell of a row keeps its own.
-        if (!(cur && cur.marker && !cellSep)) addText(" " + CODE_OMITTED + " ", true);
+        // long-code cell of a row keeps its own.  An empty marker skips the
+        // code silently.
+        if (p.code_marker && !(cur && cur.marker && !cellSep)) {
+          addText(" " + p.code_marker + " ", true);
+        }
         continue;
       }
       // SVG elements report a lowercase tagName, so compare upper-cased.
@@ -501,56 +700,101 @@ export function extractSpeechSegments(bodyEl) {
             (c) => c.nodeType === 1 && c.classList.contains("language-mermaid"),
           ));
       if (isDiagram || child.tagName === "PRE") {
-        put(newSeg(400, { code: true }), isDiagram ? DIAGRAM_OMITTED : CODE_OMITTED);
-        cur = listDepth ? newSeg(0) : null;
+        const marker = isDiagram ? p.diagram_marker : p.code_marker;
+        if (marker) put(newSeg(p.pause_code_ms, { code: true }), marker);
+        cur = listDepth ? newSeg(listPerItem ? listItemMs : 0) : null;
         continue;
       }
       const tag = child.tagName;
+      if (tag === "TABLE") {
+        cellSep = "";
+        rowBase = 0;
+        walk(child, tableInfo(child));
+        cellSep = "";
+        rowBase = 0;
+        continue;
+      }
       if (tag === "UL" || tag === "OL" || tag === "DL") {
-        if (listDepth) itemBreak();
-        else cur = newSeg(0);
-        listDepth++;
-        walk(child);
-        listDepth--;
-        if (listDepth) itemBreak();
-        else cur = null;
+        walkList(child, table);
+        continue;
+      }
+      if (tag === "TR") {
+        // Handled before the list branch so a table inside a list item reads
+        // its header row and columns the same way a top-level table does.
+        walkRow(child, table);
         continue;
       }
       if (listDepth && (tag === "LI" || tag === "DT" || tag === "DD" || PAUSE[tag] !== undefined)) {
-        // A table row inside a list item is a sentence of the list clip and
-        // starts clean: its first cell must not see the previous row's text.
-        const isRow = tag === "TR";
-        itemBreak();
-        if (isRow) {
-          cellSep = false;
-          rowBase = cur.sig;
+        if (listPerItem && (tag === "LI" || tag === "DT" || tag === "DD")) {
+          cur = newSeg(listItemMs, { item: true });
+          walk(child, table);
+          cur = null;
+          continue;
         }
-        walk(child);
         itemBreak();
-        if (isRow) cellSep = false;
+        walk(child, table);
+        itemBreak();
         continue;
       }
-      const isCell = child.tagName === "TD" || child.tagName === "TH";
-      if (isCell && cur && cur.sig > rowBase) cellSep = true;
-      const pauseMs = PAUSE[child.tagName];
+      const isCell = tag === "TD" || tag === "TH";
+      if (isCell) {
+        const prefix = table && table.mode === "prefix" ? table.headers[cellIndex] || "" : "";
+        if (table && table.joiner === "pause") {
+          // Each cell its own clip; the row pause separates cells and rows.
+          cur = newSeg(p.pause_table_row_ms, { table: true });
+          if (prefix) put(cur, prefix + ": ");
+          walk(child, table);
+          cur = null;
+          cellSep = "";
+          cellIndex++;
+          continue;
+        }
+        if (cur && cur.sig > rowBase) {
+          cellSep = table && table.joiner === "semicolon" ? "; " : ", ";
+        }
+        if (prefix) cellPrefix = prefix;
+        cellIndex++;
+        walk(child, table);
+        cellPrefix = "";
+        continue;
+      }
+      const pauseMs = PAUSE[tag];
       if (pauseMs === undefined) {
-        walk(child);
-        if (child.tagName === "TABLE") cellSep = false;
+        walk(child, table);
         continue;
       }
-      cellSep = false;
+      cellSep = "";
       rowBase = 0;
-      cur = newSeg(pauseMs, { table: child.tagName === "TR" });
-      walk(child);
+      cur = newSeg(pauseMs);
+      walk(child, table);
       cur = null; // a nested block ends this one; later text starts anew
-      cellSep = false; // a trailing empty cell must not arm the next block's text
+      cellSep = ""; // a trailing empty cell must not arm the next block's text
     }
   };
-  walk(bodyEl);
+  // The root is normally .msg-body (a div), but the walker also accepts a
+  // fragment that IS the table or the list, as the pure-function tests pass
+  // it: without this a root table is walked without its header information.
+  const rootTag = bodyEl.tagName;
+  if (rootTag === "TABLE") {
+    cellSep = "";
+    rowBase = 0;
+    walkRow(bodyEl, tableInfo(bodyEl));
+  } else if (rootTag === "UL" || rootTag === "OL" || rootTag === "DL") {
+    walkList(bodyEl, null);
+  } else {
+    walk(bodyEl, null);
+  }
   // Plain text (no block structure) is shaped like any other reply, so the
   // clip cap applies to it too.
   return shapeSpeechSegments(
-    raw.map((s) => ({ text: s.parts.join(""), pauseMs: s.pauseMs, code: s.code, table: s.table })),
+    raw.map((s) => ({
+      text: s.parts.join(""),
+      pauseMs: s.pauseMs,
+      code: s.code,
+      table: s.table,
+      item: s.item,
+    })),
+    p,
   );
 }
 
@@ -560,9 +804,10 @@ export function extractSpeechSegments(bodyEl) {
 // (long inputs raise latency and fail on some backends, and the server
 // rejects more than 8000 characters).  A sentence that is itself longer than
 // that is wrapped at its last comma, else its last space.
-export function shapeSpeechSegments(raw) {
-  const MIN_CHARS = 20;
-  const MAX_CHARS = 600;
+export function shapeSpeechSegments(raw, profile) {
+  const p = _normalizeProfile(profile);
+  const minChars = p.clip_min_chars;
+  const maxChars = p.clip_max_chars;
   // Closing quotes/brackets may follow the mark.  The quotes are written as
   // hex escapes (x22 and x27) because the test harness slices methods with a
   // brace walker that treats a quote character inside a regex literal as the
@@ -575,14 +820,16 @@ export function shapeSpeechSegments(raw) {
     const end = ENDS_SENTENCE.test(text) ? "" : ".";
     // Adjacent identical markers are one omission, not one request each.
     if (r.code && rows.length && rows[rows.length - 1].code && rows[rows.length - 1].text === text + end) continue;
-    rows.push({ text: text + end, pauseMs: r.pauseMs, code: !!r.code, table: !!r.table });
+    rows.push({ text: text + end, pauseMs: r.pauseMs, code: !!r.code, table: !!r.table, item: !!r.item });
   }
   const merged = [];
   let carry = "";
   rows.forEach((r, i) => {
     const next = rows[i + 1];
     const text = carry ? carry + " " + r.text : r.text;
-    if (!r.code && !r.table && text.length < MIN_CHARS && next && !next.code) {
+    // A code marker, a table row or a per-item list clip stands alone: the
+    // profile asked for its own clip and its own pause.
+    if (!r.code && !r.table && !r.item && text.length < minChars && next && !next.code) {
       carry = text;
       return;
     }
@@ -591,12 +838,12 @@ export function shapeSpeechSegments(raw) {
   });
   const wrapLong = (s) => {
     const parts = [];
-    while (s.length > MAX_CHARS) {
-      const comma = s.lastIndexOf(",", MAX_CHARS - 1);
-      const space = s.lastIndexOf(" ", MAX_CHARS);
-      let cut = comma > 0 ? comma + 1 : space > 0 ? space : MAX_CHARS;
+    while (s.length > maxChars) {
+      const comma = s.lastIndexOf(",", maxChars - 1);
+      const space = s.lastIndexOf(" ", maxChars);
+      let cut = comma > 0 ? comma + 1 : space > 0 ? space : maxChars;
       // A hard cut must not land between the halves of a surrogate pair.
-      if (cut === MAX_CHARS && comma <= 0 && space <= 0) {
+      if (cut === maxChars && comma <= 0 && space <= 0) {
         const hi = s.charCodeAt(cut - 1);
         if (hi >= 0xd800 && hi <= 0xdbff) cut--;
       }
@@ -615,7 +862,7 @@ export function shapeSpeechSegments(raw) {
       .split("\n")
       .flatMap(wrapLong);
     for (const s of sentences) {
-      if (piece && piece.length + 1 + s.length > MAX_CHARS) {
+      if (piece && piece.length + 1 + s.length > maxChars) {
         out.push({ text: piece, pauseMs: 0 });
         piece = s;
       } else {
@@ -652,7 +899,6 @@ async function _requestStyle(base) {
 // Returns { play(el, btn), stop(), isPlaying(), activeButton(), audio() }.
 export function createTtsPlayer(opts) {
   opts = opts || {};
-  const MAX_CLIPS = 200;
   const baseOf = typeof opts.base === "function" ? opts.base : () => opts.base || "";
   const announce = opts.announce || _announcePlayback;
   const generationOf = opts.authGeneration || authGeneration;
@@ -726,27 +972,6 @@ export function createTtsPlayer(opts) {
       return r.blob();
     };
     try {
-      // Inside the try: the walker is recursive and can throw on pathological
-      // nesting, which must reach the toast rather than reject silently.
-      const segments = extractSpeechSegments(
-        el.querySelector(".msg-body") || el,
-      );
-      if (!segments.length) {
-        stop();
-        return;
-      }
-      // One request per clip, so a table or list of hundreds of rows would
-      // queue hundreds of syntheses; read the first MAX_CLIPS and say so.
-      if (segments.length > MAX_CLIPS) {
-        segments.length = MAX_CLIPS;
-        segments[MAX_CLIPS - 1].pauseMs = 0;
-        showToast(
-          "Read-aloud stopped after the first " +
-            MAX_CLIPS +
-            " sections; the rest of this reply was skipped.",
-          "warn",
-        );
-      }
       // Clips are authenticated one by one; a logout or account switch mid-run
       // must not keep speaking (or fetching) the previous session's reply.
       const generation = generationOf();
@@ -758,7 +983,9 @@ export function createTtsPlayer(opts) {
         return true;
       };
       // Resolved once per run: every clip of a segmented reply carries the
-      // same style, and a change mid-run cannot split one reading in two.
+      // same style and the same pacing, and a change mid-run cannot split one
+      // reading in two.  All three ride the one memoized styles probe; a
+      // failed probe is Default, normal speed and the built-in profile.
       let requestStyle = "";
       try {
         requestStyle = await _requestStyle(baseOf());
@@ -770,6 +997,35 @@ export function createTtsPlayer(opts) {
         rate = await getTtsPlaybackRate(baseOf());
       } catch (e) {
         rate = 1; // a failed probe plays at normal speed
+      }
+      let profile = DEFAULT_TTS_PROFILE;
+      try {
+        profile = await getTtsProfile(baseOf());
+      } catch (e) {
+        profile = DEFAULT_TTS_PROFILE; // a failed probe reads like the old constants
+      }
+      // Inside the try: the walker is recursive and can throw on pathological
+      // nesting, which must reach the toast rather than reject silently.
+      const segments = extractSpeechSegments(
+        el.querySelector(".msg-body") || el,
+        profile,
+      );
+      if (!segments.length) {
+        stop();
+        return;
+      }
+      // One request per clip, so a table or list of hundreds of rows would
+      // queue hundreds of syntheses; read the first max_clips and say so.
+      const maxClips = profile.max_clips;
+      if (segments.length > maxClips) {
+        segments.length = maxClips;
+        segments[maxClips - 1].pauseMs = 0;
+        showToast(
+          "Read-aloud stopped after the first " +
+            maxClips +
+            " sections; the rest of this reply was skipped.",
+          "warn",
+        );
       }
       // preservesPitch is the browsers' default; set it so a faster read
       // never turns into a chipmunk on an engine that defaults otherwise.
