@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING
 from turnstone.core.voice_config import (
     BUILTIN_TERMS,
     CleanupOptions,
+    PreviewSpan,
+    SpeechPreview,
     compile_rewrite_rule,
     expand_rewrite,
 )
@@ -49,7 +51,7 @@ from turnstone.core.voice_config import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
 
-    from turnstone.core.voice_config import DictionaryEntry, RewriteRule, SpeechPreview
+    from turnstone.core.voice_config import DictionaryEntry, RewriteRule
 
 
 def _speak_version(match: re.Match[str]) -> str:
@@ -502,6 +504,45 @@ def normalize_for_speech(
     return normalized
 
 
+# A label for one output character, or None when no stage changed it yet.
+# Coalescing runs of a label gives the preview's spans.
+_Annotation = tuple[str, str] | None
+
+
+def _carry_annotations(
+    annotations: Sequence[_Annotation],
+    length: int,
+    segments: Sequence[_Segment],
+    source: str,
+    label: str,
+) -> list[_Annotation]:
+    """Map the preview's per-character labels through one stage's edit map."""
+    tag: _Annotation = (source, label)
+    carried: list[_Annotation] = [None] * length
+    for kind, old_start, old_end, new_start, new_end in segments:
+        if kind == "same":
+            carried[new_start:new_end] = annotations[old_start:old_end]
+        else:
+            carried[new_start:new_end] = [tag] * (new_end - new_start)
+    return carried
+
+
+def _spans_from_annotations(annotations: Sequence[_Annotation]) -> tuple[PreviewSpan, ...]:
+    """Coalesce per-character labels into sorted, non-overlapping spans."""
+    spans: list[PreviewSpan] = []
+    start = 0
+    current: _Annotation = None
+    for index, tag in enumerate(annotations):
+        if tag == current:
+            continue
+        if current is not None:
+            spans.append(PreviewSpan(start, index, current[0], current[1]))
+        start, current = index, tag
+    if current is not None:
+        spans.append(PreviewSpan(start, len(annotations), current[0], current[1]))
+    return tuple(spans)
+
+
 def preview_for_speech(
     text: str,
     pronunciations: Mapping[str, str] | None = None,
@@ -512,6 +553,22 @@ def preview_for_speech(
 
     Contract for the Text cleanup tab: ``.text`` is exactly what
     ``normalize_for_speech(text, pronunciations, dictionary, options)`` returns.
-    Implemented by the cleanup-engine slice.
+    Both run the same stage pipeline, so the preview can never drift from what
+    the TTS model receives.
+
+    Spans come from labelling every output character while the stages run: the
+    characters a stage rewrites take that stage's label, and characters it
+    leaves alone keep the label an earlier stage gave them.  When two stages
+    rewrite the same characters the later label wins, so a label is approximate
+    where changes overlap; the spans themselves stay sorted, disjoint and
+    inside the text.
     """
-    raise NotImplementedError
+    options = options or CleanupOptions()
+    annotations: list[_Annotation] = [None] * len(text)
+    for new_text, source, label, segments in _speech_stages(
+        text, pronunciations, dictionary, options
+    ):
+        if new_text != text:
+            annotations = _carry_annotations(annotations, len(new_text), segments, source, label)
+        text = new_text
+    return SpeechPreview(text, _spans_from_annotations(annotations))

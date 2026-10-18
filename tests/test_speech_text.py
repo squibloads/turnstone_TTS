@@ -13,12 +13,14 @@ from turnstone.core.speech_text import (
     _sub_with_segments,
     normalize_for_speech,
     parse_pronunciations,
+    preview_for_speech,
 )
 from turnstone.core.voice_config import (
     CLEANUP_GROUPS,
     CleanupOptions,
     DictionaryEntry,
     RewriteRule,
+    SpeechPreview,
     expand_rewrite,
     parse_dictionary,
 )
@@ -649,3 +651,123 @@ def test_timing_one_hundred_custom_rules_on_a_long_input() -> None:
     rules = tuple(_rule(f"word{i}", f"term{i}") for i in range(100))
     text = " ".join(f"word{i}" for i in range(100)) * 20
     assert _elapsed(text, CleanupOptions(rules=rules)) < 1.0
+
+
+# -- preview ------------------------------------------------------------------
+
+
+def _assert_spans(preview: SpeechPreview) -> None:
+    last = 0
+    for span in preview.spans:
+        assert 0 <= span.start < span.end <= len(preview.text)
+        assert span.start >= last
+        assert span.source in {"group", "custom", "dictionary"}
+        assert span.label
+        last = span.end
+
+
+PREVIEW_CORPUS = [src for src, _expected in RULE_CASES] + [
+    "user_id and aid_kit at 32GB",
+    "v1.8.5 needs 1.000.000 rows, e.g. on 2026-10-16",
+    "__init__ calls myplace_health_ai_use_context",
+    "5-10ms, 300W, ~50%, ±3",
+    "Use SQL and the YAML file",
+    "No changes here at all.",
+    "",
+]
+
+
+@pytest.mark.parametrize("src", PREVIEW_CORPUS)
+def test_preview_text_matches_normalize_for_speech(src: str) -> None:
+    assert preview_for_speech(src).text == normalize_for_speech(src)
+
+
+@pytest.mark.parametrize("src", PREVIEW_CORPUS)
+def test_preview_spans_are_sorted_disjoint_and_inside_the_text(src: str) -> None:
+    _assert_spans(preview_for_speech(src))
+
+
+def test_preview_text_matches_normalize_with_options() -> None:
+    options = CleanupOptions(
+        disabled_groups=frozenset({"units"}),
+        rules=(_rule("Postgres", "postgres"), _rule("SQL", "sequel", enabled=False)),
+        builtin_terms_off=frozenset({"YAML"}),
+    )
+    entries = [_entry("nginx", "engine ex")]
+    text = "Postgres nginx 32GB YAML SQL"
+    preview = preview_for_speech(text, None, entries, options)
+    assert preview.text == normalize_for_speech(text, None, entries, options)
+    _assert_spans(preview)
+
+
+def test_preview_labels_a_group_change() -> None:
+    preview = preview_for_speech("Needs 32GB")
+    assert preview.text == "Needs 32 gigabytes"
+    assert [(span.source, span.label) for span in preview.spans] == [("group", "units")]
+    span = preview.spans[0]
+    assert preview.text[span.start : span.end] == " gigabytes"
+
+
+def test_preview_labels_identifiers() -> None:
+    preview = preview_for_speech("user_id")
+    assert [(span.source, span.label) for span in preview.spans] == [("group", "identifiers")]
+    assert preview.text == "user ID"
+
+
+def test_preview_labels_a_custom_rule_by_its_stored_position() -> None:
+    options = CleanupOptions(rules=(_rule("first", "1st"), _rule("Postgres", "postgres")))
+    preview = preview_for_speech("Postgres", options=options)
+    assert [(span.source, span.label) for span in preview.spans] == [("custom", "custom 2")]
+
+
+def test_preview_numbers_rules_across_disabled_ones() -> None:
+    options = CleanupOptions(
+        rules=(_rule("first", "1st", enabled=False), _rule("Postgres", "postgres"))
+    )
+    preview = preview_for_speech("Postgres", options=options)
+    assert [(span.source, span.label) for span in preview.spans] == [("custom", "custom 2")]
+
+
+def test_preview_labels_the_pronunciation_layer_as_dictionary() -> None:
+    built_in = preview_for_speech("the YAML file")
+    assert built_in.text == "the yammel file"
+    assert [(span.source, span.label) for span in built_in.spans] == [("dictionary", "dictionary")]
+    entry = preview_for_speech("Use SQL", None, [_entry("SQL", "sequel")])
+    assert [(span.source, span.label) for span in entry.spans] == [("dictionary", "dictionary")]
+
+
+def test_preview_keeps_separate_spans_for_separate_changes() -> None:
+    preview = preview_for_speech("32GB at 120ms")
+    assert [(span.source, span.label) for span in preview.spans] == [
+        ("group", "units"),
+        ("group", "units"),
+    ]
+    covered = "".join(preview.text[span.start : span.end] for span in preview.spans)
+    assert covered == " gigabytes milliseconds"
+
+
+def test_preview_covers_every_changed_stretch_of_text() -> None:
+    preview = preview_for_speech("user_id needs 32GB")
+    covered = "".join(preview.text[span.start : span.end] for span in preview.spans)
+    assert covered == "user ID gigabytes"
+
+
+def test_preview_reports_no_spans_for_unchanged_text() -> None:
+    preview = preview_for_speech("Hello there.")
+    assert preview.text == "Hello there."
+    assert preview.spans == ()
+
+
+def test_preview_does_not_label_a_no_op_rule() -> None:
+    options = CleanupOptions(rules=(_rule("SQL", "SQL"),))
+    assert preview_for_speech("Use SQL", options=options).spans == ()
+
+
+def test_preview_carries_group_spans_through_a_later_rule() -> None:
+    options = CleanupOptions(rules=(_rule("point", "dot"),))
+    preview = preview_for_speech("v1.2.3", options=options)
+    assert preview.text == "version 1 dot 2 dot 3"
+    _assert_spans(preview)
+    labels = {span.label for span in preview.spans}
+    assert "versions" in labels
+    assert "custom 1" in labels
