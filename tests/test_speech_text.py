@@ -144,7 +144,7 @@ RULE_CASES: list[tuple[str, str]] = [
     ("on 192.168.100.203", "on 192 point 168 point 100 point 203"),
     ("on 192.168.1.203", "on 192 point 168 point 1 point 203"),
     # file names with a common extension
-    ("open speech_text.py now", "open speech_text dot py now"),
+    ("open speech_text.py now", "open speech text dot py now"),
     ("see README.md and app.config.ts", "see README dot md and app.config dot ts"),
     ("a Node.js app", "a Node dot js app"),
     ("see README.md.sh", "see README dot md dot sh"),
@@ -504,3 +504,84 @@ def test_builtin_term_off_does_not_block_an_operator_respelling() -> None:
     assert normalize_for_speech("edit YAML", {"YAML": "yah-mul"}, options=options) == "edit yah-mul"
     entries = [_entry("YAML", "why-ammel")]
     assert normalize_for_speech("edit YAML", None, entries, options) == "edit why-ammel"
+
+
+# -- identifiers --------------------------------------------------------------
+
+IDENTIFIER_ACRONYMS = (
+    "ai",
+    "api",
+    "id",
+    "db",
+    "ui",
+    "url",
+    "uri",
+    "io",
+    "os",
+    "cpu",
+    "gpu",
+    "llm",
+    "tts",
+    "stt",
+    "json",
+    "http",
+    "sql",
+    "ssh",
+    "vm",
+    "ip",
+    "phi",
+    "pii",
+    "aws",
+    "ssl",
+    "tls",
+    "cli",
+    "sdk",
+    "jwt",
+    "mcp",
+    "ado",
+    "pr",
+    "ci",
+)
+
+
+@pytest.mark.parametrize(
+    ("src", "expected"),
+    [
+        ("user_id", "user ID"),
+        ("aid_kit", "aid kit"),
+        ("myplace_health_ai_use_context", "myplace health AI use context"),
+        ("__init__", "init"),
+        ("_private_var", "private var"),
+        ("a__b", "a b"),
+        ("trace_2026_10_18", "trace 2026 10 18"),
+        ("api_url and db_host", "API URL and DB host"),
+        ("gpu_tts_mcp", "GPU TTS MCP"),
+        ("speech_text.py", "speech text dot py"),
+        ("voice_dictionary.js", "voice dictionary dot js"),
+        ("café_a", "café a"),
+        # no ASCII letter or digit beside an underscore: left alone, like qwen-tts
+        ("café_", "café_"),
+        ("k8s", "k8s"),
+        ("x _ y", "x _ y"),
+    ],
+)
+def test_identifiers_read_snake_case_as_words(src: str, expected: str) -> None:
+    assert normalize_for_speech(src) == expected
+
+
+@pytest.mark.parametrize("acronym", IDENTIFIER_ACRONYMS)
+def test_identifiers_spell_every_known_acronym_in_capitals(acronym: str) -> None:
+    # "json" is also a built-in term, so switch that layer off to see the
+    # group's own capitalisation.
+    options = CleanupOptions(builtin_terms_off=frozenset({"JSON"}))
+    assert normalize_for_speech(f"x_{acronym}_y", options=options) == f"x {acronym.upper()} y"
+
+
+def test_identifiers_run_before_the_builtin_term_layer() -> None:
+    assert normalize_for_speech("x_json_y") == "x jay-son y"
+
+
+def test_timing_long_word_run_with_identifiers() -> None:
+    # The qwen-tts pattern backtracks quadratically on a long word run; the
+    # boundary form used here must stay linear.
+    assert _elapsed("a" * 50_000) < 0.2

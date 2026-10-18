@@ -147,6 +147,36 @@ def _speak_phone(match: re.Match[str]) -> str:
     return ", ".join(" ".join(group) for group in match.groups())
 
 
+# Parts of a snake_case name that are said as initials rather than words.  The
+# set is the qwen-tts backend's ``speakable()`` list, so a name that backend
+# already read well sounds the same here.
+_IDENTIFIER_ACRONYMS = frozenset(
+    {
+        "ai", "api", "id", "db", "ui", "url", "uri", "io", "os", "cpu", "gpu",
+        "llm", "tts", "stt", "json", "http", "sql", "ssh", "vm", "ip", "phi",
+        "pii", "aws", "ssl", "tls", "cli", "sdk", "jwt", "mcp", "ado", "pr", "ci",
+    }
+)  # fmt: skip
+
+# The qwen-tts backend matches identifiers with
+# ``\w*[A-Za-z0-9]_\w*|\w*_[A-Za-z0-9]\w*``.  That form backtracks
+# quadratically on a long word run, so this is the same set of matches written
+# with boundaries: one whole word run, taken only when an ASCII alphanumeric
+# sits next to an underscore.
+_IDENTIFIER = re.compile(r"(?<!\w)(?=\w*(?:[A-Za-z0-9]_|_[A-Za-z0-9]))\w+")
+
+
+def _speak_identifier(match: re.Match[str]) -> str:
+    # Leading and trailing underscores are separators, not words: "__init__"
+    # is "init".  Interior empty parts ("a__b") collapse the same way.
+    parts = [part for part in match.group(0).split("_") if part]
+    if not parts:
+        return match.group(0)
+    return " ".join(
+        part.upper() if part.lower() in _IDENTIFIER_ACRONYMS else part for part in parts
+    )
+
+
 # Technical terms most voices mangle, as plain respellings that work on every
 # backend.  Universal terms only; an operator's audio.tts_pronunciations entry
 # or a dictionary entry for the same word wins.  The list lives in voice_config
@@ -239,6 +269,9 @@ _RULES: tuple[tuple[str, re.Pattern[str], str | Callable[[re.Match[str]], str]],
         ("abbreviations", r"\bvs\.(?=\s*[,;:)]|\s+[a-z])", "versus"),
         ("abbreviations", r"\bvs\.", "versus."),
         ("abbreviations", r"\bvs\b", "versus"),
+        # identifiers last: the rules above must see dotted file names and
+        # versions as written, before their underscores become spaces
+        ("identifiers", _IDENTIFIER, _speak_identifier),
     )
 )
 
