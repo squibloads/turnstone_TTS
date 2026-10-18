@@ -147,6 +147,54 @@ console.log(JSON.stringify(Array.from(out)));
 
 
 # ---------------------------------------------------------------------------
+# The worklet source
+# ---------------------------------------------------------------------------
+
+
+def test_the_embedded_processor_downmixes_averages_and_flushes_whole_chunks() -> None:
+    """The processor ships as a string, so it would otherwise never be parsed.
+
+    ``demodulize`` leaves the module's top-level bindings in the harness
+    script, so ``WORKLET_SOURCE`` is evaluated here exactly as the browser
+    would after ``addModule`` — with a fake worklet scope supplying
+    ``AudioWorkletProcessor`` and ``registerProcessor``.
+    """
+    out = _run(
+        """
+const posts = [];
+globalThis.AudioWorkletProcessor = class {
+  constructor() { this.port = { postMessage: (msg) => posts.push(msg) }; }
+};
+let registered = null;
+globalThis.registerProcessor = (name, cls) => { registered = { name, cls }; };
+new Function(WORKLET_SOURCE)();
+const proc = new registered.cls();
+const quantum = 128;
+const left = new Float32Array(quantum).fill(1);
+const right = new Float32Array(quantum).fill(0);
+let alive = true;
+for (let q = 0; q < 8; q++) alive = proc.process([[left, right]], [], {});
+const stereo = Array.from(posts[0].samples.slice(0, 4));
+const stereoLength = posts[0].samples.length;
+const monoIn = new Float32Array(quantum).fill(-0.25);
+for (let q = 0; q < 8; q++) proc.process([[monoIn]], [], {});
+console.log(JSON.stringify({
+  name: registered.name, alive, type: posts[0].type,
+  stereo, stereoLength, monoLength: posts[1].samples.length,
+  mono: Array.from(posts[1].samples.slice(0, 4)),
+}));
+"""
+    )
+    assert out["name"] == "turnstone-frame-capture"
+    assert out["alive"] is True
+    assert out["type"] == "samples"
+    # 8 render quanta fill the 1024-sample worklet chunk; stereo (1, 0)
+    # averages to 0.5 and a mono input passes through unchanged.
+    assert out["stereoLength"] == 1024 and out["stereo"] == [0.5, 0.5, 0.5, 0.5]
+    assert out["monoLength"] == 1024 and out["mono"] == [-0.25, -0.25, -0.25, -0.25]
+
+
+# ---------------------------------------------------------------------------
 # The capture pipeline
 # ---------------------------------------------------------------------------
 
