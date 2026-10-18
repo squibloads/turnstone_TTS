@@ -47,16 +47,18 @@ def test_on_transcript_gets_only_the_clip_text_once_the_stream_finishes() -> Non
 fake.chunks = ["hello ", "wor", "ld  "];
 const said = [];
 const composer = makeComposer("typed earlier  ");
+const perDelta = [];                    // said.length at each composer insertion
+composer.inputEl.addEventListener("input", () => perDelta.push(said.length));
 const m = createMicController({
   composer, base: "", wsId: "w",
   onTranscript: (text) => said.push(text),
 });
 m.setAvailable(true);
 m.button.click(); await tick();
-const during = said.slice();            // nothing while the upload is still streaming
+const during = said.slice();            // nothing before the clip is uploaded
 m.button.click(); await tick();
 console.log(JSON.stringify({
-  during, said, value: composer.inputEl.value,
+  during, said, perDelta, value: composer.inputEl.value,
   fetches: log.fetches.length, inputs: composer.inputEl.inputs,
 }));
 """
@@ -65,6 +67,8 @@ console.log(JSON.stringify({
     # One call, the whole clip joined and trimmed — not the typed prefix, and
     # not the trailing whitespace the composer insertion keeps.
     assert out["said"] == ["hello world"]
+    # ... and only after the last delta: no insertion saw a transcript yet.
+    assert out["perDelta"] == [0, 0, 0]
     assert out["value"] == "typed earlier hello world  "
     assert out["fetches"] == 1
     assert out["inputs"] == 3  # insertion is per delta, exactly as before
