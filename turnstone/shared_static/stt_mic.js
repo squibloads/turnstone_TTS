@@ -168,13 +168,19 @@ export function loadVad() {
 //   announce   live-region announcer; defaults to a module-owned region.
 //   isBusy     () => boolean; a busy pane cannot send, so it cannot dictate.
 //   sendBtn    the button to insert before; defaults to composer.sendBtn.
+//   onTranscript  optional (text) => void; called once per kept clip after its
+//              transcript stream completes, with the text that clip added
+//              (trimmed) — never for a discarded, failed or empty clip.
+//   onState    optional (state) => void; "recording" | "transcribing" |
+//              "idle" on every change; a repeated state is not re-announced
+//              and construction is not a change (the controller starts idle).
 //   loadVad    optional detector loader (tests / a pane with its own source);
 //              resolves to { watch(stream, onProbability) -> { stop() } } or
 //              null.  Defaults to the vendored build.
 //   sttConfig  optional dictation settings, object or () => object; defaults
 //              to the per-base GET /v1/api/stt/config probe.
 //
-// Returns { button, setAvailable, syncBusy, toggle, stop, isRecording,
+// Returns { button, setAvailable, syncBusy, toggle, start, stop, isRecording,
 // isDenied, destroy }.  `button` is null when the composer has no action row.
 // The button stays hidden until setAvailable(true), so it never appears when
 // no STT role is configured.
@@ -207,12 +213,21 @@ export function createMicController(opts) {
   let startMs = 0;
   let uploadAbort = null;
   let destroyed = false;
+  // Hands-free state: "idle" | "recording" | "transcribing".  Only changes are
+  // reported, so a page renders the initial "idle" itself.
+  let state = "idle";
   // Auto-stop state: the token invalidates a detector that is still loading
   // when the recording ends, `handle` is the live detector (released with the
   // stream), and `state` is the last frame's decision state.
   let vadToken = null;
   let vadHandle = null;
   let vadState = null;
+
+  function setState(next) {
+    if (next === state) return;
+    state = next;
+    if (typeof opts.onState === "function") opts.onState(next);
+  }
 
   function syncButton() {
     if (!btn) return;
@@ -358,7 +373,11 @@ export function createMicController(opts) {
 
   function upload(blob) {
     const wsId = wsIdOf();
-    if (!wsId || destroyed) return;
+    if (!wsId || destroyed) {
+      setState("idle");
+      return;
+    }
+    setState("transcribing");
     const ext =
       blob.type.indexOf("ogg") !== -1
         ? "ogg"
@@ -405,10 +424,14 @@ export function createMicController(opts) {
         const decoder = new TextDecoder();
         let started = false;
         let got = false;
+        // The text this clip contributed, kept apart from the composer value
+        // so a hands-free pane is not handed the user's typed prefix.
+        let added = "";
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           const chunk = decoder.decode(value, { stream: true });
+          if (chunk) added += chunk;
           const input = composer.inputEl;
           if (!chunk || !input) continue;
           got = true;
@@ -430,6 +453,12 @@ export function createMicController(opts) {
         } else {
           showToast("No speech detected", "error");
         }
+        // A hands-free pane sends the turn on this; whitespace-only streams
+        // have no text to hand over and are not a clip's transcript.
+        const text = added.trim();
+        if (text && typeof opts.onTranscript === "function") {
+          opts.onTranscript(text);
+        }
       })
       .catch((err) => {
         // A destroyed pane aborted this itself; nobody is left to tell.
@@ -442,11 +471,14 @@ export function createMicController(opts) {
       .finally(() => {
         if (uploadAbort === mine) uploadAbort = null;
         resetMic();
+        // A recording can begin while an upload is still draining; its state
+        // wins over the older upload settling back to idle.
+        setState(recording ? "recording" : "idle");
       });
   }
 
   function start() {
-    if (recording || destroyed || isBusy()) return;
+    if (recording || destroyed || denied || isBusy()) return;
     if (
       !navigator.mediaDevices ||
       !navigator.mediaDevices.getUserMedia ||
@@ -491,17 +523,22 @@ export function createMicController(opts) {
           syncButton();
           const drop = discard;
           discard = false;
-          if (drop) return;
+          if (drop) {
+            setState("idle");
+            return;
+          }
           const blob = new Blob(chunks, {
             type: rec.mimeType || mimeType || "audio/webm",
           });
           if (blob.size) upload(blob);
+          else setState("idle");
         });
         recorder = rec;
         recording = true;
         discard = false;
         startTimer();
         syncButton();
+        setState("recording");
         announce("Recording. Activate the microphone button again to stop.");
         rec.start();
         armAutoStop(s);
@@ -543,6 +580,7 @@ export function createMicController(opts) {
   return {
     button: btn,
     toggle,
+    start,
     stop,
     isRecording: () => recording,
     isDenied: () => denied,
