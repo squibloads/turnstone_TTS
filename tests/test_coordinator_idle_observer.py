@@ -153,10 +153,14 @@ class _FakeWorkstream:
         ws_id: str = "ws-coord",
         kind: WorkstreamKind = WorkstreamKind.COORDINATOR,
         user_id: str = "u1",
+        persona: str = "",
     ) -> None:
         self.id = ws_id
         self.kind = kind
         self.user_id = user_id
+        # Persona slug the workstream was created with ("" = plain
+        # coordinator).  The observer reads it to skip voice sessions.
+        self.persona = persona
         self.session: _FakeSession | None = _FakeSession()
 
 
@@ -437,6 +441,49 @@ class TestKindFilter:
         assert len(ws.session._nudge_queue) == 0
         # Storage was NOT queried — kind check happens before list_workstreams.
         assert storage.list_calls == []
+
+
+class TestVoiceSkip:
+    """A voice coordinator has no ``wait_for_workstream``.
+
+    Both nudge bodies end by telling the model to block on that tool, so a
+    voice session gets neither the liveness nor the advice wake: finished
+    children leave a report row the next spoken turn offers instead, and an
+    unprompted wake would make a voice session speak on its own.
+    """
+
+    def test_voice_coordinator_gets_no_nudge_at_all(self):
+        mgr = _FakeManager()
+        storage = _FakeStorage()
+        _add_active_child(storage)
+        _set_tasks(storage, _task("t1", "pending"))
+        ws = _FakeWorkstream(persona="voice")
+        ws.session.messages = _assistant_turns("on it")
+        mgr.add_ws(ws)
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        assert len(ws.session._nudge_queue) == 0
+        # Skipped at the event head - neither path even read storage.
+        assert storage.list_calls == []
+        assert storage.config_calls == []
+
+    def test_a_plain_coordinator_still_gets_its_nudge(self):
+        # The positive control for the skip: the same setup without the
+        # persona stamp must still enqueue, or the guard is too wide.
+        mgr = _FakeManager()
+        storage = _FakeStorage()
+        _add_active_child(storage, ws_id="child-a", state="running")
+        ws = _FakeWorkstream(persona="orchestrator")
+        ws.session.messages = _assistant_turns("on it")
+        mgr.add_ws(ws)
+        observer = CoordinatorIdleObserver(mgr, storage)
+        observer.start()
+        mgr.fire_state(ws.id, WorkstreamState.IDLE)
+        snap = ws.session._nudge_queue.pending("wake")
+        assert len(snap) == 1
+        assert snap[0][0] == "idle_children"
+        assert "child-a" in snap[0][1]
 
 
 class TestWaitForWorkstreamSkip:

@@ -62,7 +62,7 @@ from turnstone.core.trajectory import (
     sanitize_client_send_ids,
     turn_to_dict,
 )
-from turnstone.core.voice_config import VOICE_MEMORY_SCOPE
+from turnstone.core.voice_config import VOICE_MEMORY_SCOPE, VOICE_REPORT_STATES
 
 log = get_logger(__name__)
 
@@ -1733,6 +1733,51 @@ PERSONA_FIELD_CAPS: dict[str, int] = {
 }
 PERSONA_ALLOWLIST_MAX_ENTRIES = 512
 PERSONA_ALLOWLIST_MAX_NAME_LEN = 256
+
+
+# Storage-layer bounds for a voice report row.  The body is a finished child's
+# last assistant turn (or its persisted ``last_error``), already capped by
+# ``coordinator_client.WAIT_MESSAGE_MAX_BYTES`` on the capture path; the
+# storage edge rejects anything larger so a future ingress (SDK, scripted
+# backfill) cannot smuggle an unbounded row.  The title is the child's display
+# name, truncated by the capture path to the same bound.
+VOICE_REPORT_TITLE_MAX = 200
+VOICE_REPORT_BODY_MAX_BYTES = 10 * 1024
+
+
+def validate_voice_report_state(state: str) -> None:
+    """Reject a state outside the voice-report lifecycle vocabulary.
+
+    Shared by both backends and both the create and update paths so a typo
+    fails at the write that made it, not later in a list filter that returns
+    nothing.
+    """
+    if state not in VOICE_REPORT_STATES:
+        raise ValueError(f"voice report state must be one of {VOICE_REPORT_STATES}")
+
+
+def validate_voice_report_fields(
+    coord_ws_id: str,
+    child_ws_id: str,
+    title: str,
+    body: str,
+    state: str,
+) -> None:
+    """Validate one voice report's column values before a write.
+
+    Shared by both backends so the required ids and the size bounds cannot
+    drift.  Raises ValueError; never truncates — truncation is the producer's
+    job, and a silent cut here would hide a caller that skipped it.
+    """
+    if not coord_ws_id:
+        raise ValueError("voice report requires coord_ws_id")
+    if not child_ws_id:
+        raise ValueError("voice report requires child_ws_id")
+    validate_voice_report_state(state)
+    if len(title) > VOICE_REPORT_TITLE_MAX:
+        raise ValueError(f"voice report title exceeds {VOICE_REPORT_TITLE_MAX} characters")
+    if len(body.encode("utf-8")) > VOICE_REPORT_BODY_MAX_BYTES:
+        raise ValueError(f"voice report body exceeds {VOICE_REPORT_BODY_MAX_BYTES} UTF-8 bytes")
 
 
 def serialize_persona_fields(fields: dict[str, Any]) -> dict[str, Any]:
