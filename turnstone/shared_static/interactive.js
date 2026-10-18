@@ -3161,10 +3161,11 @@ class Pane {
   }
 
   // Streaming read-aloud: content deltas go to one feeder per reply, which
-  // hands the player only completed sentences.  The player discards a run
-  // created while audio.tts_stream is off, so this stays unconditional and a
-  // deployment with streaming off behaves exactly as it did before.
+  // hands the player only completed sentences.  A streaming run auto-plays,
+  // so it starts only in a voice session (_voiceMode); worker panes have
+  // none and stay silent, with the per-message speaker still available.
   _streamTTS(text) {
+    if (!this._voiceMode) return;
     if (!(this._voiceRoles && this._voiceRoles.tts) || !text) return;
     if (!this._ttsStream) this._ttsStream = this._ttsPlayer.stream();
     this._ttsStream.push(text);

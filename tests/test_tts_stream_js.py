@@ -443,6 +443,7 @@ def test_the_interactive_pane_feeds_flushes_and_cancels_its_stream() -> None:
             "const calls = [];",
             "const T = {",
             "  _voiceRoles: { stt: false, tts: true },",
+            "  _voiceMode: true,",
             "  _ttsStream: null,",
             "  _ttsPlayer: {",
             "    stream() { calls.push('stream'); return {",
@@ -573,6 +574,36 @@ _feedTtsStream("a content delta");
 const after = ttsStream;
 _endTtsStream();
 console.log(JSON.stringify({ calls, after }));
+""",
+        prelude=prelude,
+    )
+    assert out == {"calls": [], "after": None}
+
+
+def test_an_interactive_pane_never_auto_plays_a_streaming_reply() -> None:
+    """Worker panes have no voice session, so content deltas must not start a
+    streaming run even with audio.tts_stream on: a streaming run auto-plays,
+    and it was reading out every worker's reply."""
+    prelude = "\n".join(
+        (
+            TREE_DOM,
+            "const calls = [];",
+            "const T = {",
+            "  _voiceRoles: { stt: true, tts: true },",
+            "  _ttsStream: null,",
+            "  _ttsPlayer: {",
+            "    stream() { calls.push('stream'); return { push() {}, end() {}, cancel() {} }; },",
+            "    stop() {},",
+            "  },",
+            _INTERACTIVE_METHODS,
+            "};",
+        )
+    )
+    out = _run(
+        """
+T._streamTTS("a worker reply delta");
+T._endTTSStream();
+console.log(JSON.stringify({ calls, after: T._ttsStream }));
 """,
         prelude=prelude,
     )
