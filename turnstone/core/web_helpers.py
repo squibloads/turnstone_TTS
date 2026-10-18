@@ -637,7 +637,23 @@ def stt_config_payload(*, config_store: Any) -> dict[str, Any]:
         "auto_stop": _stt_bool(raw("audio.stt_auto_stop")),
         "silence_ms": silence_ms,
         "vad_threshold": vad_threshold,
+        # Hands-free mode defaults on (registry default), so a missing or
+        # unreadable value must not hide it; only an explicit false does.
+        "voice_mode_enabled": _voice_mode_enabled(raw("audio.voice_mode_enabled")),
     }
+
+
+def _voice_mode_enabled(raw: Any) -> bool:
+    """``audio.voice_mode_enabled`` as the coordinator pane should see it.
+
+    Unlike auto-stop this switch defaults on, so the fallback inverts: only an
+    explicit false spelling turns it off.
+    """
+    if raw is None:
+        return True
+    if isinstance(raw, str) and raw.strip().lower() in ("false", "0", "no"):
+        return False
+    return raw if isinstance(raw, bool) else True
 
 
 async def text_to_speech_response(request: Request, *, registry: Any | None) -> Response:
@@ -1198,7 +1214,9 @@ def cors_middleware(origins: list[str]) -> Middleware:
 # policy.  These directories already carry their library version in the URL,
 # so their contents can be cached immutably; every other first-party asset must
 # revalidate because ES-module imports do not inherit the entry module's ?v=.
-_VERSIONED_VENDOR_DIR = r"(?:katex|hljs|hls|mermaid|inter|jetbrains-mono|dejavu-sans|vad)-\d+(?:\.\d+)+"
+_VERSIONED_VENDOR_DIR = (
+    r"(?:katex|hljs|hls|mermaid|inter|jetbrains-mono|dejavu-sans|vad)-\d+(?:\.\d+)+"
+)
 _VERSIONED_VENDOR_PATH_RE = re.compile(rf"^{_VERSIONED_VENDOR_DIR}/")
 
 

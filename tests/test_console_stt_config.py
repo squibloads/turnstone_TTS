@@ -20,7 +20,12 @@ from starlette.testclient import TestClient
 from tests._coord_test_helpers import _AuthMiddleware, _FakeConfigStore
 from turnstone.core.web_helpers import stt_config_payload
 
-_DEFAULTS = {"auto_stop": False, "silence_ms": 900, "vad_threshold": 0.5}
+_DEFAULTS = {
+    "auto_stop": False,
+    "silence_ms": 900,
+    "vad_threshold": 0.5,
+    "voice_mode_enabled": True,
+}
 
 
 def _store(values: dict[str, Any]) -> _FakeConfigStore:
@@ -60,6 +65,7 @@ def test_stored_values_pass_through() -> None:
         "auto_stop": True,
         "silence_ms": 1500,
         "vad_threshold": 0.7,
+        "voice_mode_enabled": True,
     }
 
 
@@ -100,7 +106,12 @@ def test_the_console_route_serves_the_payload() -> None:
 
     body = _client(stt_config, {"audio.stt_auto_stop": True}).get("/v1/api/stt/config")
     assert body.status_code == 200, body.text
-    assert body.json() == {"auto_stop": True, "silence_ms": 900, "vad_threshold": 0.5}
+    assert body.json() == {
+        "auto_stop": True,
+        "silence_ms": 900,
+        "vad_threshold": 0.5,
+        "voice_mode_enabled": True,
+    }
 
 
 def test_the_node_route_serves_the_payload() -> None:
@@ -108,4 +119,26 @@ def test_the_node_route_serves_the_payload() -> None:
 
     body = _client(stt_config, {"audio.stt_silence_ms": 1200}).get("/v1/api/stt/config")
     assert body.status_code == 200, body.text
-    assert body.json() == {"auto_stop": False, "silence_ms": 1200, "vad_threshold": 0.5}
+    assert body.json() == {
+        "auto_stop": False,
+        "silence_ms": 1200,
+        "vad_threshold": 0.5,
+        "voice_mode_enabled": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Voice mode switch
+# ---------------------------------------------------------------------------
+
+
+def test_voice_mode_is_on_unless_explicitly_switched_off() -> None:
+    # The coordinator pane reads this field to decide whether to offer hands-free
+    # mode; the registry default is on, so only an explicit false turns it off.
+    def body(v: Any) -> Any:
+        return stt_config_payload(config_store=_store({"audio.voice_mode_enabled": v}))
+
+    assert body(False)["voice_mode_enabled"] is False
+    assert body("false")["voice_mode_enabled"] is False
+    assert body(True)["voice_mode_enabled"] is True
+    assert body(None)["voice_mode_enabled"] is True
