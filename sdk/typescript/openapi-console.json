@@ -2741,6 +2741,27 @@
         }
       }
     },
+    "/v1/api/stt/config": {
+      "get": {
+        "summary": "The dictation knobs the coordinator composer applies while recording: whether auto-stop is on, how much silence ends a recording, and the speech probability that counts as talking.  Values are bounded and fall back to the documented defaults.",
+        "operationId": "v1_api_stt_config_get",
+        "tags": [
+          "Models"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SttConfigResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/workstreams/{ws_id}/speech-to-text": {
       "post": {
         "summary": "Transcribe a short audio clip for a coordinator composer (multipart/form-data, field 'audio') using the configured STT model role.  Returns the transcript for the client to place into the composer; this endpoint never sends on the user's behalf.  Returns 503 when no STT role is configured or the coordinator subsystem is down.",
@@ -10479,6 +10500,31 @@
           "transcript"
         ],
         "title": "SpeechToTextResponse",
+        "type": "object"
+      },
+      "SttConfigResponse": {
+        "description": "The dictation knobs the browser applies while recording.\n\nFetched per transport base by the mic module, so a coordinator pane and a\nnode-hosted interactive pane each read their own process's settings.",
+        "properties": {
+          "auto_stop": {
+            "default": false,
+            "description": "audio.stt_auto_stop: end dictation when the speaker goes quiet",
+            "title": "Auto Stop",
+            "type": "boolean"
+          },
+          "silence_ms": {
+            "default": 900,
+            "description": "audio.stt_silence_ms: quiet milliseconds before auto-stop fires (300-5000)",
+            "title": "Silence Ms",
+            "type": "integer"
+          },
+          "vad_threshold": {
+            "default": 0.5,
+            "description": "audio.stt_vad_threshold: speech probability that counts as talking (0.1-0.9); silence is this value minus 0.15",
+            "title": "Vad Threshold",
+            "type": "number"
+          }
+        },
+        "title": "SttConfigResponse",
         "type": "object"
       },
       "TextToSpeechRequest": {

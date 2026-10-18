@@ -53,6 +53,7 @@ from turnstone.api.server_schemas import (
     SendResponse,
     SkillSummary,
     SpeechToTextResponse,
+    SttConfigResponse,
     TextToSpeechRequest,
     TextToSpeechStylesResponse,
     UploadAttachmentResponse,
@@ -522,6 +523,16 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         response_model=TextToSpeechStylesResponse,
         tags=["Chat"],
     ),
+    EndpointSpec(
+        "/v1/api/stt/config",
+        "GET",
+        "The dictation knobs the browser applies while recording: whether "
+        "auto-stop is on, how much silence ends a recording, and the speech "
+        "probability that counts as talking.  Values are bounded and fall "
+        "back to the documented defaults.",
+        response_model=SttConfigResponse,
+        tags=["Chat"],
+    ),
     # --- Saved workstreams ---
     EndpointSpec(
         "/v1/api/workstreams/saved",
@@ -758,6 +769,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     UploadAttachmentResponse,
     ListAttachmentsResponse,
     SpeechToTextResponse,
+    SttConfigResponse,
     TextToSpeechRequest,
     HealthResponse,
     SaveMemoryRequest,
@@ -770,6 +782,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ListPersonaChoicesResponse,
     AvailableModelInfo,
     ListAvailableModelsResponse,
+    SttConfigResponse,
 ]
 
 

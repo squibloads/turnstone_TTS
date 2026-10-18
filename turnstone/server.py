@@ -1737,6 +1737,21 @@ async def list_tts_styles(request: Request) -> JSONResponse:
     )
 
 
+async def stt_config(request: Request) -> JSONResponse:
+    """GET /v1/api/stt/config — the browser-side dictation knobs.
+
+    The mic module fetches this per transport base at recording time: auto-stop
+    is decided frame by frame in the browser, so the values cannot be baked
+    into a page.  Serving it here (not only on the console) is what lets the
+    interactive pane of a node-hosted session read its own node's settings.
+    """
+    from turnstone.core.web_helpers import stt_config_payload
+
+    return JSONResponse(
+        stt_config_payload(config_store=getattr(request.app.state, "config_store", None))
+    )
+
+
 def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
     """Count workstream states for health/metrics endpoints."""
     counts = dict.fromkeys((state.value for state in WorkstreamState), 0)
@@ -5665,6 +5680,7 @@ def create_app(
     )
     v1_routes.append(Route("/api/tts", text_to_speech, methods=["POST"]))
     v1_routes.append(Route("/api/tts/styles", list_tts_styles))
+    v1_routes.append(Route("/api/stt/config", stt_config))
 
     app = Starlette(
         routes=[
