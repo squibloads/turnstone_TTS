@@ -235,6 +235,11 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
         "background_shell_exit",
         "participant_joined",
         "memory_pointer",
+        # Voice-session offer of finished child agents' reports, produced by
+        # ``ChatSession._append_voice_report_note`` on a genuine user turn.
+        # Not a metacognition nudge: it carries the waiting report ids so the
+        # model can call ``voice_report`` after the user says yes.
+        "voice_reports",
     }
 )
 
