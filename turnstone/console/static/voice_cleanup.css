@@ -1,0 +1,443 @@
+/* Admin › Voice › Text cleanup — the try-it preview, the group switches, the
+   custom-rule list and its editor shelf.
+
+   Rows ride on the console's .admin-colheaders / .admin-row grid and the
+   shelf on shared_static/hatch.{css,js}; this sheet supplies the two-column
+   try-it layout, the span highlight colours, the rule table's tracks and the
+   regex helper box.  Colours are the base.css tokens; nothing here invents a
+   new palette. */
+
+.voice-cleanup-root {
+  padding-bottom: 8px;
+}
+
+/* The order strip: one sentence, read before the controls. */
+.voice-cleanup-order {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  background: var(--accent-glow);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--fg-dim);
+}
+.voice-cleanup-order strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.voice-cleanup-load-error {
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  background: rgba(248, 113, 113, 0.06);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-left: 3px solid var(--red);
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--red);
+}
+.voice-cleanup-load-error[hidden] {
+  display: none;
+}
+
+/* -- Try it ---------------------------------------------------------------- */
+
+.voice-cleanup-try {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.voice-cleanup-try-box {
+  min-width: 0;
+}
+.voice-cleanup-field-label {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+.voice-cleanup-try-box > .voice-cleanup-field-label {
+  display: block;
+  margin-bottom: 5px;
+}
+#voice-cleanup-sample {
+  width: 100%;
+  min-height: 190px;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 8px 10px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+#voice-cleanup-sample:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.voice-cleanup-try-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+.voice-cleanup-try-actions .admin-btn-action {
+  margin-left: 0;
+  margin-right: 0;
+}
+.voice-cleanup-play-hint {
+  font-size: 10.5px;
+  color: var(--fg-dim);
+}
+
+.voice-cleanup-preview-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+.voice-cleanup-changes {
+  margin-left: auto;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-dim);
+}
+.voice-cleanup-preview {
+  min-height: 190px;
+  max-height: 360px;
+  overflow: auto;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.voice-cleanup-preview.is-error {
+  color: var(--red);
+}
+.voice-cleanup-placeholder {
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+/* Span highlights: one hue per stage, matching the legend below. */
+.voice-cleanup-hl {
+  padding: 0 1px;
+  border-radius: 2px;
+  color: inherit;
+  background: transparent;
+}
+.voice-cleanup-hl--group {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-bottom: 1px solid var(--accent);
+}
+.voice-cleanup-hl--custom {
+  background: color-mix(in srgb, var(--green) 20%, transparent);
+  border-bottom: 1px solid var(--green);
+}
+.voice-cleanup-hl--dictionary {
+  background: color-mix(in srgb, var(--yellow) 20%, transparent);
+  border-bottom: 1px solid var(--yellow);
+}
+.voice-cleanup-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 7px;
+  font-size: 10.5px;
+  color: var(--fg-dim);
+}
+.voice-cleanup-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.voice-cleanup-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+.voice-cleanup-swatch--group {
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+  border-bottom: 2px solid var(--accent);
+}
+.voice-cleanup-swatch--custom {
+  background: color-mix(in srgb, var(--green) 40%, transparent);
+  border-bottom: 2px solid var(--green);
+}
+.voice-cleanup-swatch--dictionary {
+  background: color-mix(in srgb, var(--yellow) 40%, transparent);
+  border-bottom: 2px solid var(--yellow);
+}
+
+/* Cleanup-off notice, the same amber cadence as the dictionary's legacy
+   notice. */
+.voice-cleanup-notice {
+  margin-bottom: 14px;
+  padding: 8px 12px;
+  background: rgba(251, 191, 36, 0.06);
+  border: 1px solid rgba(251, 191, 36, 0.15);
+  border-left: 3px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+}
+.voice-cleanup-notice[hidden] {
+  display: none;
+}
+
+/* -- Sections -------------------------------------------------------------- */
+
+.voice-cleanup-section {
+  margin-top: 22px;
+}
+.voice-cleanup-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.voice-cleanup-section-head .admin-action-btn {
+  margin-left: auto;
+}
+.voice-cleanup-lede {
+  margin: 3px 0 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--fg-dim);
+}
+.voice-cleanup-footnote {
+  margin-top: 8px;
+}
+
+/* -- Rule groups ----------------------------------------------------------- */
+
+.voice-cleanup-groups-grid {
+  grid-template-columns:
+    minmax(110px, 140px) minmax(180px, 1.5fr) minmax(200px, 1.8fr)
+    52px;
+  align-items: center;
+}
+.voice-cleanup-example-cell {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.voice-cleanup-groups-desc {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.voice-cleanup-group-on,
+.voice-cleanup-rule-on {
+  justify-self: start;
+}
+
+/* -- Custom rules ---------------------------------------------------------- */
+
+.voice-cleanup-rules-wrap {
+  overflow-x: auto;
+}
+.voice-cleanup-rules-wrap .voice-cleanup-groups-grid {
+  min-width: 660px;
+}
+.voice-cleanup-rules-grid {
+  grid-template-columns:
+    26px minmax(100px, 1fr) 56px minmax(100px, 1.2fr) minmax(150px, 1.6fr)
+    46px 118px;
+  align-items: start;
+  min-width: 760px;
+}
+.voice-cleanup-rule-num {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-dim);
+}
+.voice-cleanup-rule-find,
+.voice-cleanup-rule-replace,
+.voice-cleanup-rule-example {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.voice-cleanup-rule-find code,
+.voice-cleanup-rule-replace code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.voice-cleanup-rule-example {
+  color: var(--fg-dim);
+}
+.voice-cleanup-empty {
+  color: var(--fg-dim);
+}
+.voice-cleanup-rule-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.voice-cleanup-rule-actions .admin-btn-action,
+.voice-cleanup-rule-actions .admin-btn-danger {
+  margin-left: 0;
+  margin-right: 0;
+}
+
+/* Rows just written read as "this is the one you added". */
+.voice-cleanup-rules-grid.is-just-added {
+  box-shadow: inset 3px 0 0 var(--green);
+}
+
+.voice-cleanup-pill {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 9.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+  text-transform: lowercase;
+}
+.voice-cleanup-pill--regex {
+  color: var(--yellow);
+  border-color: rgba(251, 191, 36, 0.35);
+  background: rgba(251, 191, 36, 0.08);
+}
+.voice-cleanup-new-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  border-radius: 999px;
+  background: rgba(52, 211, 153, 0.1);
+  color: var(--green);
+  font-size: 9px;
+  line-height: 1.5;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+/* -- Rule editor shelf ----------------------------------------------------- */
+
+.voice-cleanup-regex-help {
+  margin-top: 14px;
+  padding: 10px 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+}
+.voice-cleanup-regex-help[hidden] {
+  display: none;
+}
+.voice-cleanup-regex-title {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--fg-dim);
+}
+.voice-cleanup-regex-title strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+.voice-cleanup-regex-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.voice-cleanup-regex-actions .admin-btn-action {
+  margin-left: 0;
+  margin-right: 0;
+}
+.voice-cleanup-regex-link {
+  color: var(--accent);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.voice-cleanup-regex-link:hover {
+  text-decoration: underline;
+}
+.voice-cleanup-prompt {
+  margin-top: 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.voice-cleanup-prompt[hidden] {
+  display: none;
+}
+
+.voice-cleanup-field-error {
+  display: none;
+  margin-top: 5px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--red);
+}
+.voice-cleanup-field-error.is-visible {
+  display: block;
+}
+/* A 400 from the preview marks Find in red; !important because the shelf's
+   input cadence sets the border at a higher specificity. */
+.voice-cleanup-find.is-invalid {
+  border-color: var(--red) !important;
+  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.15) !important;
+}
+
+.voice-cleanup-draft-preview {
+  min-height: 46px;
+  max-height: 220px;
+  overflow: auto;
+  margin-top: 14px;
+  padding: 9px 11px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.voice-cleanup-draft-meta {
+  margin-top: 5px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--fg-dim);
+}
+
+/* -- Narrow pane ----------------------------------------------------------- */
+
+@media (max-width: 820px) {
+  .voice-cleanup-try {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 700px) {
+  .voice-cleanup-groups-grid {
+    grid-template-columns: minmax(110px, 1fr) minmax(160px, 1.4fr) 46px;
+    min-width: 0;
+  }
+  .voice-cleanup-groups-desc {
+    display: none;
+  }
+}
