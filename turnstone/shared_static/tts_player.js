@@ -889,6 +889,13 @@ async function _requestStyle(base) {
   return style ? style.name : "";
 }
 
+// The stop() of every player with a run in progress on this page.  Each pane
+// owns its own player, so without this a second session's play would talk over
+// the first; starting a run stops the others through their own stop(), which
+// also resets their buttons.  A run leaves the set in stop(), the one exit
+// every way of ending a run goes through.
+const _activeTtsRuns = new Set();
+
 // One pane's read-aloud player.  Options:
 //   base            transport prefix ("" or "/node/{id}"), or a function
 //                   returning it when the pane's base can change after
@@ -911,6 +918,7 @@ export function createTtsPlayer(opts) {
   let activeBtn = null;
 
   function stop() {
+    _activeTtsRuns.delete(stop);
     seq++; // invalidate any run in progress
     if (abortCtl) {
       abortCtl.abort();
@@ -941,6 +949,9 @@ export function createTtsPlayer(opts) {
       stop();
       if (wasThis) return;
     }
+    // One voice per page: another pane's run ends before this one starts.
+    for (const other of [..._activeTtsRuns]) other();
+    _activeTtsRuns.add(stop);
     // Serialize: stop() bumps the token, so a superseded run notices at its
     // next await and neither plays nor leaks a blob.  Taken before the try so
     // the catch can tell a failure of this run from one a stop already ended.

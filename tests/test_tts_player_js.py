@@ -117,6 +117,32 @@ console.log(JSON.stringify({ idle, busy, playing, stopped }));
     assert out["stopped"] == [False, None, None, False, "false", True, 1]
 
 
+def test_playing_in_one_pane_stops_every_other_pane() -> None:
+    out = _run(
+        """
+const a = createTtsPlayer({ base: "" }), b = createTtsPlayer({ base: "/node/n2" });
+const btnA = new El("button"), btnB = new El("button");
+a.play(reply("The first session's reply, still reading."), btnA);
+await tick();
+const before = [a.isPlaying(), btnA.classList.contains("is-playing")];
+b.play(reply("The second session's reply starts now."), btnB);
+const handover = [a.isPlaying(), btnA.classList.contains("is-playing"), btnA.attrs["aria-pressed"], log.audios[0].paused];
+await tick();
+const after = [b.isPlaying(), btnB.classList.contains("is-playing")];
+b.stop();
+a.play(reply("Back to the first session."), btnA);      // a stopped player can start again
+await tick();
+const again = [a.isPlaying(), b.isPlaying()];
+a.stop();
+console.log(JSON.stringify({ before, handover, after, again }));
+"""
+    )
+    assert out["before"] == [True, True]
+    assert out["handover"] == [False, False, "false", True]
+    assert out["after"] == [True, True]
+    assert out["again"] == [True, False]
+
+
 def test_a_changed_auth_generation_ends_the_run_before_it_speaks() -> None:
     out = _run(
         """
