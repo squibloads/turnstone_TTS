@@ -819,3 +819,16 @@ Edit both in Admin › Settings, section **Coordinator**. They are read when a
 spawn is prepared, so a saved change applies to the next spawn without
 reopening the session.
 
+
+## Agent reports
+
+Stub: a finished agent's report is saved and offered on your next spoken turn
+(`coordinator.voice_report_chime`).
+
+## Auto-stop
+
+Stub: `audio.stt_auto_stop`, `audio.stt_silence_ms`, `audio.stt_vad_threshold`.
+
+## Streaming read-aloud
+
+Stub: `audio.tts_stream`.
