@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+SETTINGS_DOCS_URL = "https://github.com/turnstonelabs/turnstone/blob/main/docs/settings.md"
+
+
 @dataclass(frozen=True)
 class SettingDef:
     """Definition of a single configuration setting."""
@@ -201,6 +204,20 @@ def _build_registry() -> dict[str, SettingDef]:
             "session",
             help="Text that tells the model how to behave (e.g. \u2018You are a helpful coding assistant\u2019). "
             "Applied to every conversation before any skills.",
+        ),
+        SettingDef(
+            "session.environment_notes",
+            "str",
+            "",
+            "Deployment facts appended to every agent's system prompt",
+            "session",
+            help="Free text describing the host every agent works against \u2014 for "
+            "example where the host filesystem is mounted in this deployment, or "
+            "which directories are developers' scratch copies rather than the "
+            "deployed code. When set, every new session appends it to the system "
+            "prompt under an Environment heading, and spawned child agents see it "
+            "too. Empty (the default) leaves the prompt unchanged.",
+            reference_url=SETTINGS_DOCS_URL + "#environment-notes",
         ),
         SettingDef(
             "session.retention_days",
