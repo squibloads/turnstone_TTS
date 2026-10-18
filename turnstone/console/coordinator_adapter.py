@@ -30,6 +30,9 @@ from turnstone.core.memory import get_workstream_display_name, get_workstream_di
 from turnstone.core.metacognition import sanitize_name
 from turnstone.core.storage import get_storage, is_storage_initialized
 from turnstone.core.storage._utils import VOICE_REPORT_TITLE_MAX
+from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
+from turnstone.core.nudge_queue import NudgeQueue
+from turnstone.core.settings_registry import SETTINGS
 from turnstone.core.voice_config import is_voice_persona
 from turnstone.core.workstream import (
     Workstream,
@@ -975,6 +978,96 @@ class CoordinatorAdapter:
             child_ws_id[:8],
             str(report.get("report_id", ""))[:8],
         )
+        try:
+            self._maybe_announce_voice_report(coord_ws_id, coord_ws, report)
+        except Exception:
+            # The report is saved; a failed announcement only means it waits
+            # for the next spoken turn, exactly as with the setting off.
+            log.warning(
+                "coord_adapter.voice_report_announce_failed coord=%s",
+                coord_ws_id[:8],
+                exc_info=True,
+            )
+
+    def _maybe_announce_voice_report(
+        self,
+        coord_ws_id: str,
+        coord_ws: Workstream,
+        report: dict[str, Any],
+    ) -> None:
+        """Wake an idle voice session so it tells the user an agent finished.
+
+        Opt-in (``audio.voice_announce_reports``): a voice session otherwise
+        never speaks unprompted.  Only an IDLE coordinator is woken — mid-turn
+        the next genuine user turn's offer note already covers the report, and
+        a wake queued behind a running turn would announce it a second time.
+
+        The wake reuses the idle-nudge pipeline: one ``"wake"``-channel entry
+        on the session's queue, then the shared wake gate, which starts a
+        synthetic turn whose only content is this note.  The note carries the
+        title, never the body: the user decides whether to hear it.  Its
+        ``valid_until`` re-reads the report at delivery, so a user who spoke
+        first (the offer note marked it ``offered``) is not told twice.
+        """
+        session = coord_ws.session
+        if session is None:
+            return
+        if not _voice_announce_enabled(getattr(session, "_config_store", None)):
+            return
+        if coord_ws.state is not WorkstreamState.IDLE:
+            return
+        queue = getattr(session, "_nudge_queue", None)
+        if not isinstance(queue, NudgeQueue):
+            return
+        report_id = str(report.get("report_id") or "")
+        if not report_id:
+            return
+        title = sanitize_name(str(report.get("title") or "")) or "an agent"
+
+        def _still_pending() -> bool:
+            return _voice_report_still_pending(coord_ws_id, report_id)
+
+        queue.enqueue(
+            "voice_reports",
+            _format_voice_report_announce(title),
+            "wake",
+            valid_until=_still_pending,
+            metadata={"report_id": report_id},
+        )
+        wake_workstream_if_pending(coord_ws, trigger="voice-report")
+
+
+def _voice_announce_enabled(config_store: Any) -> bool:
+    """``audio.voice_announce_reports``, read live; off when unreadable."""
+    key = "audio.voice_announce_reports"
+    try:
+        raw = config_store.get(key) if config_store is not None else SETTINGS[key].default
+    except Exception:
+        return False
+    return raw is True or (isinstance(raw, str) and raw.strip().lower() in ("true", "1", "yes"))
+
+
+def _voice_report_still_pending(coord_ws_id: str, report_id: str) -> bool:
+    """Whether the report is still unoffered — the announcement's drain check.
+
+    Fails closed: a storage error drops the announcement, and the report is
+    still offered on the next spoken turn.
+    """
+    try:
+        rows = get_storage().list_voice_reports(coord_ws_id, ("pending",))
+    except Exception:
+        return False
+    return any(str(r.get("report_id") or "") == report_id for r in rows)
+
+
+def _format_voice_report_announce(title: str) -> str:
+    """The wake turn's whole instruction: announce, ask, do not read."""
+    return (
+        f"An agent you started has finished: {title}. Nobody is talking to you "
+        "right now. In one short spoken sentence, tell the user it finished and "
+        "ask whether they would like to hear it. Do not read or summarise the "
+        "report, and do not call voice_report until the user says yes."
+    )
 
 
 def _enqueue_on_ui(ui: Any, coord_ws_id: str, payload: dict[str, Any]) -> None:

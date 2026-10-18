@@ -30,7 +30,7 @@ const VOICE_SETTING_GROUPS = [
     // settings it uses".
     id: "voice-mode",
     label: "Voice mode",
-    keys: ["audio.voice_mode_enabled"],
+    keys: ["audio.voice_mode_enabled", "audio.voice_announce_reports"],
   },
   {
     id: "dictation",

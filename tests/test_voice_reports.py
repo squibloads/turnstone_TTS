@@ -507,3 +507,149 @@ class TestPersistence:
 
 def test_report_states_are_the_contract_vocabulary() -> None:
     assert VOICE_REPORT_STATES == ("pending", "offered", "read", "dismissed")
+
+
+# ---------------------------------------------------------------------------
+# Announce: a finished agent speaks up while the session is idle
+# ---------------------------------------------------------------------------
+
+
+class _Store:
+    def __init__(self, values: dict[str, Any]) -> None:
+        self.values = values
+
+    def get(self, key: str) -> Any:
+        from turnstone.core.settings_registry import SETTINGS
+
+        return self.values.get(key, SETTINGS[key].default)
+
+
+def _wire_announce(
+    adapter: CoordinatorAdapter,
+    monkeypatch: Any,
+    *,
+    on: bool = True,
+    state: Any = None,
+) -> tuple[Any, list[str]]:
+    """A voice coordinator with a real nudge queue and a recorded wake."""
+    from turnstone.console import coordinator_adapter as mod
+    from turnstone.core.nudge_queue import NudgeQueue
+    from turnstone.core.workstream import WorkstreamState
+
+    _wire(adapter, persona="voice")
+    coord_ws = adapter._manager.get(_COORD)
+    session = MagicMock()
+    session._nudge_queue = NudgeQueue()
+    session._config_store = _Store({"audio.voice_announce_reports": on})
+    coord_ws.session = session
+    coord_ws.state = state if state is not None else WorkstreamState.IDLE
+    woken: list[str] = []
+    monkeypatch.setattr(
+        mod, "wake_workstream_if_pending", lambda ws, **kw: woken.append(kw.get("trigger", ""))
+    )
+    return session, woken
+
+
+class TestAnnounce:
+    def test_setting_is_registered_off_with_help_and_docs(self) -> None:
+        from turnstone.core.settings_registry import validate_key
+        from turnstone.core.voice_config import VOICE_DOCS_URL
+
+        d = validate_key("audio.voice_announce_reports")
+        assert d.default is False
+        assert d.help
+        assert d.reference_url == VOICE_DOCS_URL + "#announcing-finished-agents"
+
+    def test_an_idle_session_is_woken_with_a_one_line_offer(
+        self, storage: Any, monkeypatch: Any
+    ) -> None:
+        _seed_child(storage)
+        adapter = _adapter(storage)
+        session, woken = _wire_announce(adapter, monkeypatch)
+
+        _state(adapter, "running")
+        _state(adapter, "idle")
+
+        assert woken == ["voice-report"]
+        entries = session._nudge_queue.drain(frozenset({"wake"}))
+        assert len(entries) == 1
+        nudge_type, text, meta = entries[0]
+        assert nudge_type == "voice_reports"
+        assert "Research the market" in text
+        assert "ask" in text.lower()
+        # The announcement never carries the body: the user chooses to hear it.
+        assert "The research is done." not in text
+        assert meta and meta.get("report_id")
+
+    def test_setting_off_announces_nothing(self, storage: Any, monkeypatch: Any) -> None:
+        _seed_child(storage)
+        adapter = _adapter(storage)
+        session, woken = _wire_announce(adapter, monkeypatch, on=False)
+
+        _state(adapter, "running")
+        _state(adapter, "idle")
+
+        assert woken == []
+        assert session._nudge_queue.drain(frozenset({"wake"})) == []
+        # The report is still saved for the next spoken turn.
+        assert len(storage.list_voice_reports(_COORD, None)) == 1
+
+    def test_a_busy_session_is_not_interrupted(self, storage: Any, monkeypatch: Any) -> None:
+        from turnstone.core.workstream import WorkstreamState
+
+        _seed_child(storage)
+        adapter = _adapter(storage)
+        session, woken = _wire_announce(adapter, monkeypatch, state=WorkstreamState.RUNNING)
+
+        _state(adapter, "running")
+        _state(adapter, "idle")
+
+        assert woken == []
+        assert session._nudge_queue.drain(frozenset({"wake"})) == []
+
+    def test_an_offer_already_made_drops_the_queued_announcement(
+        self, storage: Any, monkeypatch: Any
+    ) -> None:
+        """The user spoke first: the report was offered on that turn, so the
+        queued announcement must not repeat it."""
+        _seed_child(storage)
+        adapter = _adapter(storage)
+        session, _woken = _wire_announce(adapter, monkeypatch)
+
+        _state(adapter, "running")
+        _state(adapter, "idle")
+        report = storage.list_voice_reports(_COORD, None)[0]
+        storage.update_voice_report_state(report["report_id"], "offered")
+
+        # drain() re-checks valid_until at delivery and drops the stale entry.
+        assert session._nudge_queue.drain(frozenset({"wake"})) == []
+
+    def test_text_coordinators_are_never_announced(self, storage: Any, monkeypatch: Any) -> None:
+        from turnstone.console import coordinator_adapter as mod
+
+        _seed_child(storage)
+        adapter = _adapter(storage)
+        _wire(adapter, persona="coordinator")
+        woken: list[str] = []
+        monkeypatch.setattr(mod, "wake_workstream_if_pending", lambda ws, **kw: woken.append("x"))
+
+        _state(adapter, "running")
+        _state(adapter, "idle")
+
+        assert woken == []
+
+    def test_a_failing_wake_never_breaks_capture(self, storage: Any, monkeypatch: Any) -> None:
+        from turnstone.console import coordinator_adapter as mod
+
+        _seed_child(storage)
+        adapter = _adapter(storage)
+        _wire_announce(adapter, monkeypatch)
+
+        def _boom(ws: Any, **kw: Any) -> None:
+            raise RuntimeError("wake down")
+
+        monkeypatch.setattr(mod, "wake_workstream_if_pending", _boom)
+        _state(adapter, "running")
+        _state(adapter, "idle")
+
+        assert len(storage.list_voice_reports(_COORD, None)) == 1

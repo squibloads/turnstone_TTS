@@ -857,6 +857,25 @@ instead of the session starting to talk. The report is offered on your next
 turn whether the setting is on or off, and the setting never makes the session
 speak on its own. It applies only to voice sessions.
 
+### Announcing finished agents
+
+By default a finished agent waits for you to speak. Turn on
+`audio.voice_announce_reports` (Voice page, Voice mode group; default off) and
+an idle session speaks up instead: when an agent you started finishes and
+nobody is talking to the session, it says in one sentence which agent
+finished and asks whether you want to hear it — for example "The research
+agent is done — want to hear it?". Answer yes and it reads the report; say no
+and it can drop it.
+
+The announcement plays even with the mic switched off, which is the point of
+muting while you wait. With the mic on, it opens again after the
+announcement so you can just answer. The session is only woken when it is
+idle: an agent that finishes while you are mid-conversation is offered on
+your next turn, as without the setting, and an agent you already heard about
+on a spoken turn is not announced again. If an announcement starts while you
+are in the middle of saying something, that half-finished clip is discarded,
+just as it would be for a typed message.
+
 Voice sessions no longer have `wait_for_workstream`. If the model asks for it
 the call is refused, and the next turn's report offer is how the result
 arrives. Text coordinators are unchanged: they keep the tool and the blocking
