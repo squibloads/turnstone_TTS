@@ -193,7 +193,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ================================================================================
 
-onnxruntime-web (^1.17.0, pinned by the vendoring step)
+onnxruntime-web 1.29.0
 https://github.com/microsoft/onnxruntime
 https://www.npmjs.com/package/onnxruntime-web
 
@@ -224,7 +224,7 @@ SOFTWARE.
 
 ================================================================================
 
-Silero VAD model (silero_vad.onnx, v5)
+Silero VAD model (silero_vad_v5.onnx)
 https://github.com/snakers4/silero-vad
 
 The speech-probability model run by the voice-activity bundle. The ONNX file is
