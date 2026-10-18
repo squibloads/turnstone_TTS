@@ -1334,6 +1334,24 @@ def _build_registry() -> dict[str, SettingDef]:
             reference_url=VOICE_DOCS_URL + "#voice-persona",
         ),
         SettingDef(
+            "coordinator.voice_max_requested_agents",
+            "int",
+            4,
+            "Agents a voice coordinator may start when the user names a count",
+            "coordinator",
+            min_value=0,
+            max_value=10,
+            help="Applies only to coordinators created with the voice persona. When the "
+            "user's latest message explicitly names a number of agents and the spawn call "
+            "sets user_requested_count, the turn's budget becomes the larger of this and "
+            "coordinator.voice_max_agents_per_turn. The number in the user's message must "
+            "be at least the batch size, so the model cannot widen the cap on its own; a "
+            "claim the message does not support falls back to the normal cap. A "
+            "coordinator.voice_max_agents_per_turn of 0 stays a hard stop. Set this to 0 "
+            "to refuse explicit-request spawns.",
+            reference_url=VOICE_DOCS_URL + "#voice-persona",
+        ),
+        SettingDef(
             "coordinator.voice_child_model",
             "str",
             "deepseek-flash-high",

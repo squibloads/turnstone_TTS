@@ -793,13 +793,14 @@ voice session does not lose it. It uses the same body-free metadata index and
 
 ### Starting agents
 
-Two settings bound the background work a voice session can start. Both apply
+Three settings bound the background work a voice session can start. All apply
 only to coordinators created with the voice persona; text coordinators ignore
 them.
 
 | Setting | Default | Range | Effect |
 |---------|---------|-------|--------|
 | `coordinator.voice_max_agents_per_turn` | `1` | 0–10 | Child agents one spoken turn may start. A further spawn call is refused with a note telling the model to ask you first. `0` stops voice sessions starting agents at all. |
+| `coordinator.voice_max_requested_agents` | `4` | 0–10 | Ceiling for a turn in which you explicitly named a number of agents and the model set `user_requested_count`. |
 | `coordinator.voice_child_model` | `deepseek-flash-high` | any model alias; empty means the normal default | Model an agent starts on when the voice coordinator names none. |
 
 The default cap is one because spoken asides are easy to mistake for
@@ -810,6 +811,19 @@ you routinely ask the voice session for several agents at once ("start one
 researcher and one engineer"); set it to `0` for a conversation-only session,
 such as while driving.
 
+`coordinator.voice_max_requested_agents` keeps the per-turn cap from
+overruling a request you actually made. When a spawn call sets
+`user_requested_count`, the turn's budget becomes the larger of this ceiling
+and the normal cap, so "chunk it up to four different agents" can start four
+in one turn instead of needing three more. The guard does not take the model's
+word for it: the latest genuine user message must itself name the count — a
+digit or a spoken number up to ten, near "agents" or "each". A flag without
+that evidence falls back to the normal cap. A refusal tells the model to ask
+you to confirm the number and then retry once with the flag, so an ambiguous
+request costs one spoken sentence rather than a silent fan-out. Set this
+ceiling to `0` to refuse explicitly requested wider turns; a normal cap of `0`
+is still a hard stop.
+
 `coordinator.voice_child_model` keeps a spoken spawn from waiting on a model
 that is not loaded. The default is a fast model suited to background work.
 Change it when your deployment uses a different alias or when that work should
@@ -817,8 +831,8 @@ run on a stronger model; leave it empty to fall back to the normal default.
 An alias the registry does not know fails the spawn the same way it would for
 a text coordinator.
 
-Edit both in Admin › Settings, section **Coordinator**. They are read when a
-spawn is prepared, so a saved change applies to the next spawn without
+Edit all three in Admin › Settings, section **Coordinator**. They are read
+when a spawn is prepared, so a saved change applies to the next spawn without
 reopening the session.
 
 
