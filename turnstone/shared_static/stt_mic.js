@@ -4,7 +4,10 @@
 //  The speech-to-text button lifted out of the interactive pane so the
 //  coordinator composer dictates the same way: getUserMedia + MediaRecorder,
 //  the upload to the workstream's /speech-to-text/stream route, and the
-//  transcript deltas written into the composer as they arrive.
+//  transcript deltas written into the composer as they arrive.  "Auto-stop"
+//  (audio.stt_auto_stop) additionally watches the recording with a browser
+//  voice-activity detector and ends it when the speaker goes quiet; the
+//  detector itself is vendored, and its absence is a supported state.
 //
 //  Transport is one knob, as in tts_player.js: `base` is "" for a same-origin
 //  pane (the console's own coordinator route) and "/node/{id}" when the console
@@ -35,6 +38,128 @@ const _MIME_CANDIDATES = [
   "audio/mp4",
 ];
 
+// ---------------------------------------------------------------------------
+//  Auto-stop: browser voice-activity detection
+// ---------------------------------------------------------------------------
+
+// Probabilities at or above `threshold` are speech; below `threshold` minus
+// this gap they are silence.  The gap is what keeps a frame that wobbles
+// around the threshold during speech from starting the silence clock, and it
+// is the same 0.15 the setting's help text names.
+const _VAD_FLOOR_GAP = 0.15;
+
+// The settings route always sends all three fields.  These are the last-resort
+// fallbacks for a degraded page (an older server, a failed probe) and match
+// the registry defaults, so dictation still works without them.
+const _STT_CONFIG_DEFAULTS = {
+  auto_stop: false,
+  silence_ms: 900,
+  vad_threshold: 0.5,
+};
+
+function _finite(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function _defaultSttConfig() {
+  return {
+    auto_stop: _STT_CONFIG_DEFAULTS.auto_stop,
+    silence_ms: _STT_CONFIG_DEFAULTS.silence_ms,
+    vad_threshold: _STT_CONFIG_DEFAULTS.vad_threshold,
+  };
+}
+
+// One frame's decision.  `state` is the previous { speaking, silentSince }
+// (null before the first frame); the return is { state, action } with action
+// "start" when speech begins, "stop" when the mic should stop, else null.
+//
+// Speech starts at `threshold` and never before, so a recording that opens in
+// silence cannot stop itself.  Silence is audio below threshold - 0.15, and a
+// stop needs `silenceMs` of it *unbroken*: one frame at or above the floor
+// restarts the clock.  Audio between the two thresholds is therefore neither
+// speech nor silence - it cannot start a recording, and it protects a pause
+// from being cut short.  The trade is that a room whose noise sits in that
+// band never auto-stops; raise the threshold, or click the mic.
+export function vadDecision(state, prob, nowMs, cfg) {
+  const threshold = _finite(
+    cfg && cfg.threshold,
+    _STT_CONFIG_DEFAULTS.vad_threshold,
+  );
+  const silenceMs = Math.max(
+    0,
+    _finite(cfg && cfg.silenceMs, _STT_CONFIG_DEFAULTS.silence_ms),
+  );
+  const prev = state || null;
+  const speaking = !!(prev && prev.speaking);
+  if (prob >= threshold) {
+    return {
+      state: { speaking: true, silentSince: null },
+      action: speaking ? null : "start",
+    };
+  }
+  if (!speaking) {
+    return { state: { speaking: false, silentSince: null }, action: null };
+  }
+  if (!(prob < threshold - _VAD_FLOOR_GAP)) {
+    return { state: { speaking: true, silentSince: null }, action: null };
+  }
+  const since = prev.silentSince == null ? nowMs : prev.silentSince;
+  if (nowMs - since >= silenceMs) {
+    return { state: { speaking: false, silentSince: null }, action: "stop" };
+  }
+  return { state: { speaking: true, silentSince: since }, action: null };
+}
+
+// Dictation settings ride their own probe, memoized per transport base like the
+// read-aloud ones: a console pane must read the settings of the node hosting
+// its session, and a page that never dictates never asks.  A failed or
+// unusable body resolves to the defaults above, so a degraded server costs
+// auto-stop rather than dictation.
+const _sttConfigPromises = {};
+
+export function getSttConfig(base) {
+  base = base || "";
+  if (!_sttConfigPromises[base]) {
+    _sttConfigPromises[base] = Promise.resolve()
+      .then(() => authFetch(base + "/v1/api/stt/config"))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body) => {
+        const cfg = _defaultSttConfig();
+        if (!body) return cfg;
+        cfg.auto_stop = body.auto_stop === true;
+        cfg.silence_ms = _finite(body.silence_ms, cfg.silence_ms);
+        cfg.vad_threshold = _finite(body.vad_threshold, cfg.vad_threshold);
+        return cfg;
+      })
+      .catch(() => _defaultSttConfig());
+  }
+  return _sttConfigPromises[base];
+}
+
+// The detector is vendored, never fetched from a CDN: a voice session may run
+// on an isolated deployment, and the model has to come from the app itself.
+// The directory is optional at build time - when it is absent (or the browser
+// cannot load the module) the import rejects and the mic keeps today's
+// click-to-stop behaviour.  This indirection is the seam a vendored build (or
+// a test) plugs into, so the rest of the file never names a VAD build; a
+// failed load is remembered rather than retried on every recording.  The
+// module may export either `loadVad()` or `watch` directly; see
+// `docs/voice.md#auto-stop` and THIRD-PARTY-NOTICES for what ships in it.
+const _VAD_MODULE = "./vad-0.0.31/vad_loader.js";
+let _vadPromise = null;
+
+export function loadVad() {
+  if (!_vadPromise) {
+    _vadPromise = Promise.resolve()
+      .then(() => import(_VAD_MODULE))
+      .then((m) => (m && typeof m.loadVad === "function" ? m.loadVad() : m))
+      .then((vad) => (vad && typeof vad.watch === "function" ? vad : null))
+      .catch(() => null);
+  }
+  return _vadPromise;
+}
+
 // opts:
 //   composer   the pane's Composer; the button joins composer.actionsRowEl
 //              (before the send button) and transcripts land in composer.inputEl.
@@ -43,6 +168,11 @@ const _MIME_CANDIDATES = [
 //   announce   live-region announcer; defaults to a module-owned region.
 //   isBusy     () => boolean; a busy pane cannot send, so it cannot dictate.
 //   sendBtn    the button to insert before; defaults to composer.sendBtn.
+//   loadVad    optional detector loader (tests / a pane with its own source);
+//              resolves to { watch(stream, onProbability) -> { stop() } } or
+//              null.  Defaults to the vendored build.
+//   sttConfig  optional dictation settings, object or () => object; defaults
+//              to the per-base GET /v1/api/stt/config probe.
 //
 // Returns { button, setAvailable, syncBusy, toggle, stop, isRecording,
 // isDenied, destroy }.  `button` is null when the composer has no action row.
@@ -56,6 +186,14 @@ export function createMicController(opts) {
     typeof opts.base === "function" ? opts.base() : opts.base || "";
   const wsIdOf = () =>
     typeof opts.wsId === "function" ? opts.wsId() : opts.wsId;
+  // Two seams a test (or a pane with its own settings source) can replace; the
+  // shipped defaults are the per-base settings probe and the vendored detector.
+  const vadLoader = typeof opts.loadVad === "function" ? opts.loadVad : loadVad;
+  const configOf = () => {
+    const supplied =
+      typeof opts.sttConfig === "function" ? opts.sttConfig() : opts.sttConfig;
+    return supplied ? Promise.resolve(supplied) : getSttConfig(baseOf());
+  };
 
   let btn = null;
   let icon = null;
@@ -69,6 +207,12 @@ export function createMicController(opts) {
   let startMs = 0;
   let uploadAbort = null;
   let destroyed = false;
+  // Auto-stop state: the token invalidates a detector that is still loading
+  // when the recording ends, `handle` is the live detector (released with the
+  // stream), and `state` is the last frame's decision state.
+  let vadToken = null;
+  let vadHandle = null;
+  let vadState = null;
 
   function syncButton() {
     if (!btn) return;
@@ -121,11 +265,74 @@ export function createMicController(opts) {
   }
 
   function teardownStream() {
+    // Releasing the microphone releases the detector with it: a handle left
+    // running would keep reading a stream it no longer owns (and could still
+    // call stop() on a finished recording).
+    stopVad();
     if (stream) {
       stream.getTracks().forEach((t) => t.stop());
       stream = null;
     }
     recorder = null;
+  }
+
+  function stopVad() {
+    vadToken = null;
+    vadState = null;
+    if (vadHandle) {
+      const handle = vadHandle;
+      vadHandle = null;
+      try {
+        handle.stop();
+      } catch (e) {
+        /* the detector was already torn down */
+      }
+    }
+  }
+
+  // Auto-stop is opt-in and best-effort: the setting must be on, the detector
+  // must load, and this must still be the live recording.  Every failure path
+  // leaves the mic exactly as it is today (click again to stop).  The settings
+  // probe runs first so a deployment with the setting off never loads the
+  // detector's model at all.
+  function armAutoStop(s) {
+    const token = {};
+    vadToken = token;
+    Promise.resolve(configOf())
+      .then((cfg) => {
+        // The recording can end while the settings are in flight; do not pay
+        // for loading the detector's model when nobody is listening any more.
+        if (!cfg || !cfg.auto_stop || vadToken !== token) return null;
+        return Promise.resolve(vadLoader()).then((vad) => {
+          if (!vad || vadToken !== token || stream !== s || destroyed) {
+            return null;
+          }
+          vadState = null;
+          return vad.watch(s, (prob) => {
+            if (vadToken !== token) return;
+            const step = vadDecision(vadState, prob, Date.now(), {
+              threshold: cfg.vad_threshold,
+              silenceMs: cfg.silence_ms,
+            });
+            vadState = step.state;
+            if (step.action === "stop" && recording) stop();
+          });
+        });
+      })
+      .then((handle) => {
+        if (!handle) return;
+        if (vadToken !== token) {
+          // The recording ended while the model was still loading.
+          try {
+            handle.stop();
+          } catch (e) {
+            /* nothing left to release */
+          }
+          return;
+        }
+        vadHandle = handle;
+      })
+      .catch(() => {});
   }
 
   // Stop recording.  `discardClip` abandons the audio (reset, busy, teardown);
@@ -297,6 +504,7 @@ export function createMicController(opts) {
         syncButton();
         announce("Recording. Activate the microphone button again to stop.");
         rec.start();
+        armAutoStop(s);
       })
       .catch(() => {
         // Denied / hardware unavailable: leave a persistent disabled state with

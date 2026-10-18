@@ -1789,6 +1789,20 @@ async def list_tts_styles(request: Request) -> JSONResponse:
     )
 
 
+async def stt_config(request: Request) -> JSONResponse:
+    """GET /v1/api/stt/config — the browser-side dictation knobs.
+
+    Coordinator sessions run in the console, so the console's own composers
+    must be able to read its settings without a node in between; the payload is
+    the node's, served from this process's config store.
+    """
+    from turnstone.core.web_helpers import stt_config_payload
+
+    return JSONResponse(
+        stt_config_payload(config_store=getattr(request.app.state, "config_store", None))
+    )
+
+
 async def _authorize_coordinator_ws(request: Request, ws_id: str) -> JSONResponse | None:
     """Gate a speech-to-text request on the caller's access to coordinator ``ws_id``.
 
@@ -17922,6 +17936,7 @@ def create_app(
                     Route("/api/models", list_available_models),
                     Route("/api/tts", text_to_speech, methods=["POST"]),
                     Route("/api/tts/styles", list_tts_styles),
+                    Route("/api/stt/config", stt_config),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),

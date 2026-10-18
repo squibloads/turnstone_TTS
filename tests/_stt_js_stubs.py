@@ -30,14 +30,18 @@ globalThis.document = { createElement: (t) => new MicEl(t) };
 """
 
 # `fake` is the knob panel: getUserMedia answers per `gum`, MediaRecorder
-# supports the types in `supported`, and the transcription route answers per
-# `stt` ("stream" | "empty" | "error" | "hang").  `log` records what happened.
+# supports the types in `supported`, the transcription route answers per
+# `stt` ("stream" | "empty" | "error" | "hang"), and the dictation settings
+# route answers per `sttConfig` (an object, "error" for a failed response).
+# `log` records what happened; config probes land in their own list so the
+# upload assertions keep indexing `log.fetches` by upload.
 MIC_STUBS = r"""
-const log = { toasts: [], announce: [], fetches: [], tracks: [], recorders: [], timers: [], cleared: [] };
+const log = { toasts: [], announce: [], fetches: [], configFetches: [], tracks: [], recorders: [], timers: [], cleared: [] };
 const fake = {
   gum: "ok",              // "ok" | "deny" | "pending"
   supported: ["audio/webm;codecs=opus", "audio/webm"],
   stt: "stream", chunks: ["hello ", "world"], error: "STT is not configured",
+  sttConfig: { auto_stop: false, silence_ms: 900, vad_threshold: 0.5 },
   pendingGum: null,
 };
 const tick = async () => { for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r)); };
@@ -82,6 +86,11 @@ globalThis.MediaRecorder = class {
   }
 };
 function authFetch(url, opts) {
+  if (url.indexOf("/stt/config") !== -1) {
+    log.configFetches.push(url);
+    if (fake.sttConfig === "error") return Promise.resolve({ ok: false, json: async () => ({}) });
+    return Promise.resolve({ ok: true, json: async () => fake.sttConfig });
+  }
   const f = { url, method: opts && opts.method, body: opts && opts.body, signal: opts && opts.signal };
   log.fetches.push(f);
   if (fake.stt === "hang") {

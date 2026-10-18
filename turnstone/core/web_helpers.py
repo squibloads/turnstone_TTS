@@ -567,6 +567,66 @@ def _tts_playback_rate(config_store: Any) -> float:
     return rate if 0.5 <= rate <= 2.0 else 1.0
 
 
+def _stt_bool(raw: Any) -> bool:
+    """A stored flag as the detector should see it.
+
+    ``ConfigStore`` hands back typed values, but a degraded store or a raw row
+    may hand back ``None`` or a string; only an explicit truthy spelling turns
+    auto-stop on, so a missing setting can never start watching the mic.
+    """
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("true", "1", "yes")
+    return bool(raw)
+
+
+def stt_config_payload(*, config_store: Any) -> dict[str, Any]:
+    """The body of ``GET /v1/api/stt/config``: the browser-side dictation knobs.
+
+    Auto-stop is decided frame by frame in the browser, so the mic module needs
+    these at recording time rather than when a page loads.  The route rides the
+    same transport base as the clip upload, which is what lets a console pane
+    read the settings of the node hosting its session.  Defaults and bounds come
+    from the settings registry, so a stored value and this fallback cannot
+    drift; an unusable value degrades per field rather than breaking dictation.
+    """
+    from math import isfinite
+
+    from turnstone.core.settings_registry import SETTINGS
+
+    def raw(key: str) -> Any:
+        return config_store.get(key) if config_store is not None else None
+
+    silence = SETTINGS["audio.stt_silence_ms"]
+    try:
+        silence_ms = int(raw(silence.key))
+    except (TypeError, ValueError):
+        silence_ms = silence.default
+    if silence.min_value is not None and silence_ms < silence.min_value:
+        silence_ms = int(silence.min_value)
+    if silence.max_value is not None and silence_ms > silence.max_value:
+        silence_ms = int(silence.max_value)
+
+    threshold = SETTINGS["audio.stt_vad_threshold"]
+    try:
+        vad_threshold = float(raw(threshold.key))
+    except (TypeError, ValueError):
+        vad_threshold = threshold.default
+    if not isfinite(vad_threshold):
+        vad_threshold = threshold.default
+    if threshold.min_value is not None and vad_threshold < threshold.min_value:
+        vad_threshold = float(threshold.min_value)
+    if threshold.max_value is not None and vad_threshold > threshold.max_value:
+        vad_threshold = float(threshold.max_value)
+
+    return {
+        "auto_stop": _stt_bool(raw("audio.stt_auto_stop")),
+        "silence_ms": silence_ms,
+        "vad_threshold": vad_threshold,
+    }
+
+
 async def text_to_speech_response(request: Request, *, registry: Any | None) -> Response:
     """Serve ``POST /v1/api/tts`` against *registry*.
 
