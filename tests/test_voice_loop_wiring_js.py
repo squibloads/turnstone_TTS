@@ -64,6 +64,8 @@ _COORD_FNS = "\n".join(
         "  function _voiceTurnOn() {",
         "  function _voiceTurnOff() {",
         "  function _voiceToggle() {",
+        "  function _voiceMicToggle() {",
+        "  function _voicePaintMute() {",
         "  function _voiceRefresh() {",
         "  function _voiceSetup() {",
         "  function _watchVoiceRun(run, replyEl) {",
@@ -87,6 +89,7 @@ _VOICE_STATE = "\n".join(
         _decl(r"let voiceOffer = [^;]*;", "let voiceOffer = undefined;"),
         _decl(r"let voiceSetup = [^;]*;", "let voiceSetup = undefined;"),
         _decl(r"let voiceDoneProbe = [^;]*;", "let voiceDoneProbe = undefined;"),
+        _decl(r"let voiceAutoStop = [^;]*;", "let voiceAutoStop = undefined;"),
         _decl(
             r"const voiceControls = _buildVoiceControls\(\);",
             "const voiceControls = { button: new El('button'), status: new El('div') };",
@@ -176,13 +179,14 @@ function createMicController(opts) {
     setAvailable() {}, syncBusy() {}, destroy() { this.destroyed = true; },
   };
 }
+let autoStop = true;            // audio.stt_auto_stop on the same probe
 let voiceSetting = true;          // audio.voice_mode_enabled on the STT config probe
 let personaRows = [];             // GET /v1/api/workstreams rows
 let probeDown = false;            // a failed settings probe must default to on
 function authFetch(url) {
   if (url === "/v1/api/stt/config") {
     if (probeDown) return Promise.reject(new Error("down"));
-    return Promise.resolve({ ok: true, json: async () => ({ auto_stop: false, voice_mode_enabled: voiceSetting }) });
+    return Promise.resolve({ ok: true, json: async () => ({ auto_stop: autoStop, voice_mode_enabled: voiceSetting }) });
   }
   if (url === "/v1/api/workstreams") {
     return Promise.resolve({ ok: true, json: async () => ({ workstreams: personaRows }) });
@@ -736,3 +740,119 @@ console.log(JSON.stringify({ first, afterRender: ttsLog.plays.length, awaiting: 
     assert out["first"] == 1
     assert out["afterRender"] == 1
     assert out["awaiting"] is None
+
+
+# --- mic mute (the mic button inside voice mode) -----------------------------
+
+
+def _voice_on() -> str:
+    return (
+        """
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+    )
+
+
+def test_the_mic_button_mutes_and_unmutes_without_leaving_voice_mode() -> None:
+    out = _run(
+        _voice_on()
+        + """
+const claimed = mic.opts.onToggle();
+const muted = { on: voiceModeOn, muted: voiceLoop.muted, stopped: mic.stopped,
+  discard: mic.lastDiscard, status: voiceStatusEl.attrs["data-state"],
+  label: voiceStatusEl.textContent, cls: mic.button.classList.contains("is-muted"),
+  pressed: mic.button.attrs["aria-pressed"] };
+const started = mic.started;
+mic.opts.onToggle();
+console.log(JSON.stringify({ claimed, muted, reopened: mic.started - started,
+  after: [voiceLoop.muted, voiceStatusEl.attrs["data-state"], mic.button.classList.contains("is-muted")] }));
+"""
+    )
+    assert out["claimed"] is True
+    assert out["muted"]["on"] is True and out["muted"]["muted"] is True
+    assert out["muted"]["stopped"] == 1 and out["muted"]["discard"] is True
+    assert out["muted"]["status"] == "muted" and "Mic off" in out["muted"]["label"]
+    assert out["muted"]["cls"] is True and out["muted"]["pressed"] == "true"
+    assert out["reopened"] == 1
+    assert out["after"] == [False, "listening", False]
+
+
+def test_a_muted_session_still_speaks_a_reply_and_keeps_the_mic_shut() -> None:
+    out = _run(
+        _voice_on()
+        + """
+mic.opts.onToggle();                    // mute
+const before = mic.started;
+setBusy(true);                          // a worker report arrives as a turn
+_feedTtsStream("Job finished.");
+const r = ttsLog.streams[0];
+_endTtsStream();
+r.resolve({ reason: "finished", heard: ["Job finished."] });
+await tick();
+setBusy(false);
+await tick();
+console.log(JSON.stringify({ streamed: ttsLog.streams.length, pushed: r.pushed.length,
+  reopened: mic.started - before, state: voiceLoop.state, status: voiceStatusEl.attrs["data-state"] }));
+"""
+    )
+    assert out["streamed"] == 1 and out["pushed"] >= 1
+    assert out["reopened"] == 0
+    assert out["state"] == "listening" and out["status"] == "muted"
+
+
+def test_without_auto_stop_the_mic_button_keeps_ending_the_turn() -> None:
+    """With auto-stop off the mic press is the only way to finish a spoken
+    turn, so voice mode must not take it over."""
+    out = _run(
+        "autoStop = false;\n"
+        + _voice_on()
+        + """
+console.log(JSON.stringify({ claimed: mic.opts.onToggle(), muted: voiceLoop.muted }));
+"""
+    )
+    assert out["claimed"] is False
+    assert out["muted"] is False
+
+
+def test_outside_voice_mode_the_mic_button_dictates_as_before() -> None:
+    out = _run(
+        """
+personaRows = [{ ws_id: "coord-1", persona: "coordinator" }];
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+console.log(JSON.stringify({ claimed: mic.opts.onToggle() }));
+"""
+    )
+    assert out["claimed"] is False
+
+
+def test_the_mute_switch_stays_usable_while_a_turn_runs() -> None:
+    out = _run(
+        _voice_on()
+        + """
+mic.button.disabled = false;
+mic.syncBusy = function () { this.button.disabled = busy; };
+setBusy(true);
+const during = mic.button.disabled;
+console.log(JSON.stringify({ during }));
+"""
+    )
+    assert out["during"] is False
+
+
+def test_turning_voice_mode_off_clears_the_mute_paint() -> None:
+    out = _run(
+        _voice_on()
+        + """
+mic.opts.onToggle();
+voiceBtn.click();                       // voice mode off
+console.log(JSON.stringify({ cls: mic.button.classList.contains("is-muted"),
+  pressed: mic.button.attrs["aria-pressed"], on: voiceModeOn }));
+"""
+    )
+    assert out["on"] is False
+    assert out["cls"] is False and out["pressed"] == "false"

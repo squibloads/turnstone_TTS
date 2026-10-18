@@ -148,6 +148,17 @@
 .coord-voice-status[data-state="listening"] {
   color: var(--accent);
 }
+/* Muted inside voice mode: the mic button reads as switched off, and the
+   status line says replies still play, so a quiet session is not mistaken
+   for a broken one. */
+.composer-mic-btn.is-muted {
+  color: var(--fg-dim);
+  border-style: dashed;
+  opacity: 0.8;
+}
+.coord-voice-status[data-state="muted"] {
+  color: var(--fg-dim);
+}
 .coord-voice-status[data-state="speaking"] {
   color: var(--ink-2);
 }

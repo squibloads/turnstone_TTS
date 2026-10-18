@@ -171,6 +171,9 @@ export function loadVad() {
 //   onTranscript  optional (text) => void; called once per kept clip after its
 //              transcript stream completes, with the text that clip added
 //              (trimmed) — never for a discarded, failed or empty clip.
+//   onToggle   optional () => boolean; asked first on every button press.  A
+//              true return claims the press (hands-free voice mode uses the
+//              button as its mic on/off switch); anything else records as usual.
 //   onState    optional (state) => void; "recording" | "transcribing" |
 //              "idle" on every change; a repeated state is not re-announced
 //              and construction is not a change (the controller starts idle).
@@ -554,6 +557,7 @@ export function createMicController(opts) {
   }
 
   function toggle() {
+    if (typeof opts.onToggle === "function" && opts.onToggle() === true) return;
     if (recording) stop(false);
     else start();
   }

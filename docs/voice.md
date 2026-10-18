@@ -978,6 +978,23 @@ not appear. It is also meant to run with dictation's auto-stop on
 With auto-stop off the mode still works, but a turn ends only when you press
 the mic button, so a spoken reply needs two clicks instead of none.
 
+### Turning the mic off without leaving voice mode
+
+With auto-stop on, the mic button becomes the session's mic switch while voice
+mode is on. Press it and the microphone closes: anything half-recorded is
+thrown away, and the status line reads **Mic off — replies still play**.
+Voice mode itself stays on, so a reply that is still coming — a worker
+finishing a job, a report the coordinator reads out — plays as usual; the mic
+just does not open afterwards. That is the switch for talking to someone in
+the room while you wait, without the session taking it as your next turn.
+Press the mic button again to start listening.
+
+The switch works while the coordinator is thinking or speaking too: muting
+then only stops the mic from reopening when the turn ends. Turning voice mode
+off clears it, so the next session starts listening. With auto-stop off the
+mic button keeps its dictation job (it is how a spoken turn ends), so there
+is no mute switch.
+
 ### Half-duplex
 
 The microphone is closed while anything plays. While a reply is being read —

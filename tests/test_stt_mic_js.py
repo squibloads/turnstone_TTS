@@ -272,3 +272,24 @@ console.log(JSON.stringify({ recording, inflight, aborted: log.fetches[0].signal
     assert out["inflight"] is False and out["aborted"] is True
     assert out["row"] == ["composer-send"]
     assert out["toasts"] == []  # a destroyed pane's own abort is not an error to show
+
+
+def test_an_on_toggle_hook_that_claims_the_click_skips_recording() -> None:
+    """Voice mode reuses the button as a mic on/off switch: a hook returning
+    true owns the click, anything else leaves dictation exactly as it was."""
+    out = _run(
+        """
+let claim = true, seen = 0;
+const composer = makeComposer();
+const m = createMicController({ composer, base: "", wsId: "w",
+  onToggle: () => { seen++; return claim; } });
+m.button.click(); await tick();
+const claimed = [m.isRecording(), log.recorders.length];
+claim = false;
+m.button.click(); await tick();
+console.log(JSON.stringify({ seen, claimed, recording: m.isRecording() }));
+"""
+    )
+    assert out["seen"] == 2
+    assert out["claimed"] == [False, 0]
+    assert out["recording"] is True

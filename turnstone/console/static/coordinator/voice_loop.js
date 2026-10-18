@@ -25,6 +25,12 @@
 //  when a clip was discarded or failed).  It is additive to the required
 //  surface; a pane that does not call it still runs the cycle, because the
 //  transcript itself moves listening -> thinking.
+//
+//  setMuted(bool) is the user's mic switch inside the mode.  Muted, the loop
+//  runs every turn exactly as before (replies and worker reports still play)
+//  but never opens the mic: `listening` reports as `muted` instead.  That lets
+//  the user talk to someone else while waiting for a job without the session
+//  hearing it.  Only `disable()` clears it.
 // ===========================================================================
 
 // The status strings live in the pane: this module only names the states.
@@ -51,6 +57,8 @@ export function createVoiceLoop(opts) {
   // still mid-turn (a session reopened while another tab's turn ran).  The
   // idle edge completes that entry rather than making a second transition.
   let micPending = false;
+  // The user's mic switch; see the header.  Independent of `state`.
+  let muted = false;
 
   function resetTurn() {
     replyRun = false;
@@ -70,6 +78,11 @@ export function createVoiceLoop(opts) {
   function enterListening() {
     state = "listening";
     resetTurn();
+    if (muted) {
+      micPending = false;
+      setStatus("muted");
+      return;
+    }
     setStatus("listening");
     micPending = startListening() === false;
   }
@@ -117,6 +130,7 @@ export function createVoiceLoop(opts) {
     state = "off";
     busy = false;
     micPending = false;
+    muted = false;
     resetTurn();
     setStatus("off");
   }
@@ -127,6 +141,9 @@ export function createVoiceLoop(opts) {
   // stale turn).
   function onTranscript(text) {
     if (state !== "listening" && state !== "transcribing") return;
+    // A clip that was still uploading when the user muted: they have turned
+    // to someone else, so whatever it caught is not for this session.
+    if (muted) return;
     const trimmed = String(text == null ? "" : text).trim();
     if (!trimmed) {
       // Nothing was heard: reopen the mic instead of sending an empty turn.
@@ -197,8 +214,37 @@ export function createVoiceLoop(opts) {
     maybeFinish();
   }
 
+  // Mid-turn the switch only records the choice: the mic is already shut, and
+  // the turn's own end (enterListening) honours it.  In the listening window
+  // it acts at once — muting discards a clip in flight, unmuting opens the mic
+  // (or defers to the idle edge, like any listening entry).
+  function setMuted(on) {
+    if (state === "off") return;
+    const next = !!on;
+    if (next === muted) return;
+    muted = next;
+    if (state !== "listening" && state !== "transcribing") return;
+    if (muted) {
+      stopListening();
+      micPending = false;
+      state = "listening";
+      setStatus("muted");
+      return;
+    }
+    if (busy) {
+      // A turn is about to own the mic window; the busy edge moves to
+      // thinking and the idle edge reopens the mic.
+      state = "listening";
+      setStatus("listening");
+      micPending = true;
+      return;
+    }
+    enterListening();
+  }
+
   function onMicState(next) {
     if (state === "off") return;
+    if (muted) return;
     if (next === "transcribing") {
       if (state === "listening") enter("transcribing");
       return;
@@ -221,8 +267,12 @@ export function createVoiceLoop(opts) {
     onPlaybackDone,
     // Additive bridge for the mic's onState; see the header.
     onMicState,
+    setMuted,
     get state() {
       return state;
+    },
+    get muted() {
+      return muted;
     },
   };
 }
