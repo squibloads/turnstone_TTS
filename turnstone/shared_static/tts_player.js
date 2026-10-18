@@ -1057,10 +1057,17 @@ export function createTtsPlayer(opts) {
   // The live streaming run, if any.  It has no button, but it owns the same
   // one-voice-per-page slot and the same stop().
   let streamRun = null;
+  // Settles the finished-reply run in progress, if any.  stop() is the one
+  // exit every way of ending a run goes through, but a stopped clip never
+  // fires "ended", so a run parked on one would otherwise wait forever.
+  let playSettle = null;
 
   function stop() {
     _activeTtsRuns.delete(stop);
     seq++; // invalidate any run in progress
+    const finish = playSettle;
+    playSettle = null;
+    if (finish) finish("cancelled");
     if (abortCtl) {
       abortCtl.abort();
       abortCtl = null;
@@ -1090,13 +1097,44 @@ export function createTtsPlayer(opts) {
     }
   }
 
-  async function play(el, btn) {
+  // A finished reply's run handle: the run's own promise (as play() always
+  // returned — click handlers await it for the end of the run and attach
+  // .catch to it) carrying `done`, which settles once with {reason, heard} —
+  // "finished" after the last clip's audio ends (or immediately when there is
+  // nothing speakable), "cancelled" when a stop ends the run first.  Toggling
+  // the playing button off starts no run and returns nothing.
+  function play(el, btn) {
     // Toggle: clicking the active button (or any while playing) stops first.
     if (activeBtn) {
       const wasThis = activeBtn === btn;
       stop();
       if (wasThis) return;
     }
+    let settled = false;
+    let settleDone;
+    const heard = [];
+    const done = new Promise((resolve) => {
+      settleDone = resolve;
+    });
+    const finish = (reason) => {
+      if (settled) return;
+      settled = true;
+      if (playSettle === finish) playSettle = null;
+      settleDone({ reason, heard: heard.slice() });
+    };
+    // The body runs to its first await synchronously, so it owns the voice
+    // slot before this returns.  The catch settles a run that threw before its
+    // own try (a DOM or Audio constructor), which must not leave the
+    // hands-free loop waiting; the returned promise keeps rejecting for a
+    // caller that awaits it, exactly as before.
+    const run = playRun(el, btn, heard, finish);
+    run.catch(() => finish("cancelled"));
+    run.heard = heard;
+    run.done = done;
+    return run;
+  }
+
+  async function playRun(el, btn, heard, finish) {
     // An explicit click supersedes a pending or playing streaming run.  It is
     // not necessarily in _activeTtsRuns yet — a run that has not reached its
     // first clip is still waiting on the config probe — so stop it by hand or
@@ -1105,6 +1143,10 @@ export function createTtsPlayer(opts) {
     // One voice per page: another pane's run ends before this one starts.
     for (const other of [..._activeTtsRuns]) other();
     _activeTtsRuns.add(stop);
+    // Only now, after the supersession calls above (a stream cancel runs this
+    // player's own stop()), so our own teardown cannot settle the run it is
+    // starting.  From here on stop() ends this run, so it settles it.
+    playSettle = finish;
     // Serialize: stop() bumps the token, so a superseded run notices at its
     // next await and neither plays nor leaks a blob.  Taken before the try so
     // the catch can tell a failure of this run from one a stop already ended.
@@ -1175,6 +1217,7 @@ export function createTtsPlayer(opts) {
         profile,
       );
       if (!segments.length) {
+        finish("finished"); // nothing to say: done, not cancelled
         stop();
         return;
       }
@@ -1249,6 +1292,11 @@ export function createTtsPlayer(opts) {
               ),
             );
         });
+        // Like a streaming run: the token test comes before heard, so an
+        // "ended" that lands after a stop is not an acknowledgement of a clip
+        // this run played.
+        if (token !== seq) return;
+        heard.push(segments[i].text);
         URL.revokeObjectURL(url);
         audioEl = null;
         if (segments[i].pauseMs) {
@@ -1258,6 +1306,10 @@ export function createTtsPlayer(opts) {
         }
         if (token === seq && stopIfAuthChanged()) return;
       }
+      // The reply ran out and its last clip ended: settle BEFORE stop(), whose
+      // teardown is also every cancelled path's exit and would otherwise
+      // report this completed run as cancelled.
+      finish("finished");
       stop();
     } catch (err) {
       if (token !== seq) return; // aborted by a stop or a newer run
@@ -1292,6 +1344,18 @@ export function createTtsPlayer(opts) {
     // clips it had queued but not yet spoken.
     if (streamRun) streamRun.cancel();
     const run = { heard: [] };
+    // The hands-free loop waits on this: one settlement per run, first value
+    // wins, so a teardown that follows a natural finish cannot relabel it.
+    let settled = false;
+    let settleDone;
+    run.done = new Promise((resolve) => {
+      settleDone = resolve;
+    });
+    const finish = (reason) => {
+      if (settled) return;
+      settled = true;
+      settleDone({ reason, heard: run.heard.slice() });
+    };
     let inbox = ""; // deltas held until the config probe resolves
     let feeder = null;
     let queue = [];
@@ -1322,6 +1386,9 @@ export function createTtsPlayer(opts) {
       inbox = "";
       if (feeder) feeder.cancel();
       wakeLoop();
+      // Every cancelled exit funnels through here (stop(), cancel(), a
+      // superseding run); a run that already settled keeps its value.
+      finish("cancelled");
     };
     // Queueing a clip also starts the run, so a streaming run enters
     // _activeTtsRuns at the same moment a clicked play() does — not when the
@@ -1439,6 +1506,10 @@ export function createTtsPlayer(opts) {
           URL.revokeObjectURL(url);
           audioEl = null;
         }
+        // The reply's text ended and its last queued clip's audio ended: this
+        // is a completed run, settled BEFORE stop(), whose teardown is also
+        // every cancelled path's exit.
+        finish("finished");
         stop();
       } catch (err) {
         if (token !== seq) return; // aborted by a stop or a newer run
@@ -1485,6 +1556,11 @@ export function createTtsPlayer(opts) {
       if (cancelled || ended) return;
       ended = true;
       if (ready && enabled && feeder) feeder.end();
+      // No audio will ever play — the setting is off, or the text shaped to
+      // nothing — so the run is over the moment its text is, and the voice
+      // loop must not wait for an "ended" that cannot come.  A started run is
+      // settled by playLoop once its queue drains.
+      if (ready && !started) finish("finished");
     };
     run.cancel = () => {
       if (streamRun === run) stop(); // clears the player and drops the queue
@@ -1509,6 +1585,7 @@ export function createTtsPlayer(opts) {
       ready = true;
       if (!enabled) {
         inbox = ""; // streaming is off: nothing was fetched and nothing plays
+        if (ended) finish("finished");
         return;
       }
       feeder = createStreamFeeder({
@@ -1523,6 +1600,13 @@ export function createTtsPlayer(opts) {
       inbox = "";
       if (text) feeder.push(text);
       if (ended) feeder.end();
+      // end() landed while the probe was still out; if it shaped to no clip at
+      // all, nothing above started a loop to settle this run.
+      if (ended && !started) finish("finished");
+    }).catch(() => {
+      // A run that cannot even start (a throwing base() or Audio constructor)
+      // is a cancelled run: settle it rather than leave the voice loop waiting.
+      run.cancel();
     });
     return run;
   }
