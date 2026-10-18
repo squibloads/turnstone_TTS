@@ -12,16 +12,19 @@ from typing import TYPE_CHECKING, Any
 
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
-from starlette.responses import FileResponse, PlainTextResponse, Response
+from starlette.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from starlette.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+
     from starlette.middleware import Middleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse
-    from starlette.types import Scope
+    from starlette.types import Receive, Scope, Send
 
     from turnstone.core.storage import WorkstreamLeaseHeldError, WorkstreamLeaseLostError
+    from turnstone.core.voice_config import DictionaryEntry
 
 
 def latin1_safe_filename(name: str, *, fallback: str = "attachment") -> str:
@@ -434,6 +437,548 @@ def auth_user_id(request: Request) -> str:
     """
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     return str(getattr(auth, "user_id", "") or "")
+
+
+def tts_text_cap(config_store: Any) -> int:
+    """The ``audio.tts_max_chars`` setting, or its default when unset or unusable.
+
+    Read per request so a change in the Settings tab applies without a restart;
+    a bad stored value must not refuse every request or lift the cap entirely.
+    """
+    from turnstone.core.settings_registry import DEFAULT_TTS_MAX_CHARS
+
+    if config_store is None:
+        return DEFAULT_TTS_MAX_CHARS
+    try:
+        cap = int(config_store.get("audio.tts_max_chars"))
+    except (TypeError, ValueError):
+        return DEFAULT_TTS_MAX_CHARS
+    return cap if cap > 0 else DEFAULT_TTS_MAX_CHARS
+
+
+def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
+    """Bind one audio HTTP request to its authenticated model principal.
+
+    Shared by node and console so a per-user OBO token is minted for the
+    *requesting* user on either process, never for a workstream owner.
+    """
+    from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
+    from turnstone.core.model_oauth import get_model_token_client
+
+    principal_id = auth_user_id(request).strip()
+    config_store = getattr(request.app.state, "config_store", None)
+    mint_client = get_model_token_client(request.app.state)
+
+    def _resolve(alias: str, config: Any) -> str | None:
+        return resolve_model_backend_auth_token(
+            alias,
+            config,
+            principal_id=principal_id,
+            config_store=config_store,
+            mint_client=mint_client,
+        )
+
+    return _resolve
+
+
+def tts_style_instruction(
+    *, config_store: Any, registry: Any | None, alias: str, style_name: str
+) -> str:
+    """The ``instructions`` text for one read-aloud request ("" = send none).
+
+    ``style_name`` is the caller's selection — the request's ``style``, or
+    ``audio.tts_style`` when the request omitted one.  An empty or unknown
+    name, a style with no instruction, and a model whose definition lacks
+    ``supports_speech_instructions`` all resolve to no instruction: a stored
+    default can outlive the style it names, and speech must never fail over a
+    preference.
+    """
+    from turnstone.core.audio import model_supports_speech_instructions
+    from turnstone.core.voice_config import parse_styles, resolve_style
+
+    if config_store is None or registry is None or not alias:
+        return ""
+    style = resolve_style(parse_styles(config_store.get("audio.tts_styles") or ""), style_name)
+    if style is None or not style.instruction:
+        return ""
+    if not model_supports_speech_instructions(registry.get_config(alias)):
+        return ""
+    return style.instruction
+
+
+def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, Any]:
+    """The body of ``GET /v1/api/tts/styles``: the style picker's choices, the
+    admin playback rate every read-aloud plays at, and the active model's
+    pacing profile.
+
+    Instruction text never leaves the server; the browser only needs names and
+    ``in_menu``.  ``instructions_supported`` is the exact gate the POST path
+    applies, so the picker can hide itself rather than offer choices the
+    configured model would ignore.  An unconfigured TTS role reads as
+    unsupported.
+    """
+    from turnstone.core.audio import model_supports_speech_instructions, resolve_role_alias
+    from turnstone.core.voice_config import parse_styles
+
+    styles = parse_styles(config_store.get("audio.tts_styles") or "") if config_store else []
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
+    supported = bool(
+        alias
+        and registry is not None
+        and model_supports_speech_instructions(registry.get_config(alias))
+    )
+    return {
+        "styles": [{"name": s.name, "in_menu": s.in_menu} for s in styles],
+        "default": str(config_store.get("audio.tts_style") or "") if config_store else "",
+        "instructions_supported": supported,
+        "playback_rate": _tts_playback_rate(config_store),
+        "profile": _tts_profile(config_store, alias),
+    }
+
+
+def _tts_profile(config_store: Any, alias: str | None) -> dict[str, Any]:
+    """The pacing profile for *alias*, every field present.
+
+    Rides the styles probe for the same reason the playback rate does: the
+    player already fetches it per transport base, and the profile decides how
+    a reply is cut into clips.  No resolved role, no settings, or an alias
+    with no profile reads as ``DEFAULT_PROFILE`` — today's player behaviour —
+    and a bad stored value degrades per field through the tolerant parser
+    rather than breaking read-aloud.
+    """
+    from turnstone.core.voice_config import parse_profiles, profile_json, resolve_profile
+
+    raw = config_store.get("audio.tts_profiles") if config_store is not None else None
+    profiles = parse_profiles(raw if isinstance(raw, str) else "")
+    return profile_json(resolve_profile(profiles, alias or ""))
+
+
+def _tts_playback_rate(config_store: Any) -> float:
+    """``audio.tts_playback_rate`` for the player; anything unusable reads as 1.0.
+
+    It rides the styles probe because that is the one read-aloud config fetch
+    the player already makes per transport base.
+    """
+    raw = config_store.get("audio.tts_playback_rate") if config_store is not None else None
+    try:
+        rate = float(raw) if raw is not None else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+    return rate if 0.5 <= rate <= 2.0 else 1.0
+
+
+async def text_to_speech_response(request: Request, *, registry: Any | None) -> Response:
+    """Serve ``POST /v1/api/tts`` against *registry*.
+
+    The node and the console hold their model registries under different
+    ``app.state`` names (``registry`` / ``coord_registry``), so the caller
+    passes it in; everything else — validation, role resolution, error masking
+    — is one contract so coordinator read-aloud behaves exactly like a node's.
+    """
+    import asyncio
+
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.audio import (
+        AudioBackendError,
+        AudioUnavailableError,
+        resolve_role_alias,
+        synthesize,
+    )
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.log import get_logger
+    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+    from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
+    from turnstone.core.voice_config import cleanup_options, parse_dictionary
+
+    log = get_logger(__name__)
+    body = await read_json_or_400(request)
+    if isinstance(body, _JSONResponse):
+        return body
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return _JSONResponse({"error": "text is required"}, status_code=400)
+    config_store = getattr(request.app.state, "config_store", None)
+    cap = tts_text_cap(config_store)
+    if len(text) > cap:
+        return _JSONResponse({"error": f"text too long (cap {cap} chars)"}, status_code=400)
+
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
+    if not alias:
+        return _JSONResponse(
+            {
+                "error": (
+                    "Text-to-speech is not configured. Assign a TTS model role in Models → Roles."
+                )
+            },
+            status_code=503,
+        )
+
+    voice = str(body.get("voice") or "").strip()
+    if not voice and config_store is not None:
+        voice = (config_store.get("audio.tts_voice") or "").strip()
+
+    # An absent/null ``style`` takes the configured default; an explicit name
+    # (including "") is resolved as given.  Unknown names are never an error.
+    style = body.get("style")
+    if style is None and config_store is not None:
+        style = config_store.get("audio.tts_style")
+    instructions = tts_style_instruction(
+        config_store=config_store,
+        registry=registry,
+        alias=alias,
+        style_name=str(style or ""),
+    )
+
+    # On by default (the registry default applies); a missing config store
+    # means defaults, not "off".
+    if config_store is None or config_store.get("audio.tts_normalize"):
+        pronunciations = ""
+        dictionary = ""
+        options = None
+        if config_store is not None:
+            pronunciations = config_store.get("audio.tts_pronunciations") or ""
+            dictionary = config_store.get("audio.voice_dictionary") or ""
+            options = cleanup_options(config_store.get)
+        # Every rule is linear and the length cap bounds the work; a thread would
+        # not help (the regex holds the GIL).  All three parsers are tolerant, so
+        # a bad stored value never breaks read-aloud.
+        text = normalize_for_speech(
+            text,
+            parse_pronunciations(pronunciations),
+            parse_dictionary(dictionary),
+            options,
+        )
+
+    abort_ref = StreamAbortRef()
+    backend_auth_resolver = audio_backend_auth_resolver(request)
+    try:
+        # Blocking SDK round-trip — offload off the event loop.
+        speech = await asyncio.to_thread(
+            synthesize,
+            registry=registry,
+            alias=alias,
+            text=text,
+            voice=voice,
+            instructions=instructions,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=abort_ref,
+        )
+    except BackendAuthUnavailableError:
+        log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
+        return _JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
+    except AudioUnavailableError as exc:
+        return _JSONResponse({"error": str(exc)}, status_code=503)
+    except AudioBackendError as exc:
+        # Static body to the caller; backend SDK detail stays in the log.
+        log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
+        return _JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
+    finally:
+        abort_ref.abort()
+
+    return Response(
+        speech.audio_bytes,
+        media_type=speech.media_type,
+        headers={"X-Model-Alias": speech.model_alias},
+    )
+
+
+STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation clips
+
+_STT_NOT_CONFIGURED = (
+    "Speech-to-text is not configured. Assign an STT model role in Models → Roles."
+)
+
+
+def stt_dictionary(config_store: Any) -> list[DictionaryEntry]:
+    """The voice dictionary dictation uses, parsed tolerantly.
+
+    ``[]`` when no config store is present or the stored value is unusable: a
+    dictionary that predates a rule change must never break dictation.
+    """
+    if config_store is None:
+        return []
+    from turnstone.core.voice_config import parse_dictionary
+
+    return parse_dictionary(config_store.get("audio.voice_dictionary") or "")
+
+
+def stt_prompt(config_store: Any, dictionary: Sequence[DictionaryEntry]) -> str:
+    """The transcription prompt: ``audio.stt_prompt``, plus dictionary terms.
+
+    The terms are appended only when ``audio.stt_dictionary_hint`` is on.  A
+    missing config store keeps the old behaviour (no prompt); with a store, the
+    registry defaults apply, so both voice settings default on.
+    """
+    if config_store is None:
+        return ""
+    prompt = (config_store.get("audio.stt_prompt") or "").strip()
+    if dictionary and config_store.get("audio.stt_dictionary_hint"):
+        from turnstone.core.dictation_text import dictionary_prompt
+
+        prompt = dictionary_prompt(prompt, dictionary)
+    return prompt
+
+
+def correct_stt_transcript(
+    config_store: Any, dictionary: Sequence[DictionaryEntry], text: str
+) -> str:
+    """Apply the dictionary's ``also_hears`` replacements when enabled."""
+    if config_store is None or not dictionary:
+        return text
+    if not config_store.get("audio.stt_dictionary_correct"):
+        return text
+    from turnstone.core.dictation_text import correct_transcript
+
+    return correct_transcript(text, dictionary)
+
+
+class AbortOnExitStreamingResponse(StreamingResponse):
+    """Abort an upstream audio stream even before body iteration begins.
+
+    ``StreamingResponse.__call__`` can be cancelled (client gone) before the body
+    generator ever starts, in which case the generator's own ``finally`` never
+    runs and the backend connection would stay pinned.
+    """
+
+    def __init__(self, *args: Any, abort_ref: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._abort_ref = abort_ref
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._abort_ref.abort()
+
+
+async def speech_to_text_response(
+    request: Request,
+    *,
+    registry: Any | None,
+    authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
+) -> JSONResponse:
+    """Serve ``POST /v1/api/workstreams/{ws_id}/speech-to-text`` against *registry*.
+
+    Multipart body with a single ``audio`` field; returns the transcript for the
+    browser to place into the composer and never sends on the user's behalf.
+    A node and the console hold their registries under different ``app.state``
+    names and authorise ``ws_id`` differently (interactive vs coordinator), so
+    both are injected; ``authorize`` returns an error response or ``None``.
+    Everything else is one contract so the coordinator mic behaves like a node's.
+    """
+    import asyncio
+
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.audio import (
+        AudioBackendError,
+        AudioUnavailableError,
+        resolve_role_alias,
+        transcribe,
+    )
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.log import get_logger
+    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+
+    log = get_logger(__name__)
+    ws_id = request.path_params.get("ws_id", "")
+    if not ws_id:
+        return _JSONResponse({"error": "ws_id is required"}, status_code=400)
+    err = await authorize(request, ws_id)
+    if err is not None:
+        return err
+
+    config_store = getattr(request.app.state, "config_store", None)
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="stt")
+    if not alias:
+        return _JSONResponse({"error": _STT_NOT_CONFIGURED}, status_code=503)
+
+    got = await read_multipart_file_or_400(request, field="audio", max_bytes=STT_UPLOAD_CAP)
+    if isinstance(got, _JSONResponse):
+        return got
+    filename, _claimed_mime, data = got
+    if not data:
+        return _JSONResponse({"error": "Empty audio upload"}, status_code=400)
+
+    dictionary = stt_dictionary(config_store)
+    prompt = stt_prompt(config_store, dictionary)
+    abort_ref = StreamAbortRef()
+    backend_auth_resolver = audio_backend_auth_resolver(request)
+    try:
+        # Blocking SDK round-trip — offload so the shared event loop (and SSE
+        # streaming) stays responsive.
+        result = await asyncio.to_thread(
+            transcribe,
+            registry=registry,
+            alias=alias,
+            data=data,
+            filename=filename or "speech.webm",
+            prompt=prompt,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=abort_ref,
+        )
+    except BackendAuthUnavailableError:
+        log.warning("speech_to_text.backend_auth_unavailable", exc_info=True)
+        return _JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
+    except AudioUnavailableError as exc:
+        return _JSONResponse({"error": str(exc)}, status_code=503)
+    except AudioBackendError as exc:
+        # str(exc) wraps the backend SDK error, which can carry upstream
+        # response detail — log it, but return a static body to the caller.
+        log.warning("speech_to_text.backend_failed", error=str(exc), exc_info=True)
+        return _JSONResponse({"error": "Speech transcription backend failed"}, status_code=502)
+    finally:
+        abort_ref.abort()
+
+    if not result.transcript:
+        # Successful call that detected no speech (silence / non-speech audio)
+        # is not a backend failure — surface it as 422 so the UI can say so
+        # rather than treating a healthy backend as a bad gateway.
+        return _JSONResponse({"error": "No speech detected"}, status_code=422)
+
+    transcript = correct_stt_transcript(config_store, dictionary, result.transcript)
+    return _JSONResponse(
+        {
+            "status": "ok",
+            "transcript": transcript,
+            "model_alias": result.model_alias,
+        }
+    )
+
+
+async def speech_to_text_stream_response(
+    request: Request,
+    *,
+    registry: Any | None,
+    authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
+) -> Response:
+    """Serve ``POST .../speech-to-text/stream``: the transcript as plain-text deltas.
+
+    Lower perceived latency than the JSON route.  Resolve/transcode failures
+    surface as 503 / 502 before any bytes are sent; once streaming begins the
+    body is best-effort (a mid-stream backend error just ends the partial
+    stream).  Dictionary terms are hinted in the prompt like the JSON route,
+    but transcript correction is JSON-route only — this route has no final
+    event, only raw deltas.  *registry* / *authorize* as in
+    :func:`speech_to_text_response`.
+    """
+    import asyncio
+    import threading
+
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.audio import (
+        AudioBackendError,
+        AudioUnavailableError,
+        resolve_role_alias,
+        transcribe_stream,
+    )
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.log import get_logger
+    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+
+    log = get_logger(__name__)
+    ws_id = request.path_params.get("ws_id", "")
+    if not ws_id:
+        return _JSONResponse({"error": "ws_id is required"}, status_code=400)
+    err = await authorize(request, ws_id)
+    if err is not None:
+        return err
+
+    config_store = getattr(request.app.state, "config_store", None)
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="stt")
+    if not alias:
+        return _JSONResponse({"error": _STT_NOT_CONFIGURED}, status_code=503)
+
+    got = await read_multipart_file_or_400(request, field="audio", max_bytes=STT_UPLOAD_CAP)
+    if isinstance(got, _JSONResponse):
+        return got
+    _filename, _claimed_mime, data = got
+    if not data:
+        return _JSONResponse({"error": "Empty audio upload"}, status_code=400)
+
+    # The dictionary hint applies here exactly as on the JSON route.  The
+    # correction does not: this route emits raw content deltas and the browser
+    # appends each one straight into the composer, so there is no final or
+    # complete transcript event to rewrite (and a phrase may span two deltas,
+    # which no per-delta rewrite could match).  Raw deltas are left alone.
+    dictionary = stt_dictionary(config_store)
+    prompt = stt_prompt(config_store, dictionary)
+    abort_ref = StreamAbortRef()
+    backend_auth_resolver = audio_backend_auth_resolver(request)
+
+    # Resolve + transcode + open the stream eagerly (off the event loop) so the
+    # common failures map to a clean status before any bytes are sent.
+    try:
+        deltas = await asyncio.to_thread(
+            transcribe_stream,
+            registry=registry,
+            alias=alias,
+            data=data,
+            prompt=prompt,
+            config_store=config_store,
+            backend_auth_resolver=backend_auth_resolver,
+            cancel_ref=abort_ref,
+        )
+    except BackendAuthUnavailableError:
+        abort_ref.abort()
+        log.warning("speech_to_text_stream.backend_auth_unavailable", exc_info=True)
+        return _JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
+    except AudioUnavailableError as exc:
+        abort_ref.abort()
+        return _JSONResponse({"error": str(exc)}, status_code=503)
+    except AudioBackendError:
+        abort_ref.abort()
+        log.warning("speech_to_text_stream.backend_failed", exc_info=True)
+        return _JSONResponse({"error": "Speech transcription backend failed"}, status_code=502)
+    except BaseException:
+        abort_ref.abort()
+        raise
+
+    # Drive the blocking stream from one worker thread that owns (and closes)
+    # the upstream connection, handing deltas to the loop via a queue.  A client
+    # disconnect sets ``stop`` so the thread releases the connection promptly
+    # instead of being pinned mid-``next()`` (which can't be cancelled).
+    async def _body() -> AsyncGenerator[bytes]:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        stop = threading.Event()
+
+        def _pump() -> None:
+            try:
+                for delta in deltas:
+                    if stop.is_set():
+                        break
+                    loop.call_soon_threadsafe(queue.put_nowait, delta.encode("utf-8"))
+            except Exception:
+                # Mid-stream backend failure: end the partial stream (logged).
+                if not abort_ref.aborted:
+                    log.warning("speech_to_text_stream.mid_stream_failed", exc_info=True)
+            finally:
+                close = getattr(deltas, "close", None)
+                if callable(close):
+                    close()
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        loop.run_in_executor(None, _pump)
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            stop.set()
+            abort_ref.abort()
+
+    return AbortOnExitStreamingResponse(
+        _body(),
+        media_type="text/plain; charset=utf-8",
+        abort_ref=abort_ref,
+    )
 
 
 def audit_context(request: Request) -> tuple[str, str]:

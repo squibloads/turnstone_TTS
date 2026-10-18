@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.9.0a2",
+    "version": "1.9.0a3",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -1651,6 +1651,27 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/tts/styles": {
+      "get": {
+        "summary": "List the speaking styles the read-aloud UI may offer.  Names and in_menu flags only; instruction text stays server-side.  instructions_supported is false when no TTS role is configured or the configured model does not accept instructions.",
+        "operationId": "v1_api_tts_styles_get",
+        "tags": [
+          "Chat"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TextToSpeechStylesResponse"
                 }
               }
             }
@@ -4703,6 +4724,19 @@
             "description": "Optional voice override (else audio.tts_voice setting)",
             "title": "Voice",
             "type": "string"
+          },
+          "style": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional speaking-style name from audio.tts_styles.  Null or absent uses the audio.tts_style default; an unknown name (or \"\") sends no instruction, never an error.  Only applied when the configured TTS model accepts instructions.",
+            "title": "Style"
           }
         },
         "required": [
@@ -5390,6 +5424,152 @@
           "deleted"
         ],
         "title": "WorkstreamDeleteResponse",
+        "type": "object"
+      },
+      "TextToSpeechStylesResponse": {
+        "description": "The style choices a read-aloud client may offer for the TTS role.",
+        "properties": {
+          "styles": {
+            "description": "Every configured style, in stored order; instruction text stays server-side",
+            "items": {
+              "$ref": "#/components/schemas/TextToSpeechStyleInfo"
+            },
+            "title": "Styles",
+            "type": "array"
+          },
+          "default": {
+            "type": "string",
+            "description": "Default style name from audio.tts_style (empty = no instruction)",
+            "title": "Default"
+          },
+          "instructions_supported": {
+            "description": "Whether the configured TTS model accepts instructions; false when no TTS role is configured",
+            "title": "Instructions Supported",
+            "type": "boolean"
+          },
+          "playback_rate": {
+            "default": 1.0,
+            "description": "Read-aloud playback speed from audio.tts_playback_rate (0.5-2.0)",
+            "title": "Playback Rate",
+            "type": "number"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/TextToSpeechProfile",
+            "description": "Pacing, structure and clip settings for the alias the TTS role resolves to; audio.tts_profiles with the defaults filled in"
+          }
+        },
+        "required": [
+          "styles",
+          "default",
+          "instructions_supported"
+        ],
+        "title": "TextToSpeechStylesResponse",
+        "type": "object"
+      },
+      "TextToSpeechProfile": {
+        "description": "Pacing, structure and clip settings for the active TTS model.\n\nEvery field is present: a model with no stored profile reads as the\ndefaults, so the player never has to merge a partial object.",
+        "properties": {
+          "pause_heading_ms": {
+            "default": 600,
+            "description": "Silence after a heading before the next clip (ms)",
+            "title": "Pause Heading Ms",
+            "type": "integer"
+          },
+          "pause_paragraph_ms": {
+            "default": 500,
+            "description": "Silence after a paragraph or blockquote (ms)",
+            "title": "Pause Paragraph Ms",
+            "type": "integer"
+          },
+          "pause_table_row_ms": {
+            "default": 150,
+            "description": "Silence between table rows (ms)",
+            "title": "Pause Table Row Ms",
+            "type": "integer"
+          },
+          "pause_code_ms": {
+            "default": 400,
+            "description": "Silence after a code or diagram marker (ms)",
+            "title": "Pause Code Ms",
+            "type": "integer"
+          },
+          "pause_list_item_ms": {
+            "default": 0,
+            "description": "Silence between list items (ms); 0 reads a whole list as one clip",
+            "title": "Pause List Item Ms",
+            "type": "integer"
+          },
+          "table_cell_joiner": {
+            "default": "comma",
+            "description": "What goes between the cells of a table row: comma | semicolon | pause",
+            "title": "Table Cell Joiner",
+            "type": "string"
+          },
+          "table_header_mode": {
+            "default": "row",
+            "description": "How a table header row is read: row | prefix | skip",
+            "title": "Table Header Mode",
+            "type": "string"
+          },
+          "inline_code_max_chars": {
+            "default": 40,
+            "description": "Inline code up to this length is spoken; longer becomes the code marker",
+            "title": "Inline Code Max Chars",
+            "type": "integer"
+          },
+          "code_marker": {
+            "default": "Code omitted.",
+            "description": "Said in place of a code block (empty = skip silently)",
+            "title": "Code Marker",
+            "type": "string"
+          },
+          "diagram_marker": {
+            "default": "Diagram omitted.",
+            "description": "Said in place of a diagram (empty = skip silently)",
+            "title": "Diagram Marker",
+            "type": "string"
+          },
+          "clip_min_chars": {
+            "default": 20,
+            "description": "A shorter line folds into the next clip (headings, labels)",
+            "title": "Clip Min Chars",
+            "type": "integer"
+          },
+          "clip_max_chars": {
+            "default": 600,
+            "description": "Longest clip; longer text splits at a comma or space",
+            "title": "Clip Max Chars",
+            "type": "integer"
+          },
+          "max_clips": {
+            "default": 200,
+            "description": "Clips read per reply before it stops with a notice",
+            "title": "Max Clips",
+            "type": "integer"
+          }
+        },
+        "title": "TextToSpeechProfile",
+        "type": "object"
+      },
+      "TextToSpeechStyleInfo": {
+        "description": "One configured speaking style, as offered to the read-aloud UI.",
+        "properties": {
+          "name": {
+            "description": "Style name (the value to send as `style`)",
+            "title": "Name",
+            "type": "string"
+          },
+          "in_menu": {
+            "description": "Whether the picker should offer this style",
+            "title": "In Menu",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "in_menu"
+        ],
+        "title": "TextToSpeechStyleInfo",
         "type": "object"
       },
       "AuthWhoamiResponse": {

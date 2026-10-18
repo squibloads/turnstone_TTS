@@ -670,6 +670,12 @@ class ModelCapabilities:
     # endpoints and the Models -> Roles capability gate (turnstone/core/audio.py).
     supports_transcription: bool = False
     supports_speech_synthesis: bool = False
+    # The speech endpoint accepts a natural-language ``instructions`` field
+    # (OpenAI ``gpt-4o-mini-tts``, vLLM-Omni speech servers).  Read the same
+    # way as the other role flags: explicit in the definition's capabilities
+    # JSON, no name inference — a backend that never heard of the field must
+    # keep receiving byte-identical requests when no style is selected.
+    supports_speech_instructions: bool = False
     # Server-side tool types to auto-inject into Responses-API ``tools[]``
     # for this model (e.g. ``("web_search",)`` for OpenAI search models,
     # ``("web_search", "x_search")`` for Grok variants).  The

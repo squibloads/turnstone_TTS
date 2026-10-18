@@ -121,6 +121,9 @@ from turnstone.api.console_schemas import (
     UsageResponse,
     UserRoleInfo,
     VerdictInfo,
+    VoiceAdminMetaResponse,
+    VoicePreviewRequest,
+    VoicePreviewResponse,
 )
 from turnstone.api.openapi import EndpointSpec, QueryParam, build_openapi
 from turnstone.api.schemas import (
@@ -165,6 +168,9 @@ from turnstone.api.server_schemas import (
     SendRequest,
     SendResponse,
     SkillSummary,
+    SpeechToTextResponse,
+    TextToSpeechRequest,
+    TextToSpeechStylesResponse,
     UploadAttachmentResponse,
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
@@ -684,6 +690,48 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         response_model=ListAvailableModelsResponse,
         tags=["Models"],
     ),
+    EndpointSpec(
+        "/v1/api/tts",
+        "POST",
+        "Synthesize text to speech audio for browser playback (coordinator "
+        "read-aloud) using the configured TTS model role.  Returns audio bytes; "
+        "503 when no TTS role is configured.",
+        request_model=TextToSpeechRequest,
+        error_codes=[400, 502, 503],
+        tags=["Models"],
+    ),
+    EndpointSpec(
+        "/v1/api/tts/styles",
+        "GET",
+        "List the speaking styles the coordinator read-aloud UI may offer.  "
+        "Names and in_menu flags only; instruction text stays server-side.  "
+        "instructions_supported is false when no TTS role is configured or "
+        "the configured model does not accept instructions.",
+        response_model=TextToSpeechStylesResponse,
+        tags=["Models"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/speech-to-text",
+        "POST",
+        "Transcribe a short audio clip for a coordinator composer "
+        "(multipart/form-data, field 'audio') using the configured STT model "
+        "role.  Returns the transcript for the client to place into the "
+        "composer; this endpoint never sends on the user's behalf.  Returns "
+        "503 when no STT role is configured or the coordinator subsystem is down.",
+        response_model=SpeechToTextResponse,
+        error_codes=[400, 403, 404, 413, 422, 502, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/speech-to-text/stream",
+        "POST",
+        "Stream the transcript of a short audio clip as plain-text deltas "
+        "(multipart/form-data, field 'audio') for lower perceived latency than "
+        "the JSON route.  Setup failures surface as 502/503 before any bytes "
+        "are sent.",
+        error_codes=[400, 403, 404, 413, 502, 503],
+        tags=["Coordinator"],
+    ),
     # --- Skills ---
     EndpointSpec(
         "/v1/api/skills",
@@ -905,6 +953,30 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             QueryParam("node_id", "Node ID for node-scoped settings"),
         ],
         error_codes=[400, 404],
+        tags=["Admin"],
+    ),
+    # --- Admin: Voice tuning ---
+    EndpointSpec(
+        "/v1/api/admin/voice/meta",
+        "GET",
+        "Read-aloud tuning metadata for Admin › Voice: cleanup groups (each with "
+        "its example run through that group alone), built-in terms, the "
+        "audio.tts_profiles field table, the TTS-eligible model aliases and the "
+        "editor limits.",
+        response_model=VoiceAdminMetaResponse,
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/voice/preview",
+        "POST",
+        "Preview read-aloud text cleanup.  Returns exactly what the TTS model "
+        "would receive plus the changed spans, running with draft rules when "
+        "given.  only_rules skips every other cleanup source for the rule "
+        "editor's test line.  A draft rule that does not validate returns 400 "
+        "with the editor-ready message.",
+        request_model=VoicePreviewRequest,
+        response_model=VoicePreviewResponse,
+        error_codes=[400],
         tags=["Admin"],
     ),
     # --- Admin: MCP Registry ---
@@ -1898,6 +1970,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CancelResponse,
     CloseWorkstreamRequest,
     CommandRequest,
+    SpeechToTextResponse,
+    TextToSpeechRequest,
     DequeueRequest,
     SendRequest,
     SendResponse,

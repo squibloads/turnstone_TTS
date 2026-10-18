@@ -11,7 +11,21 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from turnstone.core.voice_config import (
+    DEFAULT_STYLES,
+    VOICE_DOCS_URL,
+    validate_builtin_terms_off,
+    validate_dictionary,
+    validate_disabled_groups,
+    validate_profiles,
+    validate_rewrite_rules,
+    validate_styles,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass(frozen=True)
@@ -31,6 +45,10 @@ class SettingDef:
     help: str = ""  # plain-English explanation for non-experts
     reference_url: str = ""  # link to arXiv, docs, or provider reference
     strict_int: bool = False  # reject bool/float/non-canonical strings before int coercion
+    # Write-path check for structured "str" values (JSON lists): returns the
+    # canonical value or raises ValueError.  Skipped on the lenient read path
+    # (``clamp_range``), where the consumer's tolerant parser handles old data.
+    validator: Callable[[str], str] | None = field(default=None, hash=False, compare=False)
 
 
 # Default auto-compaction trigger as a fraction of the context window.  Shared
@@ -49,6 +67,19 @@ DEFAULT_APPROVAL_TIMEOUT_SECONDS = 0
 # each edge), so every cap up to it renders faithfully from retained edges; a
 # larger cap could only be honored for outputs that were held whole.
 TOOL_TRUNCATION_MAX_CHARS = 16 * 1024 * 1024
+
+
+# Speech-synthesis limits.  The node and the console fall back to these when the
+# stored value is unusable, so the registry default and the fallback cannot drift.
+DEFAULT_TTS_MAX_CHARS = 8000
+DEFAULT_TTS_TIMEOUT_SECONDS = 30
+MAX_TTS_TIMEOUT_SECONDS = 600
+# The node synthesizes a request whole and does not stop when the caller gives
+# up, so the text cap is bounded by what a slow backend finishes inside the
+# longest timeout: Kokoro-82M on CPU ran ~107 chars/s, so 50,000 takes ~470 s.
+# The clip is held whole on the way back (the console buffers the node's reply,
+# peaking near twice the clip), so memory per request grows with the cap too.
+MAX_TTS_MAX_CHARS = 50_000
 
 
 def _build_registry() -> dict[str, SettingDef]:
@@ -614,7 +645,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "audio-capable backend (e.g. an OpenAI gpt-4o-transcribe alias, or a local vLLM "
             "whisper endpoint). Empty disables the microphone affordance — there is no "
             "audio-capable session fallback, so this must name a transcription model. The "
-            "curated, capability-gated picker lives in Models -> Roles.",
+            "curated, capability-gated picker lives in Models -> Roles. Change it to enable "
+            "dictation or to move transcription to a different backend.",
+            reference_url=VOICE_DOCS_URL + "#speech-to-text-model-role",
         ),
         SettingDef(
             "audio.stt_prompt",
@@ -625,7 +658,10 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Optional text passed to the speech-to-text backend to bias the transcription "
             "— useful for domain vocabulary, names, or acronyms, and required by some models "
             "(e.g. Gemma-style ASR) that take an instruction prompt. Sent as the OpenAI "
-            "transcription `prompt` parameter; leave empty to omit it.",
+            "transcription `prompt` parameter; leave empty to omit it. Set it when a few "
+            "domain terms are consistently misheard; use the dictionary hint for a growing "
+            "word list.",
+            reference_url=VOICE_DOCS_URL + "#transcription-prompt",
         ),
         SettingDef(
             "audio.tts_model_alias",
@@ -636,7 +672,9 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Which registered model alias synthesizes assistant speech. Point it at an "
             "audio-capable backend (e.g. an OpenAI gpt-4o-mini-tts alias, or a local "
             "vLLM-Omni speech endpoint). Empty disables the playback affordance. The curated, "
-            "capability-gated picker lives in Models -> Roles.",
+            "capability-gated picker lives in Models -> Roles. Change it to enable read-aloud "
+            "or to move synthesis to a different backend.",
+            reference_url=VOICE_DOCS_URL + "#text-to-speech-model-role",
         ),
         SettingDef(
             "audio.tts_voice",
@@ -646,7 +684,214 @@ def _build_registry() -> dict[str, SettingDef]:
             "audio",
             help="Voice passed to the TTS backend. OpenAI voices include alloy, echo, fable, "
             "onyx, nova, shimmer; local backends (vLLM-Omni, Kokoro) define their own — set "
-            "this to a voice your configured TTS model backend supports.",
+            "this to a voice your configured TTS model backend supports. The default is "
+            "alloy. Change it when the voice is wrong, unavailable, or another one suits the "
+            "team better.",
+            reference_url=VOICE_DOCS_URL + "#voice-identifier",
+        ),
+        SettingDef(
+            "audio.tts_max_chars",
+            "int",
+            DEFAULT_TTS_MAX_CHARS,
+            "Longest text one speech request may synthesize (characters)",
+            "audio",
+            min_value=1,
+            max_value=MAX_TTS_MAX_CHARS,
+            strict_int=True,
+            help="A message longer than this is refused with an error instead of being read "
+            "aloud. Raise it together with audio.tts_timeout_seconds: the whole clip is "
+            "synthesized before playback starts, so longer text needs a longer wait. The "
+            "default is 8000 characters; the maximum is 50000. Raise it only for a model "
+            "fast enough to finish a longer clip within the timeout.",
+            reference_url=VOICE_DOCS_URL + "#longest-speech-request",
+        ),
+        SettingDef(
+            "audio.tts_timeout_seconds",
+            "int",
+            DEFAULT_TTS_TIMEOUT_SECONDS,
+            "How long the console waits for a node to synthesize speech (seconds)",
+            "audio",
+            min_value=1,
+            max_value=MAX_TTS_TIMEOUT_SECONDS,
+            strict_int=True,
+            help="Playback through the console waits for the node to return the complete "
+            "audio clip, which can take far longer than an ordinary request on a slow or "
+            "local speech backend. Every other request the console forwards keeps the "
+            "proxy's shared timeout. The default is 30 seconds (maximum 600). Raise it when "
+            "long clips time out on a slow backend; lower it to fail fast.",
+            reference_url=VOICE_DOCS_URL + "#synthesis-timeout",
+        ),
+        SettingDef(
+            "audio.tts_normalize",
+            "bool",
+            True,
+            "Rewrite symbols, units and versions into speakable words before text-to-speech",
+            "audio",
+            help="Technical replies contain symbols, units and version numbers that speech "
+            "models read badly (~5, 32GB, 1.8.5). When on, a small English rule set rewrites "
+            "them into plain words (about 5, 32 gigabytes, 1 point 8 point 5) before the text "
+            "is sent to the TTS backend. It covers symbols, units, versions, ISO dates and "
+            "year-months, ten-digit phone numbers, file names, seconds versus decades, "
+            "abbreviations (e.g., i.e., etc., vs.) and a few technical terms such as "
+            "PostgreSQL, YAML and JSON. It works the same for every backend; turn it off for "
+            "non-English replies or a model that already handles this itself. It is the "
+            "master switch for the Text cleanup tab: with it off, the rule groups, custom "
+            "rewrite rules, built-in terms, legacy pronunciations and the dictionary are all "
+            "skipped.",
+            reference_url=VOICE_DOCS_URL + "#text-cleanup-master-switch",
+        ),
+        SettingDef(
+            "audio.tts_pronunciations",
+            "str",
+            "",
+            "Custom pronunciations for text-to-speech (one 'word = respelling' per line)",
+            "audio",
+            help="One entry per line as `word = respelling`, for example `SQL = sequel` or "
+            "`nginx = engine ex`. Matching is whole-word and case-insensitive, and applies "
+            "after the built-in rules. Write the respelling as plain words that sound right "
+            "when read aloud: plain respellings work with every TTS model, unlike phoneme or "
+            "SSML syntax. Blank lines and lines starting with # are ignored. At most 200 "
+            "entries are used; keys and respellings may be up to 100 characters. An entry "
+            "overrides a built-in respelling, and a later duplicate line wins. Only used when "
+            "text normalisation is on. Entries in the Dictionary tab apply after these lines, "
+            "so a dictionary entry wins over a line for the same word.",
+            reference_url=VOICE_DOCS_URL + "#legacy-pronunciations",
+        ),
+        SettingDef(
+            "audio.voice_dictionary",
+            "str",
+            "[]",
+            "Voice dictionary: how read-aloud says terms and how dictation writes them",
+            "audio",
+            validator=validate_dictionary,
+            help="A JSON list edited in Admin › Voice › Dictionary. Each entry has a `term`, a "
+            "`kind` (`respelling` or `ipa`), the `respelling` every model can read, an optional "
+            "`ipa` for models that accept IPA, `match_case`, and `also_hears`: phrases a "
+            "transcript may contain that dictation replaces with the term. Read-aloud applies "
+            "it after audio.tts_pronunciations, so an entry here wins. At most 200 entries. "
+            "Edit it when a term is mispronounced in read-aloud or mistranscribed in "
+            "dictation.",
+            reference_url=VOICE_DOCS_URL + "#dictionary",
+        ),
+        SettingDef(
+            "audio.tts_styles",
+            "str",
+            DEFAULT_STYLES,
+            "Speaking styles offered beside the read-aloud button",
+            "audio",
+            validator=validate_styles,
+            help="A JSON list edited in Admin › Voice › Styles. Each style has a `name`, an "
+            "`instruction` sent to TTS models that accept instructions (empty = plain delivery) "
+            "and `in_menu`. Models without instruction support ignore styles. At most 20. "
+            "Edit them when the model accepts instructions and you want a different delivery.",
+            reference_url=VOICE_DOCS_URL + "#styles",
+        ),
+        SettingDef(
+            "audio.tts_style",
+            "str",
+            "",
+            "Default speaking style (a name from audio.tts_styles; empty = no instruction)",
+            "audio",
+            help="The style used when a read-aloud request names none. An unknown name falls "
+            "back to no instruction. Set it when read-aloud requests usually use one "
+            "delivery; leave it empty to let each request choose.",
+            reference_url=VOICE_DOCS_URL + "#default-speaking-style",
+        ),
+        SettingDef(
+            "audio.tts_playback_rate",
+            "float",
+            1.0,
+            "Read-aloud playback speed (0.5-2.0; 1.0 = as the model speaks)",
+            "audio",
+            min_value=0.5,
+            max_value=2.0,
+            help="Applied by the browser to every read-aloud clip, with pitch kept, so it works "
+            "the same for every TTS model. Use it to even out a model that speaks noticeably "
+            "slowly or quickly; it changes playback only, not what the model synthesizes. "
+            "The player reads it when it loads its read-aloud configuration, so a change "
+            "applies after a page reload.",
+            reference_url=VOICE_DOCS_URL + "#playback-speed",
+        ),
+        SettingDef(
+            "audio.stt_dictionary_hint",
+            "bool",
+            True,
+            "Append voice dictionary terms to the transcription prompt",
+            "audio",
+            help="Adds the dictionary's terms after audio.stt_prompt, which biases models that "
+            "read a prompt (Whisper-style) towards spelling them right. Models that ignore the "
+            "prompt are unaffected. Keep it on unless the backend ignores or rejects "
+            "prompts; transcript correction still works with it off.",
+            reference_url=VOICE_DOCS_URL + "#dictionary-hint-for-dictation",
+        ),
+        SettingDef(
+            "audio.stt_dictionary_correct",
+            "bool",
+            True,
+            "Replace dictionary 'also hears' phrases in transcripts with the term",
+            "audio",
+            help="After transcription, each whole-phrase match of an entry's also_hears is "
+            "replaced with its term. Works with every model, since it runs on the transcript. "
+            "Turn it off if an also_hears phrase is ordinary speech you want left alone.",
+            reference_url=VOICE_DOCS_URL + "#transcript-correction",
+        ),
+        SettingDef(
+            "audio.tts_profiles",
+            "str",
+            "{}",
+            "Read-aloud pacing, structure and clip sizes per TTS model",
+            "audio",
+            validator=validate_profiles,
+            help="A JSON object keyed by TTS model alias, edited in Admin › Voice › Settings "
+            "(Pacing, Structure, Clips). Each profile holds only the fields changed from the "
+            "defaults: pauses after headings, paragraphs, table rows, code markers and list "
+            "items; how table cells and headers are read; what replaces code and diagrams; "
+            "and how replies are cut into clips. A model with no profile uses the defaults. "
+            "Switching the TTS model role switches to that model's profile. At most 20 "
+            "profiles are kept.",
+            reference_url=VOICE_DOCS_URL + "#pacing-profiles",
+        ),
+        SettingDef(
+            "audio.tts_rewrite_rules",
+            "str",
+            "[]",
+            "Custom rewrite rules applied to read-aloud text",
+            "audio",
+            validator=validate_rewrite_rules,
+            help="A JSON list edited in Admin › Voice › Text cleanup. Each rule replaces "
+            "`find` with `replace` before the text reaches the TTS model. Plain-text rules "
+            "match whole words and ignore case; rules with `regex` true use Python regular "
+            "expressions (case-sensitive unless they start with (?i); \\1 inserts a group). "
+            "Rules run top to bottom after the built-in cleanup groups and before the "
+            "dictionary. Only used when audio.tts_normalize is on. At most 100. Check a "
+            "rule in the Text cleanup preview before relying on it.",
+            reference_url=VOICE_DOCS_URL + "#custom-rewrite-rules",
+        ),
+        SettingDef(
+            "audio.tts_cleanup_disabled",
+            "str",
+            "[]",
+            "Built-in text cleanup groups that are switched off",
+            "audio",
+            validator=validate_disabled_groups,
+            help="A JSON list of cleanup group ids switched off in Admin › Voice › Text "
+            'cleanup, for example ["versions"] when the TTS model already reads version '
+            "numbers well. Every other group keeps running while audio.tts_normalize is on. "
+            "Use it when a group misfires on your text; the Text cleanup tab lists every id.",
+            reference_url=VOICE_DOCS_URL + "#switching-a-group-off",
+        ),
+        SettingDef(
+            "audio.tts_builtin_terms_off",
+            "str",
+            "[]",
+            "Built-in pronunciations that are switched off",
+            "audio",
+            validator=validate_builtin_terms_off,
+            help="A JSON list of built-in terms (PostgreSQL, systemctl, kubectl, YAML, JSON) "
+            "switched off in Admin › Voice › Dictionary. A dictionary entry for the same "
+            "term overrides a built-in without switching it off. Switch one off when its "
+            "respelling is wrong for your team.",
+            reference_url=VOICE_DOCS_URL + "#built-in-terms",
         ),
         # -- judge ----------------------------------------------------------
         SettingDef(
@@ -1100,6 +1345,12 @@ def validate_value(key: str, raw_value: Any, *, clamp_range: bool = False) -> An
     # Choices validation
     if defn.choices is not None and typed not in defn.choices:
         raise ValueError(f"{key}: {typed!r} not in {defn.choices}")
+
+    if defn.validator is not None and not clamp_range:
+        try:
+            typed = defn.validator(typed)
+        except ValueError as exc:
+            raise ValueError(f"{key}: {exc}") from None
 
     return typed
 

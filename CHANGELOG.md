@@ -120,6 +120,28 @@ frozen.
 
 ### Added
 
+- **Speech-synthesis limits are settings.** `audio.tts_max_chars` (default 8000, the old fixed
+  cap, at most 50,000) is the longest text `POST /v1/api/tts` accepts, and
+  `audio.tts_timeout_seconds` (default 30, at most 600) is how long the console waits for a node's
+  `tts` answer. The node answers only once the whole clip is synthesized, so a long reply on a
+  local backend outlasted the proxy's shared 30-second timeout and showed "Node unreachable". The
+  setting covers only that wait: connecting to the node, and every other request the console
+  forwards, keep the shared timeout. Both are read per request, so a change in the Settings tab
+  applies without a restart. A stored value that is not a number falls back to the default, and
+  one out of range is clamped to the nearest bound.
+
+- **Read-aloud speaks symbols, units and version numbers.** Before text goes to the text-to-speech
+  backend, a small English rule set rewrites things models read badly into plain words: `~5`
+  becomes "about 5", `32GB` "32 gigabytes", `120ms` "120 milliseconds", `3-5` "3 to 5", `1.8.5`
+  "1 point 8 point 5", `->` "to", `60s` "60 seconds" (but `the 80s` stays a decade), `2026-10-16`
+  "October 16th, 2026" and `2026-10` "October 2026", `300W` "300 watts" (attached only), a
+  ten-digit phone number digit by digit, `speech_text.py` "speech_text dot py", and `e.g.` "for
+  example". A few technical terms voices mangle get plain respellings
+  (`PostgreSQL` as "Postgres", `systemctl`, `kubectl`, `YAML`, `JSON`). It uses no model-specific syntax, so it
+  behaves the same on Kokoro, OpenAI and vLLM-Omni backends. The new `audio.tts_normalize` setting
+  (on by default) turns it off, and `audio.tts_pronunciations` takes one `word = respelling` per
+  line for words the rules do not cover; an entry there overrides a built-in respelling.
+
 - **MCP servers on the 2026-07-28 revision (#679).** A connection probes `server/discover` and
   adopts 2026-07-28 when the server offers it; a server that refuses the probe gets the 2025-11-25
   `initialize` handshake, so existing servers connect as before. On 2026-07-28 connections, change
@@ -260,6 +282,19 @@ frozen.
 
 ### Changed
 
+- **Read-aloud speaks a reply one block at a time** — headings, paragraphs and table rows
+  are each read as their own clip with a pause after them (a heading or paragraph under 20 characters joins the clip that follows and takes no pause of its own; a whole list is one clip, see below), instead of
+  running into the next sentence, and a code block is replaced by "Code omitted." (consecutive blocks by one marker). A diagram (a ```mermaid block, rendered or not) says "Diagram omitted." instead of reading its labels aloud, and inline SVG, images, canvas, video and audio are skipped. Inline code of
+  40 or more characters is replaced the same way; shorter inline code is read aloud. A reply is read
+  up to its first 200 clips, with a toast saying the rest was skipped. Playback starts as soon as the first clip is
+  synthesized rather than after the whole reply, using the same `/v1/api/tts` endpoint with one
+  request in flight at a time. A request that fails, or a browser that blocks playback, now shows an
+  error toast and stops.
+- **Read-aloud plays a list as one clip and pauses 150 ms between table rows** — all the items of a list (nested lists and definition lists included) are read as a single clip with no pause between items or after it, and a short lead-in such as "To deploy:" is carried into it; a long list is still cut at item ends. Table rows stay one clip each, now with a 150 ms pause (cells are read comma-joined, empty cells skipped), and short rows are no longer merged into one another. Chosen by listening tests.
+- **Read-aloud keeps playing when the tab is hidden** — it used to stop, because hiding the tab
+  closes the live stream and the stream teardown also stopped the audio. It now stops on Stop,
+  when the conversation is rebuilt from history, and when the pane is closed.
+- **Every finished reply has its own read-aloud button** — the speaker used to appear only on the latest reply and moved on with Retry. It now stays on each reply once it has finished (a reply still streaming gets it when it settles), so an earlier answer can be read, or keep playing, while a newer one arrives.
 - **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
   `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
   (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP

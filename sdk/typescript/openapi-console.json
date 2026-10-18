@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.9.0a2",
+    "version": "1.9.0a3",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -2666,6 +2666,266 @@
         }
       }
     },
+    "/v1/api/tts": {
+      "post": {
+        "summary": "Synthesize text to speech audio for browser playback (coordinator read-aloud) using the configured TTS model role.  Returns audio bytes; 503 when no TTS role is configured.",
+        "operationId": "v1_api_tts_post",
+        "tags": [
+          "Models"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TextToSpeechRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/tts/styles": {
+      "get": {
+        "summary": "List the speaking styles the coordinator read-aloud UI may offer.  Names and in_menu flags only; instruction text stays server-side.  instructions_supported is false when no TTS role is configured or the configured model does not accept instructions.",
+        "operationId": "v1_api_tts_styles_get",
+        "tags": [
+          "Models"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TextToSpeechStylesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/speech-to-text": {
+      "post": {
+        "summary": "Transcribe a short audio clip for a coordinator composer (multipart/form-data, field 'audio') using the configured STT model role.  Returns the transcript for the client to place into the composer; this endpoint never sends on the user's behalf.  Returns 503 when no STT role is configured or the coordinator subsystem is down.",
+        "operationId": "v1_api_workstreams_{ws_id}_speech-to-text_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpeechToTextResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error 422",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/speech-to-text/stream": {
+      "post": {
+        "summary": "Stream the transcript of a short audio clip as plain-text deltas (multipart/form-data, field 'audio') for lower perceived latency than the JSON route.  Setup failures surface as 502/503 before any bytes are sent.",
+        "operationId": "v1_api_workstreams_{ws_id}_speech-to-text_stream_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/skills": {
       "get": {
         "summary": "List available skills (summary)",
@@ -3766,6 +4026,68 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/voice/meta": {
+      "get": {
+        "summary": "Read-aloud tuning metadata for Admin \u203a Voice: cleanup groups (each with its example run through that group alone), built-in terms, the audio.tts_profiles field table, the TTS-eligible model aliases and the editor limits.",
+        "operationId": "v1_api_admin_voice_meta_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VoiceAdminMetaResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/voice/preview": {
+      "post": {
+        "summary": "Preview read-aloud text cleanup.  Returns exactly what the TTS model would receive plus the changed spans, running with draft rules when given.  only_rules skips every other cleanup source for the rule editor's test line.  A draft rule that does not validate returns 400 with the editor-ready message.",
+        "operationId": "v1_api_admin_voice_preview_post",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VoicePreviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VoicePreviewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
             "content": {
               "application/json": {
                 "schema": {
@@ -10132,6 +10454,66 @@
         "title": "CommandRequest",
         "type": "object"
       },
+      "SpeechToTextResponse": {
+        "description": "Transcript returned for the browser to place into the composer.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "description": "Request outcome",
+            "title": "Status",
+            "type": "string"
+          },
+          "transcript": {
+            "description": "Transcribed text",
+            "title": "Transcript",
+            "type": "string"
+          },
+          "model_alias": {
+            "default": "",
+            "description": "STT role alias used",
+            "title": "Model Alias",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transcript"
+        ],
+        "title": "SpeechToTextResponse",
+        "type": "object"
+      },
+      "TextToSpeechRequest": {
+        "properties": {
+          "text": {
+            "description": "Text to synthesize",
+            "title": "Text",
+            "type": "string"
+          },
+          "voice": {
+            "default": "",
+            "description": "Optional voice override (else audio.tts_voice setting)",
+            "title": "Voice",
+            "type": "string"
+          },
+          "style": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional speaking-style name from audio.tts_styles.  Null or absent uses the audio.tts_style default; an unknown name (or \"\") sends no instruction, never an error.  Only applied when the configured TTS model accepts instructions.",
+            "title": "Style"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "TextToSpeechRequest",
+        "type": "object"
+      },
       "DequeueRequest": {
         "description": "Body for ``DELETE /v1/api/workstreams/{ws_id}/send``.\n\nRemoves a previously-queued message from the workstream's pending\nqueue. ``msg_id`` is the id returned in a prior ``send`` response\nwhen the workstream was busy and the message was queued.",
         "properties": {
@@ -14672,6 +15054,18 @@
             "default": "",
             "title": "Judge Default Alias",
             "type": "string"
+          },
+          "stt_default_alias": {
+            "default": "",
+            "description": "Effective speech-to-text role alias (blank = voice input disabled)",
+            "title": "Stt Default Alias",
+            "type": "string"
+          },
+          "tts_default_alias": {
+            "default": "",
+            "description": "Effective text-to-speech role alias (blank = voice output disabled)",
+            "title": "Tts Default Alias",
+            "type": "string"
           }
         },
         "title": "ListAvailableModelsResponse",
@@ -16639,6 +17033,152 @@
         "title": "RoleOverridesRequest",
         "type": "object"
       },
+      "TextToSpeechStylesResponse": {
+        "description": "The style choices a read-aloud client may offer for the TTS role.",
+        "properties": {
+          "styles": {
+            "description": "Every configured style, in stored order; instruction text stays server-side",
+            "items": {
+              "$ref": "#/components/schemas/TextToSpeechStyleInfo"
+            },
+            "title": "Styles",
+            "type": "array"
+          },
+          "default": {
+            "type": "string",
+            "description": "Default style name from audio.tts_style (empty = no instruction)",
+            "title": "Default"
+          },
+          "instructions_supported": {
+            "description": "Whether the configured TTS model accepts instructions; false when no TTS role is configured",
+            "title": "Instructions Supported",
+            "type": "boolean"
+          },
+          "playback_rate": {
+            "default": 1.0,
+            "description": "Read-aloud playback speed from audio.tts_playback_rate (0.5-2.0)",
+            "title": "Playback Rate",
+            "type": "number"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/TextToSpeechProfile",
+            "description": "Pacing, structure and clip settings for the alias the TTS role resolves to; audio.tts_profiles with the defaults filled in"
+          }
+        },
+        "required": [
+          "styles",
+          "default",
+          "instructions_supported"
+        ],
+        "title": "TextToSpeechStylesResponse",
+        "type": "object"
+      },
+      "TextToSpeechProfile": {
+        "description": "Pacing, structure and clip settings for the active TTS model.\n\nEvery field is present: a model with no stored profile reads as the\ndefaults, so the player never has to merge a partial object.",
+        "properties": {
+          "pause_heading_ms": {
+            "default": 600,
+            "description": "Silence after a heading before the next clip (ms)",
+            "title": "Pause Heading Ms",
+            "type": "integer"
+          },
+          "pause_paragraph_ms": {
+            "default": 500,
+            "description": "Silence after a paragraph or blockquote (ms)",
+            "title": "Pause Paragraph Ms",
+            "type": "integer"
+          },
+          "pause_table_row_ms": {
+            "default": 150,
+            "description": "Silence between table rows (ms)",
+            "title": "Pause Table Row Ms",
+            "type": "integer"
+          },
+          "pause_code_ms": {
+            "default": 400,
+            "description": "Silence after a code or diagram marker (ms)",
+            "title": "Pause Code Ms",
+            "type": "integer"
+          },
+          "pause_list_item_ms": {
+            "default": 0,
+            "description": "Silence between list items (ms); 0 reads a whole list as one clip",
+            "title": "Pause List Item Ms",
+            "type": "integer"
+          },
+          "table_cell_joiner": {
+            "default": "comma",
+            "description": "What goes between the cells of a table row: comma | semicolon | pause",
+            "title": "Table Cell Joiner",
+            "type": "string"
+          },
+          "table_header_mode": {
+            "default": "row",
+            "description": "How a table header row is read: row | prefix | skip",
+            "title": "Table Header Mode",
+            "type": "string"
+          },
+          "inline_code_max_chars": {
+            "default": 40,
+            "description": "Inline code up to this length is spoken; longer becomes the code marker",
+            "title": "Inline Code Max Chars",
+            "type": "integer"
+          },
+          "code_marker": {
+            "default": "Code omitted.",
+            "description": "Said in place of a code block (empty = skip silently)",
+            "title": "Code Marker",
+            "type": "string"
+          },
+          "diagram_marker": {
+            "default": "Diagram omitted.",
+            "description": "Said in place of a diagram (empty = skip silently)",
+            "title": "Diagram Marker",
+            "type": "string"
+          },
+          "clip_min_chars": {
+            "default": 20,
+            "description": "A shorter line folds into the next clip (headings, labels)",
+            "title": "Clip Min Chars",
+            "type": "integer"
+          },
+          "clip_max_chars": {
+            "default": 600,
+            "description": "Longest clip; longer text splits at a comma or space",
+            "title": "Clip Max Chars",
+            "type": "integer"
+          },
+          "max_clips": {
+            "default": 200,
+            "description": "Clips read per reply before it stops with a notice",
+            "title": "Max Clips",
+            "type": "integer"
+          }
+        },
+        "title": "TextToSpeechProfile",
+        "type": "object"
+      },
+      "TextToSpeechStyleInfo": {
+        "description": "One configured speaking style, as offered to the read-aloud UI.",
+        "properties": {
+          "name": {
+            "description": "Style name (the value to send as `style`)",
+            "title": "Name",
+            "type": "string"
+          },
+          "in_menu": {
+            "description": "Whether the picker should offer this style",
+            "title": "In Menu",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "in_menu"
+        ],
+        "title": "TextToSpeechStyleInfo",
+        "type": "object"
+      },
       "UpdateMemoryDescriptionRequest": {
         "properties": {
           "description": {
@@ -16695,6 +17235,392 @@
           "envelope_count"
         ],
         "title": "MemoryIndexHealthResponse",
+        "type": "object"
+      },
+      "VoiceAdminMetaResponse": {
+        "description": "Everything Admin \u203a Voice needs besides the stored settings themselves.",
+        "properties": {
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/VoiceCleanupGroupInfo"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "builtin_terms": {
+            "items": {
+              "$ref": "#/components/schemas/VoiceBuiltinTermInfo"
+            },
+            "title": "Builtin Terms",
+            "type": "array"
+          },
+          "profile_fields": {
+            "items": {
+              "$ref": "#/components/schemas/VoiceProfileFieldInfo"
+            },
+            "title": "Profile Fields",
+            "type": "array"
+          },
+          "tts_models": {
+            "items": {
+              "$ref": "#/components/schemas/VoiceTtsModelInfo"
+            },
+            "title": "Tts Models",
+            "type": "array"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/VoiceLimitsInfo"
+          }
+        },
+        "required": [
+          "groups",
+          "builtin_terms",
+          "profile_fields",
+          "tts_models",
+          "limits"
+        ],
+        "title": "VoiceAdminMetaResponse",
+        "type": "object"
+      },
+      "VoiceBuiltinTermInfo": {
+        "properties": {
+          "term": {
+            "title": "Term",
+            "type": "string"
+          },
+          "respelling": {
+            "title": "Respelling",
+            "type": "string"
+          }
+        },
+        "required": [
+          "term",
+          "respelling"
+        ],
+        "title": "VoiceBuiltinTermInfo",
+        "type": "object"
+      },
+      "VoiceCleanupGroupInfo": {
+        "description": "One built-in cleanup group, with its example run through the group alone.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "example": {
+            "default": "",
+            "title": "Example",
+            "type": "string"
+          },
+          "result": {
+            "description": "The example after this group alone has run",
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "result"
+        ],
+        "title": "VoiceCleanupGroupInfo",
+        "type": "object"
+      },
+      "VoiceLimitsInfo": {
+        "description": "The caps a Voice editor enforces, from the voice_config constants.",
+        "properties": {
+          "max_rules": {
+            "title": "Max Rules",
+            "type": "integer"
+          },
+          "max_find_chars": {
+            "title": "Max Find Chars",
+            "type": "integer"
+          },
+          "max_replace_chars": {
+            "title": "Max Replace Chars",
+            "type": "integer"
+          },
+          "max_test_chars": {
+            "title": "Max Test Chars",
+            "type": "integer"
+          },
+          "max_profiles": {
+            "title": "Max Profiles",
+            "type": "integer"
+          },
+          "max_marker_chars": {
+            "title": "Max Marker Chars",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_rules",
+          "max_find_chars",
+          "max_replace_chars",
+          "max_test_chars",
+          "max_profiles",
+          "max_marker_chars"
+        ],
+        "title": "VoiceLimitsInfo",
+        "type": "object"
+      },
+      "VoiceProfileFieldInfo": {
+        "description": "One ``audio.tts_profiles`` field, as the Settings tab's Pacing/Structure/Clips render it.",
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "group": {
+            "description": "pacing | structure | clips",
+            "title": "Group",
+            "type": "string"
+          },
+          "kind": {
+            "description": "int | str | choice",
+            "title": "Kind",
+            "type": "string"
+          },
+          "default": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Default"
+          },
+          "label": {
+            "default": "",
+            "title": "Label",
+            "type": "string"
+          },
+          "help": {
+            "default": "",
+            "title": "Help",
+            "type": "string"
+          },
+          "reference_url": {
+            "description": "docs/voice.md section for this field",
+            "title": "Reference Url",
+            "type": "string"
+          },
+          "min": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Lower bound for an int field",
+            "title": "Min"
+          },
+          "max": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Upper bound for an int field",
+            "title": "Max"
+          },
+          "choices": {
+            "description": "Allowed values for a choice field",
+            "items": {
+              "type": "string"
+            },
+            "title": "Choices",
+            "type": "array"
+          },
+          "unit": {
+            "default": "",
+            "description": "Display unit: ms, chars or clips",
+            "title": "Unit",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "group",
+          "kind",
+          "default",
+          "reference_url"
+        ],
+        "title": "VoiceProfileFieldInfo",
+        "type": "object"
+      },
+      "VoiceTtsModelInfo": {
+        "description": "A model alias eligible for the TTS role.",
+        "properties": {
+          "alias": {
+            "title": "Alias",
+            "type": "string"
+          },
+          "active": {
+            "description": "Whether the TTS role currently resolves to this alias",
+            "title": "Active",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "alias",
+          "active"
+        ],
+        "title": "VoiceTtsModelInfo",
+        "type": "object"
+      },
+      "VoicePreviewRequest": {
+        "properties": {
+          "text": {
+            "description": "Text to preview, at most 5000 characters",
+            "title": "Text",
+            "type": "string"
+          },
+          "rules": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/VoiceRewriteRuleDraft"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Draft rules replacing the stored audio.tts_rewrite_rules for this preview only",
+            "title": "Rules"
+          },
+          "only_rules": {
+            "default": false,
+            "description": "Run only the draft (or stored) rules; skip the cleanup groups, built-in terms, legacy pronunciations and dictionary",
+            "title": "Only Rules",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "VoicePreviewRequest",
+        "type": "object"
+      },
+      "VoiceRewriteRuleDraft": {
+        "description": "One rewrite rule in the stored ``audio.tts_rewrite_rules`` shape.",
+        "properties": {
+          "find": {
+            "title": "Find",
+            "type": "string"
+          },
+          "regex": {
+            "default": false,
+            "title": "Regex",
+            "type": "boolean"
+          },
+          "replace": {
+            "default": "",
+            "title": "Replace",
+            "type": "string"
+          },
+          "test": {
+            "default": "",
+            "title": "Test",
+            "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "find"
+        ],
+        "title": "VoiceRewriteRuleDraft",
+        "type": "object"
+      },
+      "VoicePreviewResponse": {
+        "properties": {
+          "text": {
+            "description": "Exactly what the TTS model would receive",
+            "title": "Text",
+            "type": "string"
+          },
+          "spans": {
+            "items": {
+              "$ref": "#/components/schemas/VoicePreviewSpanInfo"
+            },
+            "title": "Spans",
+            "type": "array"
+          },
+          "changes": {
+            "description": "Number of changed spans",
+            "title": "Changes",
+            "type": "integer"
+          },
+          "normalize_enabled": {
+            "description": "The audio.tts_normalize master switch; the preview runs regardless",
+            "title": "Normalize Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "text",
+          "spans",
+          "changes",
+          "normalize_enabled"
+        ],
+        "title": "VoicePreviewResponse",
+        "type": "object"
+      },
+      "VoicePreviewSpanInfo": {
+        "description": "One changed stretch of the previewed text, in output coordinates.",
+        "properties": {
+          "start": {
+            "title": "Start",
+            "type": "integer"
+          },
+          "end": {
+            "title": "End",
+            "type": "integer"
+          },
+          "source": {
+            "description": "group | custom | dictionary",
+            "title": "Source",
+            "type": "string"
+          },
+          "label": {
+            "description": "Group id, 'custom <n>' or 'dictionary'",
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end",
+          "source",
+          "label"
+        ],
+        "title": "VoicePreviewSpanInfo",
         "type": "object"
       },
       "NodeMetadataResponse": {

@@ -8,12 +8,16 @@ pending-list, GET /content, DELETE, auth isolation, and the extended
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from starlette.testclient import TestClient
+
+from turnstone.core.voice_config import DEFAULT_PROFILE, profile_json
 
 # Magic-byte-valid 1x1 PNG
 PNG_1x1 = (
@@ -1020,8 +1024,16 @@ class _VoiceConfigStore:
     def __init__(self, **values: str) -> None:
         self._values = dict(values)
 
-    def get(self, key: str, default: str = "") -> str:
-        return self._values.get(key, default)
+    def get(self, key: str, default: Any = None) -> Any:
+        # Like ConfigStore: an unset key falls back to the registry default.
+        if key in self._values:
+            return self._values[key]
+        if default is not None:
+            return default
+        from turnstone.core.settings_registry import SETTINGS
+
+        defn = SETTINGS.get(key)
+        return defn.default if defn else None
 
 
 @pytest.fixture
@@ -1219,6 +1231,58 @@ class TestTextToSpeech:
         # audio.tts_voice setting supplies the voice when the body omits one.
         create = mock_client.audio.speech.with_streaming_response.create
         assert create.call_args.kwargs["voice"] == "alloy"
+        # No style requested: the backend never sees an instructions field.
+        assert "instructions" not in create.call_args.kwargs
+
+    def test_styles_endpoint_lists_the_configured_styles(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.get("/v1/api/tts/styles", headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {
+            "styles": [
+                {"name": "Professional", "in_menu": True},
+                {"name": "Social", "in_menu": True},
+                {"name": "Plain", "in_menu": True},
+            ],
+            "default": "",
+            "instructions_supported": False,
+            "playback_rate": 1.0,
+            "profile": profile_json(DEFAULT_PROFILE),
+        }
+
+    def test_style_instruction_reaches_the_backend_when_capable(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_styles"] = json.dumps(
+            [{"name": "Warm", "instruction": "Speak warmly.", "in_menu": True}]
+        )
+        store._values["audio.tts_style"] = "Warm"
+        client.app.state.registry.get_config("voice").capabilities[
+            "supports_speech_instructions"
+        ] = True
+        resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["instructions"] == "Speak warmly."
+
+    def test_style_instruction_is_dropped_without_capability(self, voice_app_client):
+        client, mock_client = voice_app_client
+        client.app.state.config_store._values["audio.tts_styles"] = json.dumps(
+            [{"name": "Warm", "instruction": "Speak warmly.", "in_menu": True}]
+        )
+        resp = client.post(
+            "/v1/api/tts", json={"text": "hello", "style": "Warm"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert "instructions" not in create.call_args.kwargs
+
+    def test_unknown_style_is_not_an_error(self, voice_app_client):
+        client, _ = voice_app_client
+        resp = client.post(
+            "/v1/api/tts", json={"text": "hello", "style": "No Such Style"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
 
     def test_empty_text_returns_400(self, voice_app_client):
         client, _ = voice_app_client
@@ -1229,6 +1293,155 @@ class TestTextToSpeech:
         client, _ = voice_app_client
         resp = client.post("/v1/api/tts", json={"text": "x" * 9000}, headers=_auth("userA"))
         assert resp.status_code == 400
+
+    def test_text_cap_follows_the_setting(self, voice_app_client):
+        client, _ = voice_app_client
+        client.app.state.config_store._values["audio.tts_max_chars"] = 10
+        ok = client.post("/v1/api/tts", json={"text": "x" * 10}, headers=_auth("userA"))
+        assert ok.status_code == 200, ok.text
+        over = client.post("/v1/api/tts", json={"text": "x" * 11}, headers=_auth("userA"))
+        assert over.status_code == 400
+        assert "cap 10 chars" in over.json()["error"]
+
+    def test_text_cap_above_the_default_is_honoured(self, voice_app_client):
+        client, _ = voice_app_client
+        client.app.state.config_store._values["audio.tts_max_chars"] = 20000
+        resp = client.post("/v1/api/tts", json={"text": "x" * 9000}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+
+    def test_text_cap_through_a_real_config_store(self, storage):
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.web_helpers import tts_text_cap as _tts_text_cap
+
+        cs = ConfigStore(storage)
+        assert _tts_text_cap(cs) == 8000
+        cs.set("audio.tts_max_chars", 10)
+        assert _tts_text_cap(cs) == 10
+
+    @pytest.mark.parametrize("bad", ["", "abc", 0, -5, None])
+    def test_unusable_text_cap_falls_back_to_the_default(self, voice_app_client, bad):
+        client, _ = voice_app_client
+        client.app.state.config_store._values["audio.tts_max_chars"] = bad
+        ok = client.post("/v1/api/tts", json={"text": "x" * 8000}, headers=_auth("userA"))
+        assert ok.status_code == 200, ok.text
+        over = client.post("/v1/api/tts", json={"text": "x" * 8001}, headers=_auth("userA"))
+        assert over.status_code == 400
+
+    def test_text_is_normalised_before_synthesis(self, voice_app_client):
+        client, mock_client = voice_app_client
+        resp = client.post(
+            "/v1/api/tts", json={"text": "Needs ~32GB at 120ms"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Needs about 32 gigabytes at 120 milliseconds"
+
+    def test_missing_config_store_still_normalises(self, voice_app_client, monkeypatch):
+        # No config store means defaults (normalisation on), not "off".  The alias
+        # lookup needs a store, so stub it to isolate the normalise branch.
+        import turnstone.core.audio as audio_mod
+
+        client, mock_client = voice_app_client
+        client.app.state.config_store = None
+        monkeypatch.setattr(audio_mod, "resolve_role_alias", lambda **_kw: "voice")
+        resp = client.post("/v1/api/tts", json={"text": "Needs ~32GB"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert "about 32 gigabytes" in create.call_args.kwargs["input"]
+
+    def test_normalisation_applies_pronunciations(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_pronunciations"] = "# note\nSQL = sequel"
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use sequel"
+
+    def test_normalisation_applies_the_voice_dictionary(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.voice_dictionary"] = json.dumps(
+            [{"term": "SQL", "respelling": "sequel"}]
+        )
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use sequel"
+
+    def test_voice_dictionary_beats_pronunciations(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_pronunciations"] = "SQL = ess cue ell"
+        store._values["audio.voice_dictionary"] = json.dumps(
+            [{"term": "SQL", "respelling": "sequel"}]
+        )
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use sequel"
+
+    def test_voice_dictionary_honours_match_case(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.voice_dictionary"] = json.dumps(
+            [{"term": "BAA", "respelling": "B A A", "match_case": True}]
+        )
+        create = mock_client.audio.speech.with_streaming_response.create
+        resp = client.post(
+            "/v1/api/tts", json={"text": "the sheep said baa"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
+        assert create.call_args.kwargs["input"] == "the sheep said baa"
+        resp = client.post("/v1/api/tts", json={"text": "BAA is the code"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        assert create.call_args.kwargs["input"] == "B A A is the code"
+
+    def test_bad_voice_dictionary_does_not_break_read_aloud(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.voice_dictionary"] = "not json"
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use SQL"
+
+    def test_voice_dictionary_follows_the_normalisation_switch(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_normalize"] = False
+        store._values["audio.voice_dictionary"] = json.dumps(
+            [{"term": "SQL", "respelling": "sequel"}]
+        )
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use SQL"
+
+    def test_normalisation_can_be_disabled(self, voice_app_client):
+        client, mock_client = voice_app_client
+        client.app.state.config_store._values["audio.tts_normalize"] = False
+        resp = client.post("/v1/api/tts", json={"text": "Needs ~32GB"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Needs ~32GB"
+
+    def test_normalisation_honours_the_cleanup_settings(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_cleanup_disabled"] = json.dumps(["units"])
+        store._values["audio.tts_rewrite_rules"] = json.dumps(
+            [{"find": "Postgres", "replace": "postgres", "enabled": True}]
+        )
+        store._values["audio.tts_builtin_terms_off"] = json.dumps(["YAML"])
+        resp = client.post(
+            "/v1/api/tts",
+            json={"text": "user_id Postgres needs ~32GB and YAML"},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "user ID postgres needs about 32GB and YAML"
 
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         client, mock_client = voice_app_client
@@ -1328,7 +1541,7 @@ class TestVoiceStreamLifecycle:
         from starlette.responses import StreamingResponse
 
         from turnstone.core.deadline import StreamAbortRef
-        from turnstone.server import _AbortOnExitStreamingResponse
+        from turnstone.core.web_helpers import AbortOnExitStreamingResponse
 
         handle = MagicMock()
         abort_ref = StreamAbortRef()
@@ -1338,7 +1551,7 @@ class TestVoiceStreamLifecycle:
             raise asyncio.CancelledError
 
         monkeypatch.setattr(StreamingResponse, "__call__", cancel_before_body)
-        response = _AbortOnExitStreamingResponse([], abort_ref=abort_ref)
+        response = AbortOnExitStreamingResponse([], abort_ref=abort_ref)
 
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(response({}, MagicMock(), MagicMock()))
