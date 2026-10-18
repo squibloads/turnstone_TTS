@@ -103,6 +103,16 @@ COORDINATOR_TOOLS = [
     for t in TOOLS
     if _META[t["function"]["name"]].get("coordinator")
 ]
+# Voice coordinators are coordinator-kind sessions built under the ``voice``
+# persona.  Their one schema difference is memory: the ``voice`` variant
+# narrows the scope enum to the private voice namespace (plus project) and
+# replaces the coordinator description, so it must WIN over the coordinator
+# variant rather than merge with it.  Applying it on top of COORDINATOR_TOOLS
+# keeps every other tool on the coordinator surface byte-for-byte; a tool with
+# no ``voice`` variant passes through unchanged (same object, no copy).
+VOICE_COORDINATOR_TOOLS = [
+    _apply_kind_variant(t, "voice", _META[t["function"]["name"]]) for t in COORDINATOR_TOOLS
+]
 # Interactive sessions — the default session kind — must NOT see coordinator-only
 # tools (``spawn_workstream`` et al.) in their tool set.  Coordinator-only tools
 # require a ``coord_client`` that only console-hosted coordinator sessions

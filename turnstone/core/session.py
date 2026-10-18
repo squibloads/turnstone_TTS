@@ -287,6 +287,7 @@ from turnstone.core.tools import (
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
     TOOLS,
+    VOICE_COORDINATOR_TOOLS,
     apply_cwd_context,
     merge_mcp_tools,
     salvage_tool_arguments,
@@ -319,6 +320,7 @@ from turnstone.core.truncation import (
     source_chars,
     truncate_text,
 )
+from turnstone.core.voice_config import VOICE_MEMORY_SCOPE, is_voice_persona
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import (
     UrlBlockedError,
@@ -2231,14 +2233,16 @@ def _format_search_results(
 # Memory scopes accepted by the ``memory`` tool's preparer + executor.
 # Single source of truth — every action validator imports this rather
 # than literal-listing the values, so adding a scope is a one-site
-# change.  ``coordinator`` is COORDINATOR-only and ``project`` needs the
-# workstream attached to an accessible project (see
+# change.  ``coordinator`` and ``voice`` are both COORDINATOR-only, and a
+# coordinator accepts exactly one of them according to its persona; ``project``
+# needs the workstream attached to an accessible project (see
 # :meth:`ChatSession._validate_scope`); the others are kind-agnostic.
 _VALID_MEMORY_SCOPES: tuple[str, ...] = (
     "global",
     "workstream",
     "user",
     "coordinator",
+    VOICE_MEMORY_SCOPE,
     "project",
 )
 
@@ -5018,8 +5022,10 @@ class ChatSession:
         construction rather than by remembering a guard:
 
         * coordinator — ``merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools)``;
-          no cwd notes (no cwd-dependent tool in the base, and MCP tools
-          never carry one) and no task-agent lane.
+          a voice-persona coordinator uses ``VOICE_COORDINATOR_TOOLS``
+          instead, whose ``memory`` schema offers only the voice and project
+          scopes; no cwd notes (no cwd-dependent tool in the base, and MCP
+          tools never carry one) and no task-agent lane.
         * interactive — both lanes route through ``_apply_cwd_notes`` so a
           rebuild cannot silently drop the working-dir/workspace notes by
           assigning from the module constants directly.
@@ -5037,7 +5043,15 @@ class ChatSession:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Derive both MCP-merged lanes without publishing either one."""
         if self._kind == WorkstreamKind.COORDINATOR:
-            return merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools), []
+            # The voice persona narrows ONE coordinator tool (memory) and must
+            # win over the coordinator variant; every other coordinator tool is
+            # the same object either way.
+            base = (
+                VOICE_COORDINATOR_TOOLS
+                if is_voice_persona(self._persona_name)
+                else COORDINATOR_TOOLS
+            )
+            return merge_mcp_tools(base, mcp_tools), []
         return (
             self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)),
             self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)),
@@ -7970,6 +7984,13 @@ class ChatSession:
                     snapshot = acquire_memory_index_snapshot(
                         self._ws_id,
                         principal_id,
+                        # The durable row records kind only; the persona is a
+                        # construction-time stamp, so the capturing session says
+                        # which private namespace a coordinator row binds.
+                        voice=(
+                            self._kind == WorkstreamKind.COORDINATOR
+                            and is_voice_persona(self._persona_name)
+                        ),
                         commit_context=functools.partial(
                             self._memory_index_commit_context,
                             my_generation,
@@ -21026,6 +21047,8 @@ class ChatSession:
             return resolved.principal_id
         if scope == "coordinator":
             return self._coordinator_scope_id(resolved)
+        if scope == VOICE_MEMORY_SCOPE:
+            return self._voice_scope_id(resolved)
         if scope == "project":
             return resolved.project_id
         return ""
@@ -21033,6 +21056,18 @@ class ChatSession:
     def _coordinator_scope_id(self, access: _MemoryAccess | None = None) -> str:
         """Return this coordinator actor's private memory namespace."""
         if self._kind != WorkstreamKind.COORDINATOR:
+            return ""
+        return (access or self._memory_access()).principal_id
+
+    def _voice_scope_id(self, access: _MemoryAccess | None = None) -> str:
+        """Return this voice coordinator's private memory namespace.
+
+        Keyed by the acting user exactly like ``coordinator``, but reachable
+        only from a coordinator under the voice persona.  The empty key fails
+        closed: a non-voice session must never alias the voice namespace even
+        if a caller skips the scope validator.
+        """
+        if self._kind != WorkstreamKind.COORDINATOR or not is_voice_persona(self._persona_name):
             return ""
         return (access or self._memory_access()).principal_id
 
@@ -21055,25 +21090,33 @@ class ChatSession:
         access: _MemoryAccess | None = None,
         write: bool = False,
     ) -> dict[str, Any] | None:
-        """Validate one exact scope against kind, actor identity, and live ACL."""
+        """Validate one exact scope against kind, persona, actor identity, and live ACL.
+
+        A voice session is still COORDINATOR kind, so the persona decides which
+        private namespace it may name: ``voice`` for a voice session,
+        ``coordinator`` for every other coordinator.  The two sets are disjoint
+        on purpose — a spoken aside must not inherit, or pollute, the text
+        coordinator's orchestration memory.
+        """
         resolved = access or self._memory_access()
-        allowed = (
-            {"coordinator", "project"}
-            if self._kind == WorkstreamKind.COORDINATOR
-            else {"global", "workstream", "user", "project"}
-        )
-        if scope not in allowed:
+        voice = self._kind == WorkstreamKind.COORDINATOR and is_voice_persona(self._persona_name)
+        if self._kind == WorkstreamKind.COORDINATOR:
+            allowed = {"voice", "project"} if voice else {"coordinator", "project"}
             guidance = (
-                "Use coordinator, project, or omit scope to inherit the active target."
-                if self._kind == WorkstreamKind.COORDINATOR
-                else "Use global, workstream, user, or an accessible attached project."
+                "Use voice, project, or omit scope to inherit the active target."
+                if voice
+                else "Use coordinator, project, or omit scope to inherit the active target."
             )
+        else:
+            allowed = {"global", "workstream", "user", "project"}
+            guidance = "Use global, workstream, user, or an accessible attached project."
+        if scope not in allowed:
             return self._memory_prepare_error(
                 call_id,
                 f"✗ memory: scope '{scope}' unavailable",
                 f"Error: scope '{scope}' is unavailable to this workstream kind. {guidance}",
             )
-        if scope in {"user", "coordinator"} and not resolved.principal_id:
+        if scope in {"user", "coordinator", VOICE_MEMORY_SCOPE} and not resolved.principal_id:
             return self._memory_prepare_error(
                 call_id,
                 f"✗ memory: {scope} scope requires authentication",
@@ -21098,11 +21141,18 @@ class ChatSession:
         return None
 
     def _inherited_memory_scope(self, access: _MemoryAccess | None = None) -> str:
-        """Return the single target inherited by unscoped save/get/delete."""
+        """Return the single target inherited by unscoped save/get/delete.
+
+        A voice coordinator inherits its own namespace rather than the text
+        coordinator's, so an unscoped save during a spoken turn is filed where
+        the next voice session will find it.
+        """
         resolved = access or self._memory_access()
         if resolved.attached_project_id:
             return "project"
         if self._kind == WorkstreamKind.COORDINATOR:
+            if is_voice_persona(self._persona_name):
+                return VOICE_MEMORY_SCOPE
             return "coordinator"
         return "global"
 
@@ -21160,7 +21210,9 @@ class ChatSession:
         role doesn't need user-context memory and pulling those rows in
         would also surface memories from sibling interactive sessions
         (same user, different workstream) into the coord's system
-        message, which the coord shouldn't be reasoning over.
+        message, which the coord shouldn't be reasoning over.  A voice
+        coordinator is isolated the same way, to the ``voice`` namespace
+        instead of the coordinator one.
         """
         resolved = access or self._memory_access()
         total = 0
@@ -21178,25 +21230,32 @@ class ChatSession:
     def _visible_scopes(self, access: _MemoryAccess | None = None) -> list[tuple[str, str]]:
         """Return the (scope, scope_id) pairs visible to this session.
 
-        Coord sessions see their coord-scope; interactive sessions see global +
-        their workstream + their user (when uid present).  Either kind also sees
-        its attached ``project`` scope when the acting principal currently has
-        read access. Drives the single-query visibility helpers.
+        Coord sessions see their coord-scope, except a voice coordinator:
+        it sees the separate ``voice`` namespace instead, so neither kind
+        can read the other's memories.  Interactive sessions see global +
+        their workstream + their user (when uid present).  Every kind also
+        sees its attached ``project`` scope when the acting principal
+        currently has read access.  Drives the single-query visibility
+        helpers.
         """
         resolved = access or self._memory_access()
         if self._kind == WorkstreamKind.COORDINATOR:
-            scope_id = self._coordinator_scope_id(resolved)
+            voice = is_voice_persona(self._persona_name)
+            scope = VOICE_MEMORY_SCOPE if voice else "coordinator"
+            scope_id = (
+                self._voice_scope_id(resolved) if voice else self._coordinator_scope_id(resolved)
+            )
             # Fail closed on an empty scope id (unreachable through real hosts,
             # because __init__ refuses anonymous coordinators): no anonymous
-            # coordinator namespace exists.
-            coord_scopes: list[tuple[str, str]] = []
+            # coordinator or voice namespace exists.
+            private_scopes: list[tuple[str, str]] = []
             if scope_id:
-                coord_scopes.append(("coordinator", scope_id))
+                private_scopes.append((scope, scope_id))
             # A coordinator attached to a project also recalls the shared project
-            # bucket (read + write), alongside its isolated coordinator scope.
+            # bucket (read + write), alongside its isolated private scope.
             if resolved.project_id:
-                coord_scopes.append(("project", resolved.project_id))
-            return coord_scopes
+                private_scopes.append(("project", resolved.project_id))
+            return private_scopes
         scopes: list[tuple[str, str]] = [("global", ""), ("workstream", self._ws_id)]
         if resolved.principal_id:
             scopes.append(("user", resolved.principal_id))
