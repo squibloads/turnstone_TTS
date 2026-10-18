@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 import pytest
 
 from turnstone.core.speech_text import (
     _RULES,
+    _sub_with_segments,
     normalize_for_speech,
     parse_pronunciations,
 )
@@ -16,6 +18,8 @@ from turnstone.core.voice_config import (
     CLEANUP_GROUPS,
     CleanupOptions,
     DictionaryEntry,
+    RewriteRule,
+    expand_rewrite,
     parse_dictionary,
 )
 
@@ -422,9 +426,9 @@ class TestUnicodeCaseFolds:
         normalize_for_speech("İs it", {"is": "X"})
 
 
-def _elapsed(text: str) -> float:
+def _elapsed(text: str, options: CleanupOptions | None = None) -> float:
     start = time.perf_counter()
-    normalize_for_speech(text)
+    normalize_for_speech(text, options=options)
     return time.perf_counter() - start
 
 
@@ -585,3 +589,63 @@ def test_timing_long_word_run_with_identifiers() -> None:
     # The qwen-tts pattern backtracks quadratically on a long word run; the
     # boundary form used here must stay linear.
     assert _elapsed("a" * 50_000) < 0.2
+
+
+# -- custom rewrite rules -----------------------------------------------------
+
+
+def _rule(
+    find: str, replace: str = "", *, regex: bool = False, enabled: bool = True
+) -> RewriteRule:
+    return RewriteRule(find=find, regex=regex, replace=replace, test="", enabled=enabled)
+
+
+def test_custom_rules_run_after_the_cleanup_groups() -> None:
+    options = CleanupOptions(rules=(_rule("gigabytes", "GBs"),))
+    assert normalize_for_speech("needs 32GB", options=options) == "needs 32 GBs"
+
+
+def test_custom_rules_run_before_the_pronunciation_layer() -> None:
+    options = CleanupOptions(rules=(_rule("why ammel", "YAML"),))
+    assert normalize_for_speech("say why ammel", options=options) == "say yammel"
+
+
+def test_custom_rules_run_in_order_and_see_the_previous_output() -> None:
+    options = CleanupOptions(rules=(_rule("foo", "bar"), _rule("bar", "baz")))
+    assert normalize_for_speech("foo", options=options) == "baz"
+
+
+def test_only_enabled_custom_rules_run() -> None:
+    options = CleanupOptions(rules=(_rule("foo", "bar", enabled=False), _rule("bar", "baz")))
+    assert normalize_for_speech("foo bar", options=options) == "foo baz"
+
+
+def test_plain_rule_is_whole_word_and_ignores_case() -> None:
+    options = CleanupOptions(rules=(_rule("K8s", "kubernetes"),))
+    assert normalize_for_speech("K8S and k8sx", options=options) == "kubernetes and k8sx"
+
+
+def test_regex_rule_expands_groups() -> None:
+    options = CleanupOptions(rules=(_rule(r"(\d+)px", r"\1 pixels", regex=True),))
+    assert normalize_for_speech("at 10px and 2px", options=options) == "at 10 pixels and 2 pixels"
+
+
+def test_a_rule_that_no_longer_compiles_is_skipped() -> None:
+    bad = RewriteRule(find="(bad", regex=True, replace="x", test="", enabled=True)
+    options = CleanupOptions(rules=(bad, _rule("foo", "bar")))
+    assert normalize_for_speech("foo", options=options) == "bar"
+
+
+def test_zero_length_matches_are_skipped() -> None:
+    # The public write path rejects a pattern that matches empty text; a
+    # directly-built CleanupOptions can still carry one, so the engine guards.
+    rule = RewriteRule(find="x*", regex=True, replace="Y", test="", enabled=True)
+    pattern = re.compile("x*")
+    text, _segments = _sub_with_segments(pattern, lambda match: expand_rewrite(rule, match), "axxb")
+    assert text == "aYb"
+
+
+def test_timing_one_hundred_custom_rules_on_a_long_input() -> None:
+    rules = tuple(_rule(f"word{i}", f"term{i}") for i in range(100))
+    text = " ".join(f"word{i}" for i in range(100)) * 20
+    assert _elapsed(text, CleanupOptions(rules=rules)) < 1.0

@@ -39,12 +39,17 @@ import datetime
 import re
 from typing import TYPE_CHECKING
 
-from turnstone.core.voice_config import BUILTIN_TERMS, CleanupOptions
+from turnstone.core.voice_config import (
+    BUILTIN_TERMS,
+    CleanupOptions,
+    compile_rewrite_rule,
+    expand_rewrite,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
-    from turnstone.core.voice_config import DictionaryEntry, SpeechPreview
+    from turnstone.core.voice_config import DictionaryEntry, RewriteRule, SpeechPreview
 
 
 def _speak_version(match: re.Match[str]) -> str:
@@ -351,8 +356,54 @@ def _replacement_rows(
     return rows
 
 
-def _apply_replacements(text: str, rows: Sequence[_Replacement]) -> str:
-    """Replace whole-word keys in a single pass.
+# One stage's edit map: ("same" | "change", old_start, old_end, new_start,
+# new_end).  Every character of the input and the output appears in exactly one
+# segment, so a later stage can carry the preview's labels through an edit.
+_Segment = tuple[str, int, int, int, int]
+
+
+def _sub_with_segments(
+    pattern: re.Pattern[str],
+    repl: str | Callable[[re.Match[str]], str],
+    text: str,
+) -> tuple[str, list[_Segment]]:
+    """Apply *pattern* and return the text plus an input→output edit map.
+
+    Mirrors ``pattern.sub`` for the non-empty matches this engine uses, and
+    skips zero-length matches: a rewrite rule must never insert its
+    replacement between every character.  A match whose replacement equals the
+    matched text is recorded as unchanged, so the preview does not label no-ops.
+    """
+    pieces: list[str] = []
+    segments: list[_Segment] = []
+    position = 0
+    size = 0
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        if start == end:
+            continue
+        replacement = match.expand(repl) if isinstance(repl, str) else repl(match)
+        if start > position:
+            unchanged = text[position:start]
+            pieces.append(unchanged)
+            segments.append(("same", position, start, size, size + len(unchanged)))
+            size += len(unchanged)
+        if replacement == text[start:end]:
+            segments.append(("same", start, end, size, size + len(replacement)))
+        else:
+            segments.append(("change", start, end, size, size + len(replacement)))
+        pieces.append(replacement)
+        size += len(replacement)
+        position = end
+    if position < len(text):
+        unchanged = text[position:]
+        pieces.append(unchanged)
+        segments.append(("same", position, len(text), size, size + len(unchanged)))
+    return "".join(pieces), segments
+
+
+def _apply_replacements(text: str, rows: Sequence[_Replacement]) -> tuple[str, list[_Segment]]:
+    """Replace whole-word keys in a single pass; returns the text and its edits.
 
     One alternation (longest key first) keeps a respelling from being
     re-substituted by another key, so the result does not depend on input
@@ -361,7 +412,7 @@ def _apply_replacements(text: str, rows: Sequence[_Replacement]) -> str:
     rescanned.
     """
     if not rows:
-        return text
+        return text, []
     alternation = "|".join(
         f"((?i:{re.escape(key)}))" if not match_case else f"({re.escape(key)})"
         for key, _value, match_case in rows
@@ -370,7 +421,58 @@ def _apply_replacements(text: str, rows: Sequence[_Replacement]) -> str:
     # One capturing group per key: the group index names the value directly, so
     # a Unicode case fold ("ſ" matching "s") cannot miss a re-derived dict key.
     pattern = re.compile(r"(?<!\w)(?:" + alternation + r")(?!\w)")
-    return pattern.sub(lambda m: values[(m.lastindex or 1) - 1], text)
+    return _sub_with_segments(pattern, lambda m: values[(m.lastindex or 1) - 1], text)
+
+
+def _rewrite_replacement(rule: RewriteRule, match: re.Match[str]) -> str:
+    """The expansion for one custom-rule match, tolerating a stale template.
+
+    The write path validates the replacement, but a ``\\N`` can still name an
+    optional group the match did not take; leaving that match alone is better
+    than failing read-aloud.
+    """
+    try:
+        return expand_rewrite(rule, match)
+    except (re.error, IndexError):
+        return match.group(0)
+
+
+def _speech_stages(
+    text: str,
+    pronunciations: Mapping[str, str] | None,
+    dictionary: Sequence[DictionaryEntry] | None,
+    options: CleanupOptions,
+) -> Iterator[tuple[str, str, str, list[_Segment]]]:
+    """Run the cleanup pipeline one stage at a time.
+
+    Each yield is ``(new_text, source, label, segments)``; *segments* maps the
+    previous text to *new_text* so ``preview_for_speech`` can carry its labels
+    through later stages.  ``source`` and ``label`` name the stage that made
+    the edit: a cleanup group, a custom rule (1-based over the full stored
+    list) or the pronunciation layer.
+    """
+    for group, pattern, repl in _RULES:
+        if group in options.disabled_groups:
+            continue
+        text, segments = _sub_with_segments(pattern, repl, text)
+        yield text, "group", group, segments
+    for index, rule in enumerate(options.rules, start=1):
+        if not rule.enabled:
+            continue
+        try:
+            pattern = compile_rewrite_rule(rule)
+        except ValueError:
+            continue  # a stored rule that no longer compiles is skipped, not fatal
+
+        def replace(match: re.Match[str], rule: RewriteRule = rule) -> str:
+            return _rewrite_replacement(rule, match)
+
+        text, segments = _sub_with_segments(pattern, replace, text)
+        yield text, "custom", f"custom {index}", segments
+    text, segments = _apply_replacements(
+        text, _replacement_rows(pronunciations, dictionary, options.builtin_terms_off)
+    )
+    yield text, "dictionary", "dictionary", segments
 
 
 def normalize_for_speech(
@@ -392,13 +494,12 @@ def normalize_for_speech(
     the entry's ``respelling`` is read aloud (sending IPA to a model that
     accepts it is out of scope here).
     """
-    options = options or CleanupOptions()
-    for group, pattern, repl in _RULES:
-        if group not in options.disabled_groups:
-            text = pattern.sub(repl, text)
-    return _apply_replacements(
-        text, _replacement_rows(pronunciations, dictionary, options.builtin_terms_off)
-    )
+    normalized = text
+    for stage_text, _source, _label, _segments in _speech_stages(
+        text, pronunciations, dictionary, options or CleanupOptions()
+    ):
+        normalized = stage_text
+    return normalized
 
 
 def preview_for_speech(
