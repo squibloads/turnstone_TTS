@@ -69,6 +69,10 @@ function _addTtsActions() {}
 let voiceRoles = { stt: false, tts: false };
 const ttsPlayer = { stop() {} };
 let ttsStream = null;
+// Hands-free voice mode is covered by test_voice_loop_wiring_js; here it is
+// only the pane state the sliced functions touch.
+function _voiceRefresh() {}
+let voiceLoop = null;
 """
 
 _COORD_FNS = "\n".join(
@@ -96,11 +100,17 @@ let staleRetryTimer = null, cancelTimeoutId = null, forceTimeoutId = null, tasks
   liveBadgeFlushTimer = null, pruneTimer = null, unmountTranscriptPresentation = null;
 const removeVisibilityHandler = () => {}, _childObserver = null, unregisterTranscriptScroller = () => {};
 const scrollFollow = { destroy() {} };
+let voiceModeOn = false;
+const voiceBtn = new El("button"), voiceStatusEl = new El("div");
 """
 
 
 def _run(body: str, extra: str = "") -> Any:
-    src = _PRELUDE + extra + f"\n(async () => {{\n{body}\n}})().catch((e) => {{ console.error(e); process.exit(1); }});"
+    src = (
+        _PRELUDE
+        + extra
+        + f"\n(async () => {{\n{body}\n}})().catch((e) => {{ console.error(e); process.exit(1); }});"
+    )
     r = run_node_source(src)
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout.strip().splitlines()[-1])
@@ -129,7 +139,10 @@ console.log(JSON.stringify({ before, ttsOnly, sttOnly, off: show(),
     )
     assert out["before"] == out["ttsOnly"] == out["off"] == ["none", False]
     assert out["sttOnly"] == ["", True]
-    assert out["order"] == ["composer-mic-btn", "composer-send"]  # beside send, as in the interactive pane
+    assert out["order"] == [
+        "composer-mic-btn",
+        "composer-send",
+    ]  # beside send, as in the interactive pane
 
 
 def test_recording_posts_to_the_console_coordinator_route() -> None:

@@ -965,4 +965,88 @@ speaker on the finished reply still works.
 
 ## Voice mode
 
-Stub: hands-free back-and-forth (`audio.voice_mode_enabled`).
+Voice mode turns the coordinator into a spoken conversation. You press the
+**Voice** button once and then just talk: the microphone records, your turn is
+sent when you stop, the reply is read aloud, and the microphone opens again for
+the next thing you say. There is no second click per turn and nothing to press
+to hear the answer.
+
+It needs both a **Speech-to-text** and a **Text-to-speech** role
+([Models → Roles](#speech-to-text-model-role)); without both, the button does
+not appear. It is also meant to run with dictation's auto-stop on
+([`audio.stt_auto_stop`](#turning-it-on)): the turn ends when you stop talking.
+With auto-stop off the mode still works, but a turn ends only when you press
+the mic button, so a spoken reply needs two clicks instead of none.
+
+### Half-duplex
+
+The microphone is closed while anything plays. While a reply is being read —
+and while the coordinator is thinking — the mic is not recording, so the page
+never hears its own voice and never transcribes it into your next turn.
+
+The trade is that you cannot interrupt. Speaking over a reply does nothing: the
+reply plays to its end (or you press Stop), and only then does the microphone
+reopen. Barge-in — cutting the reply off by talking — is not part of this mode.
+Use the Stop button to cut a reply short; the microphone reopens as soon as the
+turn settles.
+
+A transcript that arrives while a turn is already running is dropped rather
+than queued. The mic should not have been open at that moment, and replaying a
+stale clip later would send a turn you have moved past.
+
+### The button and the status line
+
+**Voice** sits beside the microphone in the composer, labelled rather than
+icon-only so the two controls cannot be confused: the microphone is push-to-
+talk dictation, Voice is the hands-free loop. With the mode on, the button is
+outlined in the accent color.
+
+Below the composer, a short status line says what the loop is doing:
+
+| Status | Meaning |
+|--------|---------|
+| **Listening…** | The microphone is open. Speak; the clip ends when you stop. |
+| **Transcribing…** | The clip is uploading. The mic is closed. |
+| **Thinking…** | Your turn was sent and the coordinator is working. The mic is closed. |
+| **Speaking…** | The reply is being read aloud. The mic is closed. |
+
+The line is the only place the state is visible, and it is the answer to "why
+is the microphone not picking me up?" — it is closed on purpose until the turn
+is over.
+
+Pressing **Voice** again turns the mode off immediately. A recording in flight
+is discarded rather than transcribed, playback stops, and nothing else fires.
+Closing the pane does the same.
+
+### The setting
+
+`audio.voice_mode_enabled` · default on · boolean
+
+Whether coordinator sessions offer the Voice button. It is the single switch
+for the mode: off hides the button everywhere and an already-visible button
+that loses the setting drops the mode. The other requirements — both roles
+configured, and a browser that supports microphone capture — are checked
+separately, so turning this on cannot make the button appear where it could
+not work.
+
+The button appears **on** for a coordinator created with the
+[`voice` persona](#voice-persona) and **off** for every other persona. That is
+the whole default: a voice session is a spoken conversation by construction, so
+it opens listening; a coordinator you opened to read and type does not start
+recording at you. Either way the button is the override — press it to turn the
+mode on in a text session, or off in a voice one.
+
+### Turning the setting off for one session
+
+Turn `audio.voice_mode_enabled` off for a conversation-only deployment, or
+where the microphone must not open without a deliberate click. Dictation is
+unaffected: the mic button still records a clip per click. The setting only
+controls the hands-free loop.
+
+Leave it on where a voice session is the point. A voice session opens
+listening as soon as the page has confirmed both roles, so the browser's
+microphone permission prompt appears at open rather than on a click. A browser
+that refuses the microphone leaves the mic button in its blocked state and
+nothing is recorded; other personas start with the loop off and wait for the
+button.
+

@@ -499,6 +499,12 @@ def test_the_coordinator_pane_feeds_flushes_and_cancels_its_stream() -> None:
             "const calls = [];",
             "let voiceRoles = { stt: false, tts: true };",
             "let ttsStream = null;",
+            # Hands-free voice mode owns the streaming run (see
+            # test_voice_loop_wiring_js): with the mode on, a delta starts one.
+            "let voiceModeOn = true;",
+            "let voiceLoop = { onReplyStarted() { calls.push('reply'); } };",
+            "const currentAssistantEl = null;",
+            "function _watchVoiceRun(run) { calls.push(['watch', !!run.done]); }",
             "const ttsPlayer = {",
             "  stream() { calls.push('stream'); return {",
             "    push: (text) => calls.push(['push', text]),",
@@ -526,10 +532,14 @@ console.log(JSON.stringify({ calls, firstRun, afterEnd, afterCancel }));
     assert out == {
         "calls": [
             "stream",
+            ["watch", False],
+            "reply",
             ["push", "first delta"],
             ["push", " second delta"],
             "end",
             "stream",
+            ["watch", False],
+            "reply",
             ["push", "next segment"],
             "cancel",
         ],
@@ -537,3 +547,33 @@ console.log(JSON.stringify({ calls, firstRun, afterEnd, afterCancel }));
         "afterEnd": None,
         "afterCancel": None,
     }
+
+
+def test_voice_mode_off_never_starts_a_streaming_run() -> None:
+    """A streaming run auto-plays.  With Voice mode off the pane must stay
+    silent even when audio.tts_stream is on (the player resolves the setting
+    per run, so the pane is the only place the two can be kept apart)."""
+    prelude = "\n".join(
+        (
+            TREE_DOM,
+            "const calls = [];",
+            "let voiceRoles = { stt: true, tts: true };",
+            "let ttsStream = null;",
+            "let voiceModeOn = false;          // audio.tts_stream may be on; the pane is not listening",
+            "const currentAssistantEl = null;",
+            "const voiceLoop = { onReplyStarted() { calls.push('reply'); } };",
+            "function _watchVoiceRun() { calls.push('watch'); }",
+            "const ttsPlayer = { stream() { calls.push('stream'); return { push() {}, end() {}, cancel() {} }; } };",
+            _COORDINATOR_FNS,
+        )
+    )
+    out = _run(
+        """
+_feedTtsStream("a content delta");
+const after = ttsStream;
+_endTtsStream();
+console.log(JSON.stringify({ calls, after }));
+""",
+        prelude=prelude,
+    )
+    assert out == {"calls": [], "after": None}
