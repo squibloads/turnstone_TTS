@@ -72,6 +72,18 @@ def test_voice_report_is_absent_from_every_other_surface() -> None:
         assert "voice_report" not in _names(lane)
 
 
+def test_a_voice_session_is_built_with_the_swap(storage: Any) -> None:
+    """The constants are only half the contract: the session must build its
+    lane from them, and a plain coordinator must build the other one."""
+    voice = _voice_session()
+    assert "voice_report" in _names(voice._tools)
+    assert "wait_for_workstream" not in _names(voice._tools)
+
+    plain = _plainer_session()
+    assert "wait_for_workstream" in _names(plain._tools)
+    assert "voice_report" not in _names(plain._tools)
+
+
 def test_voice_surface_is_the_coordinator_surface_plus_the_swap() -> None:
     # Nothing else may drift: the two lists differ by exactly one tool each
     # way, so a later tool change cannot silently fall out of voice.
