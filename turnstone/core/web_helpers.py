@@ -508,8 +508,9 @@ def tts_style_instruction(
 
 def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, Any]:
     """The body of ``GET /v1/api/tts/styles``: the style picker's choices, the
-    admin playback rate every read-aloud plays at, and the active model's
-    pacing profile.
+    admin playback rate every read-aloud plays at, the active model's pacing
+    profile, and whether replies are read aloud while they are still being
+    written.
 
     Instruction text never leaves the server; the browser only needs names and
     ``in_menu``.  ``instructions_supported`` is the exact gate the POST path
@@ -533,6 +534,7 @@ def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, 
         "instructions_supported": supported,
         "playback_rate": _tts_playback_rate(config_store),
         "profile": _tts_profile(config_store, alias),
+        "stream": _tts_stream_enabled(config_store),
     }
 
 
@@ -551,6 +553,17 @@ def _tts_profile(config_store: Any, alias: str | None) -> dict[str, Any]:
     raw = config_store.get("audio.tts_profiles") if config_store is not None else None
     profiles = parse_profiles(raw if isinstance(raw, str) else "")
     return profile_json(resolve_profile(profiles, alias or ""))
+
+
+def _tts_stream_enabled(config_store: Any) -> bool:
+    """``audio.tts_stream`` for the player; missing or store-less reads as off.
+
+    It rides the styles probe for the same reason the playback rate and profile
+    do: that is the one read-aloud config fetch the player already makes per
+    transport base.  Off is the pre-streaming behaviour — read a finished reply
+    only — so every failure mode falls back to it.
+    """
+    return bool(config_store.get("audio.tts_stream")) if config_store is not None else False
 
 
 def _tts_playback_rate(config_store: Any) -> float:

@@ -232,6 +232,12 @@ class TextToSpeechStylesResponse(BaseModel):
             "audio.tts_profiles with the defaults filled in"
         ),
     )
+    stream: bool = Field(
+        default=False,
+        description=(
+            "Whether read-aloud speaks a reply while it is still being written (audio.tts_stream)"
+        ),
+    )
 
 
 class ApproveRequest(BaseModel):
