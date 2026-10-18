@@ -96,6 +96,11 @@ function _normalizeVerdict(value) {
  * captured frame: a missing run is simply a longer non-speech gap and can
  * close a segment or a turn.
  *
+ * A segment is `{ startMs, endMs, frames }`.  `frames` are the Int16Array
+ * frames (not copies), including one pre-roll frame and at most one frame of
+ * trailing padding; `startMs`/`endMs` are the bounds of that padded span.
+ * `endMs` is exclusive.
+ *
  * `verdict(segment)` is called as each segment closes, before the segment is
  * handed to onSegment; it may return "accept", "reject", "abstain", or a
  * Promise of one.  Verdicts may settle out of order — results are applied in
