@@ -77,6 +77,28 @@ console.log(JSON.stringify({ afterFirst, beforeEnd, afterEnd: clips }));
     ]
 
 
+def test_markdown_markers_are_not_spoken() -> None:
+    # A streamed delta is raw model text, not the rendered bubble, so the
+    # markers the finished-reply DOM path never sees must be dropped here.
+    out = _run(
+        r"""
+stubStream = true;
+const clips = [];
+const feeder = createStreamFeeder({ onClip: (clip) => clips.push(clip.text) });
+feeder.push("## Summary\n\nThe **build** is `green` and _ready_. ");
+feeder.push("See [the log](http://x/y) for details.\n- First item done.\n");
+feeder.end();
+console.log(JSON.stringify(clips.join(" ")));
+"""
+    )
+    assert "#" not in out
+    assert "*" not in out
+    assert "`" not in out
+    assert "_" not in out
+    assert "http" not in out
+    assert "build" in out and "green" in out and "the log" in out and "First item" in out
+
+
 def test_deltas_that_split_a_sentence_mid_word_still_produce_whole_sentences() -> None:
     out = _run(
         """

@@ -948,6 +948,22 @@ function _streamCut(text, minChars) {
   return 0;
 }
 
+// A streamed delta is raw model text, not the rendered bubble the finished-
+// reply path reads, so Markdown markers would be spoken literally ("hash hash
+// summary").  Drop them per completed sentence: links keep their label, code
+// keeps its text, and emphasis, headings, bullets and fences lose their marks.
+function _streamPlainText(text) {
+  return text
+    .replace(/```[^\n]*/g, " ")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s*(?:[-*+]|\d+[.)])\s+/gm, "")
+    .replace(/^\s*>\s?/gm, "")
+    .replace(/(\*\*|__|\*|_|~~|`)(?=\S)([^]*?\S)\1/g, "$2")
+    .replace(/[*_`#~]/g, "");
+}
+
 // Turns a live reply's text deltas into clips for a streaming run.  Each
 // delta is appended to a buffer; every completed sentence is shaped and
 // handed to onClip immediately, while the trailing partial sentence waits for
@@ -963,7 +979,8 @@ export function createStreamFeeder(opts) {
   const onClip = opts.onClip || (() => {});
   let pending = "";
   let closed = false;
-  const emit = (text) => {
+  const emit = (raw) => {
+    const text = _streamPlainText(raw);
     if (!text.trim()) return;
     for (const clip of shapeSpeechSegments([{ text, pauseMs: 0 }], profile)) {
       if (clip.text) onClip(clip);
