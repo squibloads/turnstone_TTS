@@ -739,3 +739,10 @@ Use it to even out a model that speaks noticeably slowly or quickly. It is not
 a substitute for a pacing profile: the profile controls the silence between
 clips, while playback speed changes the rate inside a clip. Tuning one does not
 change the other.
+
+## Voice persona
+
+A voice session is a coordinator created with the `voice` persona. It keeps
+its own memories (scope `voice`), starts at most
+`coordinator.voice_max_agents_per_turn` agents per spoken turn, and starts
+them on `coordinator.voice_child_model` when it names no model.
