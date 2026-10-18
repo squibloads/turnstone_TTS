@@ -33,9 +33,10 @@
   const RULES_KEY = "audio.tts_rewrite_rules";
   const DISABLED_KEY = "audio.tts_cleanup_disabled";
 
-  // Mirrors turnstone/core/voice_config.py (VOICE_DOCS_URL, MAX_REWRITE_RULES,
-  // MAX_RULE_*_CHARS).  The server's strict validators remain the authority;
-  // the meta endpoint's `limits` block overrides these when it loads.
+  // Mirrors turnstone/core/voice_config.py: voice_config.VOICE_DOCS_URL is
+  // the same URL, and MAX_REWRITE_RULES / MAX_RULE_*_CHARS are the defaults
+  // below.  The server's strict validators remain the authority; the meta
+  // endpoint's `limits` block overrides these when it loads.
   const VOICE_DOCS_URL =
     "https://github.com/turnstonelabs/turnstone/blob/main/docs/voice.md";
   const DEFAULT_LIMITS = {
