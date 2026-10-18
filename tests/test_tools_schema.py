@@ -60,17 +60,23 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        # 31 tool files total: 12 coordinator-only + the rest interactive,
-        # with memory/skills/notify/read_resource/use_prompt dual-kind.
-        assert len(TOOLS) == 31
+        # 32 tool files total: 12 coordinator-only + voice_report (voice-only,
+        # still coordinator-kind metadata) + the rest interactive, with
+        # memory/skills/notify/read_resource/use_prompt dual-kind.
+        assert len(TOOLS) == 32
 
     def test_task_agent_tools_count(self):
         assert len(TASK_AGENT_TOOLS) == 13
 
     def test_coordinator_tools_count(self):
-        from turnstone.core.tools import COORDINATOR_TOOLS
+        # 17 = the plain coordinator surface.  voice_report carries
+        # coordinator-kind metadata but is voice-only, and
+        # wait_for_workstream is voice-excluded; the two lists trade exactly
+        # one tool each way (pinned in test_voice_reports.py).
+        from turnstone.core.tools import COORDINATOR_TOOLS, VOICE_COORDINATOR_TOOLS
 
         assert len(COORDINATOR_TOOLS) == 17
+        assert len(VOICE_COORDINATOR_TOOLS) == 17
         assert {t["function"]["name"] for t in COORDINATOR_TOOLS} == {
             "spawn_workstream",
             "spawn_batch",
@@ -130,6 +136,8 @@ class TestToolsMetadata:
             "list_workstreams",
             "list_nodes",
             "wait_for_workstream",
+            # Voice-only read/dismiss of a finished child's saved report.
+            "voice_report",
         }
         assert expected == TASK_AUTO_TOOLS
 
@@ -164,12 +172,14 @@ class TestToolsMetadata:
             "cancel_workstream": "ws_id",
             "delete_workstream": "ws_id",
             "tasks": "action",
+            # Voice-only coordinator tool:
+            "voice_report": "report_id",
         }
         assert expected == PRIMARY_KEY_MAP
 
     def test_no_metadata_in_function_dicts(self):
         """Ensure turnstone metadata keys are stripped from the OpenAI schema."""
-        meta_keys = {"task_agent", "coordinator", "auto_approve", "primary_key"}
+        meta_keys = {"task_agent", "coordinator", "interactive", "voice", "auto_approve", "primary_key"}
         for tool in TOOLS:
             func = tool["function"]
             leaked = meta_keys & set(func)
