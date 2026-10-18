@@ -331,6 +331,7 @@ const pane = {
   _scrollFollow: v.follow, messagesEl: v.scroller,
   _reasoningActivity: { finish() {} }, _compaction: {},
   removeEmptyState() {},
+  _streamTTS() {}, _endTTSStream() {}, _cancelTTSStream() {},
 """
         + methods.replace("\n  }", "\n  },")
         + """

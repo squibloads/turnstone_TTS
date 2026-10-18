@@ -484,6 +484,9 @@ class Pane {
     // Voice I/O (mic STT + per-message TTS playback)
     this._voiceRoles = { stt: false, tts: false };
     this._mic = null;
+    // The live streaming-read-aloud run for the reply being written, if any
+    // (created on the first content delta and flushed at stream_end).
+    this._ttsStream = null;
     // reset() and replayHistory() call _stopTTS() before any playback, so the
     // player exists from construction (the base is read per request: a console
     // pane's is fixed, but a test or host may set it after construction).
@@ -2331,6 +2334,7 @@ class Pane {
         }
         this.contentBuffer += evt.text;
         streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
+        this._streamTTS(evt.text);
         this.scrollToBottom();
         break;
 
@@ -2350,6 +2354,9 @@ class Pane {
         // frozen bar until the abandoned worker notices at its next
         // checkpoint.
         resetCompactionHolder(this._compaction);
+        // This segment's text is complete: speak the sentence still in the
+        // feeder's buffer, then let the run drain its queue.
+        this._endTTSStream();
         // Reset the segment state BEFORE the finalize render, and guard the
         // render with a plain-text fallback (mirrors coordinator.js).  With
         // the old order a finalize throw skipped these clears, so every
@@ -2728,6 +2735,7 @@ class Pane {
         // Show "Cancelling..." state; state_change will transition to ready.
         // If state_change already arrived (busy is false), the cancel is
         // already handled — don't re-enter the cancelling state.
+        this._cancelTTSStream(); // drop anything spoken for the cancelled text
         if (!this.busy) break;
         // Clear any prior timeouts first (duplicate cancelled events).
         clearTimeout(this._cancelTimeout);
@@ -3152,7 +3160,33 @@ class Pane {
     return this._ttsPlayer.play(el, btn);
   }
 
+  // Streaming read-aloud: content deltas go to one feeder per reply, which
+  // hands the player only completed sentences.  The player discards a run
+  // created while audio.tts_stream is off, so this stays unconditional and a
+  // deployment with streaming off behaves exactly as it did before.
+  _streamTTS(text) {
+    if (!(this._voiceRoles && this._voiceRoles.tts) || !text) return;
+    if (!this._ttsStream) this._ttsStream = this._ttsPlayer.stream();
+    this._ttsStream.push(text);
+  }
+
+  _endTTSStream() {
+    if (!this._ttsStream) return;
+    this._ttsStream.end();
+    this._ttsStream = null; // the run keeps draining; the next reply starts fresh
+  }
+
+  _cancelTTSStream() {
+    if (!this._ttsStream) return;
+    this._ttsStream.cancel();
+    this._ttsStream = null;
+  }
+
   _stopTTS() {
+    // A reference left over a stop would swallow the next reply's deltas;
+    // clearing it lets the next content start a fresh run.  The player's own
+    // stop() drops the streaming run it is holding.
+    this._ttsStream = null;
     this._ttsPlayer.stop();
   }
 

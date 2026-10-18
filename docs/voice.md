@@ -262,6 +262,7 @@ own section:
 | `audio.tts_builtin_terms_off` | `[]` | Built-in respellings switched off. | A shipped respelling is wrong for your team. | [Built-in terms](#built-in-terms) |
 | `audio.voice_dictionary` | `[]` | Read-aloud respellings and dictation corrections. | A term is mispronounced or mistranscribed. | [Dictionary](#dictionary), max 200 |
 | `audio.tts_styles` | Professional, Social, Plain | Named delivery instructions. | The model accepts instructions and you want a different delivery. | [Styles](#styles), max 20 |
+| `audio.tts_stream` | `false` | Reads a reply aloud while it is still being written. | A voice session should speak each sentence as it completes. | [Streaming read-aloud](#streaming-read-aloud) |
 
 ## Pacing profiles
 
@@ -831,4 +832,32 @@ Stub: `audio.stt_auto_stop`, `audio.stt_silence_ms`, `audio.stt_vad_threshold`.
 
 ## Streaming read-aloud
 
-Stub: `audio.tts_stream`.
+By default a reply is read aloud only after it is finished: the speaker button
+appears when the turn ends, and pressing it speaks the whole answer. With
+streaming read-aloud on, the player starts as soon as the first **sentence** is
+complete and keeps speaking while the rest of the reply is still being written.
+
+The player receives the reply as it streams, so it can only act on text that
+has arrived. It holds the trailing partial sentence back — a delta that stops
+in the middle of a word, or on a full stop that might still become "3.14" or
+"Dr." — and hands each completed sentence to the speech backend immediately.
+At the end of the turn the remainder is flushed, so a reply that trails off is
+still spoken in full. A cancel, a stop, or a new reply drops every clip that
+was queued but not yet played.
+
+Streaming and finished-reply playback share the same voice, style, playback
+rate and pacing profile, and the same one-request-at-a-time rule: the next
+sentence is synthesized while the current one plays. Only one reading plays at
+a time on a page, so starting a new reply stops anything still speaking. The
+speaker button on finished replies is unchanged; it reads the whole reply again
+from the beginning.
+
+`audio.tts_stream` · default off · on/off · Admin › Settings, section **Audio**
+
+Off keeps the old behaviour: nothing is synthesized until you press the speaker
+on a finished reply. Turn it on for a voice session whose replies should be
+heard as they are written. The setting is deployment-wide and reaches the
+browser with the rest of the read-aloud configuration, so a saved change
+applies after a page reload. The browser may refuse to start audio that no
+click preceded — a page that has had no interaction yet — in which case the
+speaker on the finished reply still works.
