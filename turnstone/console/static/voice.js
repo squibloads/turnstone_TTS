@@ -9,10 +9,10 @@
 
    The Settings section edits the audio.* settings the general Settings tab no
    longer shows.  The stt/tts model aliases stay in Models → Roles, and the two
-   JSON-list settings have their own tabs here.  Below the Dictation and Read
-   aloud groups sits the per-model pacing profile: the Pacing, Structure and
-   Clips sections edit one alias's overrides in `audio.tts_profiles`, with the
-   TTS model select choosing which alias. */
+   JSON-list settings have their own tabs here.  Below the setting groups sits
+   the per-model pacing profile: the Pacing, Structure and Clips sections edit
+   one alias's overrides in `audio.tts_profiles`, with the TTS model select
+   choosing which alias. */
 
 let _voiceSettings = [];
 const _voiceSectionLoaders = {};
@@ -25,12 +25,23 @@ let _voiceLoadSeq = 0;
 // lands in "Other" rather than disappearing from the page.
 const VOICE_SETTING_GROUPS = [
   {
+    // The hands-free loop's master switch comes before the two halves it
+    // drives, so the page reads "voice mode, then the dictation and read-aloud
+    // settings it uses".
+    id: "voice-mode",
+    label: "Voice mode",
+    keys: ["audio.voice_mode_enabled"],
+  },
+  {
     id: "dictation",
     label: "Dictation",
     keys: [
       "audio.stt_prompt",
       "audio.stt_dictionary_hint",
       "audio.stt_dictionary_correct",
+      "audio.stt_auto_stop",
+      "audio.stt_silence_ms",
+      "audio.stt_vad_threshold",
     ],
   },
   {
@@ -43,6 +54,7 @@ const VOICE_SETTING_GROUPS = [
       "audio.tts_timeout_seconds",
       "audio.tts_style",
       "audio.tts_pronunciations",
+      "audio.tts_stream",
     ],
   },
 ];
