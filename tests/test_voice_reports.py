@@ -365,7 +365,10 @@ def test_voice_wait_call_is_refused_before_it_blocks(storage: Any) -> None:
         {
             "id": "call-w",
             "type": "function",
-            "function": {"name": "wait_for_workstream", "arguments": json.dumps({"ws_ids": [_CHILD]})},
+            "function": {
+                "name": "wait_for_workstream",
+                "arguments": json.dumps({"ws_ids": [_CHILD]}),
+            },
         }
     )
     assert "error" in item
@@ -380,7 +383,10 @@ def test_a_text_coordinator_can_still_prepare_the_wait(storage: Any) -> None:
         {
             "id": "call-w",
             "type": "function",
-            "function": {"name": "wait_for_workstream", "arguments": json.dumps({"ws_ids": [_CHILD]})},
+            "function": {
+                "name": "wait_for_workstream",
+                "arguments": json.dumps({"ws_ids": [_CHILD]}),
+            },
         }
     )
     assert "error" not in item

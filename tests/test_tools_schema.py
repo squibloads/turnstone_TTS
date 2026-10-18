@@ -179,7 +179,14 @@ class TestToolsMetadata:
 
     def test_no_metadata_in_function_dicts(self):
         """Ensure turnstone metadata keys are stripped from the OpenAI schema."""
-        meta_keys = {"task_agent", "coordinator", "interactive", "voice", "auto_approve", "primary_key"}
+        meta_keys = {
+            "task_agent",
+            "coordinator",
+            "interactive",
+            "voice",
+            "auto_approve",
+            "primary_key",
+        }
         for tool in TOOLS:
             func = tool["function"]
             leaked = meta_keys & set(func)
