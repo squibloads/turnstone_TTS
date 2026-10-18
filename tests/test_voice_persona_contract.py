@@ -1,8 +1,8 @@
 """Tests for the voice-persona contract in turnstone.core.voice_config.
 
 A voice session is a coordinator created with the ``voice`` persona.  The
-memory scope, the spawn cap and the child-model default all key off that one
-name, so the name, the scope and the two settings are pinned here before the
+memory scope, the spawn caps and the child-model default all key off that one
+name, so the name, the scope and the settings are pinned here before the
 slices that consume them are built.
 """
 
@@ -47,6 +47,15 @@ def test_max_agents_per_turn_setting() -> None:
     assert d.help and d.reference_url.startswith(VOICE_DOCS_URL + "#")
     with pytest.raises(ValueError):
         validate_value("coordinator.voice_max_agents_per_turn", "11")
+
+
+def test_max_requested_agents_setting() -> None:
+    d = validate_key("coordinator.voice_max_requested_agents")
+    assert (d.type, d.section, d.default) == ("int", "coordinator", 4)
+    assert (d.min_value, d.max_value) == (0, 10)
+    assert d.help and d.reference_url.startswith(VOICE_DOCS_URL + "#")
+    with pytest.raises(ValueError):
+        validate_value("coordinator.voice_max_requested_agents", "11")
 
 
 def test_child_model_setting() -> None:

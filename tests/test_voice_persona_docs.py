@@ -1,7 +1,7 @@
 """Documentation and admin-view completeness for the voice persona.
 
 A voice session is a coordinator created with the ``voice`` persona.  The
-settings registry points both voice-persona settings at
+settings registry points the voice-persona settings at
 ``docs/voice.md#voice-persona``, so that heading is a public anchor: renaming
 it turns every "learn more" link in Admin › Settings into a dead link.  The
 admin Memories scope filter is a fixed list in the console HTML, so it has to
@@ -38,10 +38,11 @@ def test_voice_doc_documents_the_persona_subsections() -> None:
     assert "starting-agents" in slugs
 
 
-def test_voice_doc_names_both_persona_settings() -> None:
+def test_voice_doc_names_the_persona_settings() -> None:
     text = _voice_text()
     for key in (
         "coordinator.voice_max_agents_per_turn",
+        "coordinator.voice_max_requested_agents",
         "coordinator.voice_child_model",
     ):
         assert key in text, f"docs/voice.md must name {key}"
