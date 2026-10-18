@@ -1008,6 +1008,40 @@ personas = sa.Table(
 sa.Index("idx_personas_enabled", personas.c.enabled)
 
 # ---------------------------------------------------------------------------
+# Voice reports — finished child agents' output, queued for the next spoken
+# turn (migration 085)
+# ---------------------------------------------------------------------------
+# A voice coordinator must not block its turn on ``wait_for_workstream``, so a
+# finished child leaves a row here instead.  The row outlives the session on
+# purpose: a report captured before a resume/reopen is still offered on the
+# next genuine user turn.  ``state`` walks
+# ``turnstone.core.voice_config.VOICE_REPORT_STATES``; the tuple is written
+# out in the CHECK so a later code change cannot silently widen the column.
+
+voice_reports = sa.Table(
+    "voice_reports",
+    metadata,
+    sa.Column("report_id", sa.Text, primary_key=True),
+    sa.Column("coord_ws_id", sa.Text, nullable=False),
+    sa.Column("child_ws_id", sa.Text, nullable=False),
+    # title: the child's display name (alias > title > name), truncated by the
+    # capture path.  Short by contract — it is spoken, not read.
+    sa.Column("title", sa.Text, nullable=False, server_default=""),
+    # body: the child's last assistant turn or persisted last_error, capped at
+    # VOICE_REPORT_BODY_MAX_BYTES by the storage edge.
+    sa.Column("body", sa.Text, nullable=False, server_default=""),
+    sa.Column("state", sa.Text, nullable=False, server_default="pending"),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+    sa.CheckConstraint(
+        "state IN ('pending', 'offered', 'read', 'dismissed')",
+        name="ck_voice_reports_state",
+    ),
+)
+
+sa.Index("idx_voice_reports_coord_state", voice_reports.c.coord_ws_id, voice_reports.c.state)
+
+# ---------------------------------------------------------------------------
 # OIDC identity tables
 # ---------------------------------------------------------------------------
 
