@@ -835,11 +835,13 @@ button yourself — the dictionary hint, correction and every other dictation
 behavior apply unchanged.
 
 The detector runs inside the browser against the microphone stream dictation
-already captured. Nothing is sent anywhere until the clip is uploaded for
-transcription, and no extra permission prompt appears: it uses the same
-microphone grant as the recording itself.
+already captured. Its model is served by the application itself — not a CDN —
+and is loaded once per page, on the first recording made with auto-stop on.
+Nothing is sent anywhere until the clip is uploaded for transcription, and no
+extra permission prompt appears: it uses the same microphone grant as the
+recording itself.
 
-#### Turning it on
+### Turning it on
 
 `audio.stt_auto_stop` · default off · boolean
 
@@ -853,7 +855,7 @@ Turn it on for hands-free spoken turns. Leave it off if you dictate long
 answers with deliberate pauses (or think out loud between sentences) and would
 rather decide when the clip ends.
 
-#### How long you must be quiet
+### How long you must be quiet
 
 `audio.stt_silence_ms` · default `900` · range 300–5000
 
@@ -862,7 +864,7 @@ dictation cuts you off mid-thought or while you are looking something up;
 lower it for snappier turns. A value below a few hundred milliseconds starts
 cutting normal pauses between words.
 
-#### What counts as talking
+### What counts as talking
 
 `audio.stt_vad_threshold` · default `0.5` · range 0.1–0.9
 
@@ -882,7 +884,7 @@ noisy frame, at the cost of a room whose background noise sits in that band
 never auto-stopping. Raise the threshold until the room's noise reads as
 silence; lower it when quiet speech is missed.
 
-#### When the detector is unavailable
+### When the detector is unavailable
 
 The detector ships with the application, so a normal deployment has it. If the
 browser cannot load it — an older build without the files, or a browser that
