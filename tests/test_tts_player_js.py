@@ -646,3 +646,402 @@ console.log(JSON.stringify(rates));
 """
     )
     assert out == [1, 1, 1, 1]
+
+
+# -- read-aloud profile (audio.tts_profiles) --------------------------------
+# The profile rides the styles probe.  It replaces every pacing/structure
+# constant the player used to bake in, field by field: a missing, malformed or
+# out-of-range field reads as the built-in default, so a model with no profile
+# sounds exactly as it did before profiles existed.
+
+_DEFAULT_PROFILE = {
+    "pause_heading_ms": 600,
+    "pause_paragraph_ms": 500,
+    "pause_table_row_ms": 150,
+    "pause_code_ms": 400,
+    "pause_list_item_ms": 0,
+    "table_cell_joiner": "comma",
+    "table_header_mode": "row",
+    "inline_code_max_chars": 40,
+    "code_marker": "Code omitted.",
+    "diagram_marker": "Diagram omitted.",
+    "clip_min_chars": 20,
+    "clip_max_chars": 600,
+    "max_clips": 200,
+}
+
+
+def test_the_profile_rides_the_styles_probe_once_per_base() -> None:
+    out = _run(
+        """
+stubProfile = { pause_paragraph_ms: 250, table_cell_joiner: "semicolon" };
+const same = await Promise.all([getTtsProfile(""), getTtsProfile(""), getTtsStyles("")]);
+stubProfile = undefined;                            // a server that predates profiles
+const missing = await getTtsProfile("/node/plain");
+stylesMode = "down";                                // a failed probe is the defaults
+const down = await getTtsProfile("/node/down");
+console.log(JSON.stringify({
+  profile: same[0], missing, down,
+  urls: log.fetches.filter((f) => f.url.endsWith("/tts/styles")).map((f) => f.url),
+}));
+"""
+    )
+    assert out["profile"] == {
+        **_DEFAULT_PROFILE,
+        "pause_paragraph_ms": 250,
+        "table_cell_joiner": "semicolon",
+    }
+    assert out["missing"] == _DEFAULT_PROFILE
+    assert out["down"] == _DEFAULT_PROFILE
+    # Three panes asking share one probe per base, exactly like the styles and rate.
+    assert out["urls"] == [
+        "/v1/api/tts/styles",
+        "/node/plain/v1/api/tts/styles",
+        "/node/down/v1/api/tts/styles",
+    ]
+
+
+def test_a_malformed_profile_field_reads_as_its_default() -> None:
+    out = _run(
+        """
+stubProfile = {
+  pause_heading_ms: 9000,              // above the 0-5000 bound
+  pause_paragraph_ms: true,            // bool is not a whole number
+  pause_table_row_ms: 40.5,            // not a whole number
+  pause_code_ms: 750,                  // valid
+  pause_list_item_ms: -1,              // below the 0 bound
+  table_cell_joiner: "tab",            // not one of comma/semicolon/pause
+  table_header_mode: "prefix",         // valid
+  inline_code_max_chars: "40",         // not a number
+  code_marker: "  Silence.  ",         // valid, trimmed like the server does
+  diagram_marker: "x".repeat(61),      // longer than MAX_MARKER_CHARS
+  clip_min_chars: 150,
+  clip_max_chars: 120,                 // inverted pair: both read as defaults
+  max_clips: 0,                        // below the 1 bound
+};
+const bad = await getTtsProfile("");
+stubProfile = "not an object";
+const notObject = await getTtsProfile("/node/string");
+stubProfile = [];
+const list = await getTtsProfile("/node/list");
+console.log(JSON.stringify({ bad, notObject, list }));
+"""
+    )
+    assert out["bad"] == {
+        **_DEFAULT_PROFILE,
+        "pause_code_ms": 750,
+        "table_header_mode": "prefix",
+        "code_marker": "Silence.",
+    }
+    assert out["notObject"] == _DEFAULT_PROFILE
+    assert out["list"] == _DEFAULT_PROFILE
+
+
+def test_the_profile_sets_every_block_pause() -> None:
+    out = _run(
+        """
+const body = new El("div");
+const add = (tag, text) => {
+  const n = new El(tag); n.appendChild(new Text_(text)); body.appendChild(n);
+};
+add("h2", "A heading for the reply");
+add("p", "A paragraph that is long enough.");
+add("blockquote", "A quoted sentence of some length.");
+const table = new El("table");
+for (const [a, b] of [["alpha first", "beta second"], ["gamma third", "delta fourth"]]) {
+  const tr = new El("tr");
+  for (const text of [a, b]) {
+    const td = new El("td"); td.appendChild(new Text_(text)); tr.appendChild(td);
+  }
+  table.appendChild(tr);
+}
+body.appendChild(table);
+console.log(JSON.stringify(extractSpeechSegments(body, {
+  pause_heading_ms: 900, pause_paragraph_ms: 250, pause_table_row_ms: 40,
+})));
+"""
+    )
+    assert out == [
+        {"text": "A heading for the reply.", "pauseMs": 900},
+        {"text": "A paragraph that is long enough.", "pauseMs": 250},
+        {"text": "A quoted sentence of some length.", "pauseMs": 250},
+        {"text": "alpha first, beta second.", "pauseMs": 40},
+        {"text": "gamma third, delta fourth.", "pauseMs": 0},
+    ]
+
+
+def test_markers_and_the_marker_pause_come_from_the_profile() -> None:
+    out = _run(
+        """
+const body = new El("div");
+const add = (tag, text) => {
+  const n = new El(tag); n.appendChild(new Text_(text)); body.appendChild(n);
+};
+add("p", "Before the code block.");
+add("pre", "ls -la");
+const d = new El("div"); d.className = "mermaid-container mermaid-loading";
+body.appendChild(d);
+add("p", "After the diagram.");
+console.log(JSON.stringify(extractSpeechSegments(body, {
+  pause_code_ms: 750, code_marker: "Code skipped.", diagram_marker: "Diagram skipped.",
+})));
+"""
+    )
+    assert out == [
+        {"text": "Before the code block.", "pauseMs": 500},
+        {"text": "Code skipped.", "pauseMs": 750},
+        {"text": "Diagram skipped.", "pauseMs": 750},
+        {"text": "After the diagram.", "pauseMs": 0},
+    ]
+
+
+def test_an_empty_marker_skips_the_element_silently() -> None:
+    out = _run(
+        """
+const body = new El("div");
+const add = (tag, text) => {
+  const n = new El(tag); n.appendChild(new Text_(text)); body.appendChild(n);
+};
+add("p", "Before the code block.");
+add("pre", "ls -la");
+const d = new El("div"); d.className = "mermaid-container mermaid-loading";
+body.appendChild(d);
+add("p", "After the diagram.");
+const only = new El("div");
+const lonely = new El("div"); lonely.className = "mermaid-container mermaid-loading";
+only.appendChild(lonely);
+console.log(JSON.stringify({
+  segs: extractSpeechSegments(body, { code_marker: "", diagram_marker: "" }),
+  only: extractSpeechSegments(only, { code_marker: "", diagram_marker: "" }),
+}));
+"""
+    )
+    # No marker clip and no marker pause; the surrounding text keeps its own pacing.
+    assert out["segs"] == [
+        {"text": "Before the code block.", "pauseMs": 500},
+        {"text": "After the diagram.", "pauseMs": 0},
+    ]
+    assert out["only"] == []
+
+
+def test_pause_list_item_splits_a_list_into_one_clip_per_item() -> None:
+    out = _run(
+        """
+const body = new El("div");
+const ul = new El("ul");
+for (const text of ["The first list item is red", "The second list item is blue",
+                    "The third list item is green"]) {
+  const li = new El("li"); li.appendChild(new Text_(text)); ul.appendChild(li);
+}
+body.appendChild(ul);
+const nested = new El("ul");
+const outer = new El("li"); outer.appendChild(new Text_("Parent item text here"));
+const inner = new El("ul");
+for (const text of ["Child item one is here", "Child item two is here"]) {
+  const li = new El("li"); li.appendChild(new Text_(text)); inner.appendChild(li);
+}
+outer.appendChild(inner); nested.appendChild(outer);
+const sibling = new El("li"); sibling.appendChild(new Text_("Sibling item text here"));
+nested.appendChild(sibling);
+const short = new El("ul");
+for (const text of ["Milk", "Eggs", "Bread"]) {
+  const li = new El("li"); li.appendChild(new Text_(text)); short.appendChild(li);
+}
+console.log(JSON.stringify({
+  byDefault: extractSpeechSegments(body),
+  perItem: extractSpeechSegments(body, { pause_list_item_ms: 300 }),
+  nested: extractSpeechSegments(nested, { pause_list_item_ms: 300 }),
+  short: extractSpeechSegments(short, { pause_list_item_ms: 300 }),
+}));
+"""
+    )
+    assert out["byDefault"] == [
+        {
+            "text": "The first list item is red. The second list item is blue."
+            " The third list item is green.",
+            "pauseMs": 0,
+        }
+    ]
+    assert out["perItem"] == [
+        {"text": "The first list item is red.", "pauseMs": 300},
+        {"text": "The second list item is blue.", "pauseMs": 300},
+        {"text": "The third list item is green.", "pauseMs": 0},
+    ]
+    assert out["nested"] == [
+        {"text": "Parent item text here.", "pauseMs": 300},
+        {"text": "Child item one is here.", "pauseMs": 300},
+        {"text": "Child item two is here.", "pauseMs": 300},
+        {"text": "Sibling item text here.", "pauseMs": 0},
+    ]
+    # An item is a clip of its own even when it is shorter than clip_min_chars:
+    # the profile asked for one, and folding it forward would swallow the pause.
+    assert out["short"] == [
+        {"text": "Milk.", "pauseMs": 300},
+        {"text": "Eggs.", "pauseMs": 300},
+        {"text": "Bread.", "pauseMs": 0},
+    ]
+
+
+def test_table_cell_joiner_semicolon_and_pause() -> None:
+    out = _run(
+        """
+const table = new El("table");
+for (const row of [["alpha first", "beta second"], ["gamma third", "delta fourth"]]) {
+  const tr = new El("tr");
+  for (const text of row) {
+    const td = new El("td"); td.appendChild(new Text_(text)); tr.appendChild(td);
+  }
+  table.appendChild(tr);
+}
+console.log(JSON.stringify({
+  semicolon: extractSpeechSegments(table, { table_cell_joiner: "semicolon" }),
+  pause: extractSpeechSegments(table, { table_cell_joiner: "pause", pause_table_row_ms: 120 }),
+}));
+"""
+    )
+    assert out["semicolon"] == [
+        {"text": "alpha first; beta second.", "pauseMs": 150},
+        {"text": "gamma third; delta fourth.", "pauseMs": 0},
+    ]
+    # Each cell is its own clip, the row pause between cells and between rows.
+    assert out["pause"] == [
+        {"text": "alpha first.", "pauseMs": 120},
+        {"text": "beta second.", "pauseMs": 120},
+        {"text": "gamma third.", "pauseMs": 120},
+        {"text": "delta fourth.", "pauseMs": 0},
+    ]
+
+
+def test_table_header_mode_prefix_and_skip() -> None:
+    out = _run(
+        """
+const mkTable = (withThead, secondHeader) => {
+  const t = new El("table");
+  const header = new El("tr");
+  for (const text of ["Plan name", secondHeader]) {
+    const th = new El("th"); th.appendChild(new Text_(text)); header.appendChild(th);
+  }
+  if (withThead) {
+    const thead = new El("thead"); thead.appendChild(header); t.appendChild(thead);
+  } else {
+    t.appendChild(header);
+  }
+  const row = new El("tr");
+  for (const text of ["Pro tier", "Nine dollars"]) {
+    const td = new El("td"); td.appendChild(new Text_(text)); row.appendChild(td);
+  }
+  t.appendChild(row);
+  return t;
+};
+console.log(JSON.stringify({
+  row: extractSpeechSegments(mkTable(true, "Price per month")),
+  theadPrefix: extractSpeechSegments(mkTable(true, "Price per month"), { table_header_mode: "prefix" }),
+  firstRowPrefix: extractSpeechSegments(mkTable(false, "Price per month"), { table_header_mode: "prefix" }),
+  skip: extractSpeechSegments(mkTable(true, "Price per month"), { table_header_mode: "skip" }),
+  emptyHeader: extractSpeechSegments(mkTable(true, ""), { table_header_mode: "prefix" }),
+}));
+"""
+    )
+    assert out["row"] == [
+        {"text": "Plan name, Price per month.", "pauseMs": 150},
+        {"text": "Pro tier, Nine dollars.", "pauseMs": 0},
+    ]
+    assert out["theadPrefix"] == [
+        {"text": "Plan name: Pro tier, Price per month: Nine dollars.", "pauseMs": 0}
+    ]
+    assert out["firstRowPrefix"] == out["theadPrefix"]
+    assert out["skip"] == [{"text": "Pro tier, Nine dollars.", "pauseMs": 0}]
+    # An empty header cell adds no "": " prefix.
+    assert out["emptyHeader"] == [{"text": "Plan name: Pro tier, Nine dollars.", "pauseMs": 0}]
+
+
+def test_inline_code_max_chars_decides_what_is_spoken() -> None:
+    out = _run(
+        """
+const para = (codeText) => {
+  const p = new El("p");
+  p.appendChild(new Text_("Call the "));
+  const code = new El("code"); code.appendChild(new Text_(codeText)); p.appendChild(code);
+  p.appendChild(new Text_(" now please."));
+  return p;
+};
+console.log(JSON.stringify({
+  spoken: extractSpeechSegments(para("foo_bar_function")),
+  marked: extractSpeechSegments(para("foo_bar_function"), { inline_code_max_chars: 5 }),
+  raised: extractSpeechSegments(para("x".repeat(100)), { inline_code_max_chars: 500 }),
+}));
+"""
+    )
+    assert out["spoken"] == [{"text": "Call the foo_bar_function now please.", "pauseMs": 0}]
+    assert out["marked"] == [{"text": "Call the Code omitted. now please.", "pauseMs": 0}]
+    assert out["raised"] == [{"text": "Call the " + "x" * 100 + " now please.", "pauseMs": 0}]
+
+
+def test_clip_min_and_max_chars_shape_the_clips() -> None:
+    out = _run(
+        """
+const long = "alpha beta gamma delta. ".repeat(20);
+console.log(JSON.stringify({
+  separate: shapeSpeechSegments(
+    [{ text: "Summary", pauseMs: 600 }, { text: "This paragraph is long enough to stand.", pauseMs: 0 }],
+    { clip_min_chars: 0 }),
+  split: shapeSpeechSegments([{ text: long, pauseMs: 0 }], { clip_max_chars: 120 }),
+}));
+"""
+    )
+    assert out["separate"] == [
+        {"text": "Summary.", "pauseMs": 600},
+        {"text": "This paragraph is long enough to stand.", "pauseMs": 0},
+    ]
+    assert len(out["split"]) > 1
+    assert all(len(row["text"]) <= 120 for row in out["split"])
+    assert (
+        " ".join(row["text"] for row in out["split"]) == ("alpha beta gamma delta. " * 20).strip()
+    )
+
+
+def test_the_player_reads_a_reply_with_the_profiles_clip_sizes() -> None:
+    out = _run(
+        """
+stubProfile = { clip_min_chars: 0 };                 // a short line stays its own clip
+const el = new El("div"); el.className = "msg assistant";
+const body = new El("div"); body.className = "msg-body";
+const h = new El("h2"); h.appendChild(new Text_("Hi."));
+const p = new El("p"); p.appendChild(new Text_("A paragraph long enough to stand alone."));
+body.append(h); body.append(p); el.appendChild(body);
+const player = createTtsPlayer({ base: "" });
+player.play(el, new El("button"));
+await tick();
+console.log(JSON.stringify(log.fetches.filter((f) => f.method === "POST").map((f) => f.text)));
+"""
+    )
+    assert out == ["Hi.", "A paragraph long enough to stand alone."]
+
+
+def test_max_clips_comes_from_the_profile_and_is_in_the_notice() -> None:
+    out = _run(
+        """
+stubProfile = { max_clips: 2 };
+const el = new El("div"); el.className = "msg assistant";
+const body = new El("div"); body.className = "msg-body";
+for (const text of ["First paragraph is long enough.", "Second paragraph is long enough.",
+                    "Third paragraph is long enough."]) {
+  const p = new El("p"); p.appendChild(new Text_(text)); body.appendChild(p);
+}
+el.appendChild(body);
+const player = createTtsPlayer({ base: "" });
+player.play(el, new El("button"));
+await tick();
+console.log(JSON.stringify({
+  posts: log.fetches.filter((f) => f.method === "POST").length,
+  toasts: log.toasts,
+}));
+"""
+    )
+    assert out["posts"] == 2
+    assert out["toasts"] == [
+        [
+            "Read-aloud stopped after the first 2 sections; the rest of this reply was skipped.",
+            "warn",
+        ]
+    ]
