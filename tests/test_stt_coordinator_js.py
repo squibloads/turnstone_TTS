@@ -72,7 +72,9 @@ let ttsStream = null;
 // Hands-free voice mode is covered by test_voice_loop_wiring_js; here it is
 // only the pane state the sliced functions touch.
 function _voiceRefresh() {}
+function _voiceMicToggle() { return false; }
 let voiceLoop = null;
+let voiceModeOn = false, voiceAutoStop = false;
 """
 
 _COORD_FNS = "\n".join(
@@ -100,7 +102,6 @@ let staleRetryTimer = null, cancelTimeoutId = null, forceTimeoutId = null, tasks
   liveBadgeFlushTimer = null, pruneTimer = null, unmountTranscriptPresentation = null;
 const removeVisibilityHandler = () => {}, _childObserver = null, unregisterTranscriptScroller = () => {};
 const scrollFollow = { destroy() {} };
-let voiceModeOn = false;
 const voiceBtn = new El("button"), voiceStatusEl = new El("div");
 """
 
