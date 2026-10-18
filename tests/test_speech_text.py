@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 import pytest
 
-from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
-from turnstone.core.voice_config import DictionaryEntry, parse_dictionary
+from turnstone.core.speech_text import (
+    _RULES,
+    _sub_with_segments,
+    normalize_for_speech,
+    parse_pronunciations,
+    preview_for_speech,
+)
+from turnstone.core.voice_config import (
+    CLEANUP_GROUPS,
+    CleanupOptions,
+    DictionaryEntry,
+    RewriteRule,
+    SpeechPreview,
+    expand_rewrite,
+    parse_dictionary,
+)
 
 RULE_CASES: list[tuple[str, str]] = [
     # symbols
@@ -135,7 +150,7 @@ RULE_CASES: list[tuple[str, str]] = [
     ("on 192.168.100.203", "on 192 point 168 point 100 point 203"),
     ("on 192.168.1.203", "on 192 point 168 point 1 point 203"),
     # file names with a common extension
-    ("open speech_text.py now", "open speech_text dot py now"),
+    ("open speech_text.py now", "open speech text dot py now"),
     ("see README.md and app.config.ts", "see README dot md and app.config dot ts"),
     ("a Node.js app", "a Node dot js app"),
     ("see README.md.sh", "see README dot md dot sh"),
@@ -413,9 +428,9 @@ class TestUnicodeCaseFolds:
         normalize_for_speech("İs it", {"is": "X"})
 
 
-def _elapsed(text: str) -> float:
+def _elapsed(text: str, options: CleanupOptions | None = None) -> float:
     start = time.perf_counter()
-    normalize_for_speech(text)
+    normalize_for_speech(text, options=options)
     return time.perf_counter() - start
 
 
@@ -445,3 +460,314 @@ def test_timing_file_name_rule() -> None:
 def test_timing_arrow_and_decade_runs() -> None:
     assert _elapsed("a " + "-" * 50_000 + "> b") < 0.2
     assert _elapsed("10s, " * 10_000) < 1.0  # measured ~0.17 s: decade walk
+
+
+# -- cleanup groups -----------------------------------------------------------
+
+
+def test_every_rule_row_has_a_known_group() -> None:
+    known = {group.id for group in CLEANUP_GROUPS}
+    tagged = {group for group, _pattern, _repl in _RULES}
+    assert tagged <= known
+    # identifiers runs as its own stage, so it need not own a _RULES row.
+    assert known - {"identifiers"} <= tagged
+
+
+@pytest.mark.parametrize(
+    ("group", "text"),
+    [
+        ("phone_numbers", "call 555-123-4567"),
+        ("dates", "on 2026-10-16"),
+        ("file_names", "open notes.txt"),
+        ("versions", "upgrade to v1.8.5"),
+        ("symbols", "~5 users"),
+        ("dimensions", "a 1024x768 screen"),
+        ("units", "120ms and 32GB"),
+        ("seconds_decades", "timeout is 60s"),
+        ("ranges", "takes 10-20 minutes"),
+        ("abbreviations", "e.g. this"),
+        ("identifiers", "user_id"),
+    ],
+)
+def test_disabling_a_group_skips_its_rules(group: str, text: str) -> None:
+    options = CleanupOptions(disabled_groups=frozenset({group}))
+    assert normalize_for_speech(text, options=options) == text
+
+
+def test_disabling_one_group_leaves_the_others_running() -> None:
+    options = CleanupOptions(disabled_groups=frozenset({"units"}))
+    assert normalize_for_speech("~5 files at 32GB", options=options) == "about 5 files at 32GB"
+
+
+def test_builtin_terms_off_leaves_those_terms_alone() -> None:
+    options = CleanupOptions(builtin_terms_off=frozenset({"YAML", "JSON"}))
+    assert normalize_for_speech("edit YAML and JSON", options=options) == "edit YAML and JSON"
+    assert normalize_for_speech("run systemctl", options=options) == "run system control"
+
+
+def test_builtin_term_off_does_not_block_an_operator_respelling() -> None:
+    options = CleanupOptions(builtin_terms_off=frozenset({"YAML"}))
+    assert normalize_for_speech("edit YAML", {"YAML": "yah-mul"}, options=options) == "edit yah-mul"
+    entries = [_entry("YAML", "why-ammel")]
+    assert normalize_for_speech("edit YAML", None, entries, options) == "edit why-ammel"
+
+
+# -- identifiers --------------------------------------------------------------
+
+IDENTIFIER_ACRONYMS = (
+    "ai",
+    "api",
+    "id",
+    "db",
+    "ui",
+    "url",
+    "uri",
+    "io",
+    "os",
+    "cpu",
+    "gpu",
+    "llm",
+    "tts",
+    "stt",
+    "json",
+    "http",
+    "sql",
+    "ssh",
+    "vm",
+    "ip",
+    "phi",
+    "pii",
+    "aws",
+    "ssl",
+    "tls",
+    "cli",
+    "sdk",
+    "jwt",
+    "mcp",
+    "ado",
+    "pr",
+    "ci",
+)
+
+
+@pytest.mark.parametrize(
+    ("src", "expected"),
+    [
+        ("user_id", "user ID"),
+        ("aid_kit", "aid kit"),
+        ("myplace_health_ai_use_context", "myplace health AI use context"),
+        ("__init__", "init"),
+        ("_private_var", "private var"),
+        ("a__b", "a b"),
+        ("trace_2026_10_18", "trace 2026 10 18"),
+        ("api_url and db_host", "API URL and DB host"),
+        ("gpu_tts_mcp", "GPU TTS MCP"),
+        ("speech_text.py", "speech text dot py"),
+        ("voice_dictionary.js", "voice dictionary dot js"),
+        ("café_a", "café a"),
+        # no ASCII letter or digit beside an underscore: left alone, like qwen-tts
+        ("café_", "café_"),
+        ("k8s", "k8s"),
+        ("x _ y", "x _ y"),
+    ],
+)
+def test_identifiers_read_snake_case_as_words(src: str, expected: str) -> None:
+    assert normalize_for_speech(src) == expected
+
+
+@pytest.mark.parametrize("acronym", IDENTIFIER_ACRONYMS)
+def test_identifiers_spell_every_known_acronym_in_capitals(acronym: str) -> None:
+    # "json" is also a built-in term, so switch that layer off to see the
+    # group's own capitalisation.
+    options = CleanupOptions(builtin_terms_off=frozenset({"JSON"}))
+    assert normalize_for_speech(f"x_{acronym}_y", options=options) == f"x {acronym.upper()} y"
+
+
+def test_identifiers_run_before_the_builtin_term_layer() -> None:
+    assert normalize_for_speech("x_json_y") == "x jay-son y"
+
+
+def test_timing_long_word_run_with_identifiers() -> None:
+    # The qwen-tts pattern backtracks quadratically on a long word run; the
+    # boundary form used here must stay linear.
+    assert _elapsed("a" * 50_000) < 0.2
+
+
+# -- custom rewrite rules -----------------------------------------------------
+
+
+def _rule(
+    find: str, replace: str = "", *, regex: bool = False, enabled: bool = True
+) -> RewriteRule:
+    return RewriteRule(find=find, regex=regex, replace=replace, test="", enabled=enabled)
+
+
+def test_custom_rules_run_after_the_cleanup_groups() -> None:
+    options = CleanupOptions(rules=(_rule("gigabytes", "GBs"),))
+    assert normalize_for_speech("needs 32GB", options=options) == "needs 32 GBs"
+
+
+def test_custom_rules_run_before_the_pronunciation_layer() -> None:
+    options = CleanupOptions(rules=(_rule("why ammel", "YAML"),))
+    assert normalize_for_speech("say why ammel", options=options) == "say yammel"
+
+
+def test_custom_rules_run_in_order_and_see_the_previous_output() -> None:
+    options = CleanupOptions(rules=(_rule("foo", "bar"), _rule("bar", "baz")))
+    assert normalize_for_speech("foo", options=options) == "baz"
+
+
+def test_only_enabled_custom_rules_run() -> None:
+    options = CleanupOptions(rules=(_rule("foo", "bar", enabled=False), _rule("bar", "baz")))
+    assert normalize_for_speech("foo bar", options=options) == "foo baz"
+
+
+def test_plain_rule_is_whole_word_and_ignores_case() -> None:
+    options = CleanupOptions(rules=(_rule("K8s", "kubernetes"),))
+    assert normalize_for_speech("K8S and k8sx", options=options) == "kubernetes and k8sx"
+
+
+def test_regex_rule_expands_groups() -> None:
+    options = CleanupOptions(rules=(_rule(r"(\d+)px", r"\1 pixels", regex=True),))
+    assert normalize_for_speech("at 10px and 2px", options=options) == "at 10 pixels and 2 pixels"
+
+
+def test_a_rule_that_no_longer_compiles_is_skipped() -> None:
+    bad = RewriteRule(find="(bad", regex=True, replace="x", test="", enabled=True)
+    options = CleanupOptions(rules=(bad, _rule("foo", "bar")))
+    assert normalize_for_speech("foo", options=options) == "bar"
+
+
+def test_zero_length_matches_are_skipped() -> None:
+    # The public write path rejects a pattern that matches empty text; a
+    # directly-built CleanupOptions can still carry one, so the engine guards.
+    rule = RewriteRule(find="x*", regex=True, replace="Y", test="", enabled=True)
+    pattern = re.compile("x*")
+    text, _segments = _sub_with_segments(pattern, lambda match: expand_rewrite(rule, match), "axxb")
+    assert text == "aYb"
+
+
+def test_timing_one_hundred_custom_rules_on_a_long_input() -> None:
+    rules = tuple(_rule(f"word{i}", f"term{i}") for i in range(100))
+    text = " ".join(f"word{i}" for i in range(100)) * 20
+    assert _elapsed(text, CleanupOptions(rules=rules)) < 1.0
+
+
+# -- preview ------------------------------------------------------------------
+
+
+def _assert_spans(preview: SpeechPreview) -> None:
+    last = 0
+    for span in preview.spans:
+        assert 0 <= span.start < span.end <= len(preview.text)
+        assert span.start >= last
+        assert span.source in {"group", "custom", "dictionary"}
+        assert span.label
+        last = span.end
+
+
+PREVIEW_CORPUS = [src for src, _expected in RULE_CASES] + [
+    "user_id and aid_kit at 32GB",
+    "v1.8.5 needs 1.000.000 rows, e.g. on 2026-10-16",
+    "__init__ calls myplace_health_ai_use_context",
+    "5-10ms, 300W, ~50%, ±3",
+    "Use SQL and the YAML file",
+    "No changes here at all.",
+    "",
+]
+
+
+@pytest.mark.parametrize("src", PREVIEW_CORPUS)
+def test_preview_text_matches_normalize_for_speech(src: str) -> None:
+    assert preview_for_speech(src).text == normalize_for_speech(src)
+
+
+@pytest.mark.parametrize("src", PREVIEW_CORPUS)
+def test_preview_spans_are_sorted_disjoint_and_inside_the_text(src: str) -> None:
+    _assert_spans(preview_for_speech(src))
+
+
+def test_preview_text_matches_normalize_with_options() -> None:
+    options = CleanupOptions(
+        disabled_groups=frozenset({"units"}),
+        rules=(_rule("Postgres", "postgres"), _rule("SQL", "sequel", enabled=False)),
+        builtin_terms_off=frozenset({"YAML"}),
+    )
+    entries = [_entry("nginx", "engine ex")]
+    text = "Postgres nginx 32GB YAML SQL"
+    preview = preview_for_speech(text, None, entries, options)
+    assert preview.text == normalize_for_speech(text, None, entries, options)
+    _assert_spans(preview)
+
+
+def test_preview_labels_a_group_change() -> None:
+    preview = preview_for_speech("Needs 32GB")
+    assert preview.text == "Needs 32 gigabytes"
+    assert [(span.source, span.label) for span in preview.spans] == [("group", "units")]
+    span = preview.spans[0]
+    assert preview.text[span.start : span.end] == " gigabytes"
+
+
+def test_preview_labels_identifiers() -> None:
+    preview = preview_for_speech("user_id")
+    assert [(span.source, span.label) for span in preview.spans] == [("group", "identifiers")]
+    assert preview.text == "user ID"
+
+
+def test_preview_labels_a_custom_rule_by_its_stored_position() -> None:
+    options = CleanupOptions(rules=(_rule("first", "1st"), _rule("Postgres", "postgres")))
+    preview = preview_for_speech("Postgres", options=options)
+    assert [(span.source, span.label) for span in preview.spans] == [("custom", "custom 2")]
+
+
+def test_preview_numbers_rules_across_disabled_ones() -> None:
+    options = CleanupOptions(
+        rules=(_rule("first", "1st", enabled=False), _rule("Postgres", "postgres"))
+    )
+    preview = preview_for_speech("Postgres", options=options)
+    assert [(span.source, span.label) for span in preview.spans] == [("custom", "custom 2")]
+
+
+def test_preview_labels_the_pronunciation_layer_as_dictionary() -> None:
+    built_in = preview_for_speech("the YAML file")
+    assert built_in.text == "the yammel file"
+    assert [(span.source, span.label) for span in built_in.spans] == [("dictionary", "dictionary")]
+    entry = preview_for_speech("Use SQL", None, [_entry("SQL", "sequel")])
+    assert [(span.source, span.label) for span in entry.spans] == [("dictionary", "dictionary")]
+
+
+def test_preview_keeps_separate_spans_for_separate_changes() -> None:
+    preview = preview_for_speech("32GB at 120ms")
+    assert [(span.source, span.label) for span in preview.spans] == [
+        ("group", "units"),
+        ("group", "units"),
+    ]
+    covered = "".join(preview.text[span.start : span.end] for span in preview.spans)
+    assert covered == " gigabytes milliseconds"
+
+
+def test_preview_covers_every_changed_stretch_of_text() -> None:
+    preview = preview_for_speech("user_id needs 32GB")
+    covered = "".join(preview.text[span.start : span.end] for span in preview.spans)
+    assert covered == "user ID gigabytes"
+
+
+def test_preview_reports_no_spans_for_unchanged_text() -> None:
+    preview = preview_for_speech("Hello there.")
+    assert preview.text == "Hello there."
+    assert preview.spans == ()
+
+
+def test_preview_does_not_label_a_no_op_rule() -> None:
+    options = CleanupOptions(rules=(_rule("SQL", "SQL"),))
+    assert preview_for_speech("Use SQL", options=options).spans == ()
+
+
+def test_preview_carries_group_spans_through_a_later_rule() -> None:
+    options = CleanupOptions(rules=(_rule("point", "dot"),))
+    preview = preview_for_speech("v1.2.3", options=options)
+    assert preview.text == "version 1 dot 2 dot 3"
+    _assert_spans(preview)
+    labels = {span.label for span in preview.spans}
+    assert "versions" in labels
+    assert "custom 1" in labels

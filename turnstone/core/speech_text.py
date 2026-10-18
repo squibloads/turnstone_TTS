@@ -39,12 +39,19 @@ import datetime
 import re
 from typing import TYPE_CHECKING
 
-from turnstone.core.voice_config import BUILTIN_TERMS
+from turnstone.core.voice_config import (
+    BUILTIN_TERMS,
+    CleanupOptions,
+    PreviewSpan,
+    SpeechPreview,
+    compile_rewrite_rule,
+    expand_rewrite,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
-    from turnstone.core.voice_config import CleanupOptions, DictionaryEntry, SpeechPreview
+    from turnstone.core.voice_config import DictionaryEntry, RewriteRule
 
 
 def _speak_version(match: re.Match[str]) -> str:
@@ -147,6 +154,36 @@ def _speak_phone(match: re.Match[str]) -> str:
     return ", ".join(" ".join(group) for group in match.groups())
 
 
+# Parts of a snake_case name that are said as initials rather than words.  The
+# set is the qwen-tts backend's ``speakable()`` list, so a name that backend
+# already read well sounds the same here.
+_IDENTIFIER_ACRONYMS = frozenset(
+    {
+        "ai", "api", "id", "db", "ui", "url", "uri", "io", "os", "cpu", "gpu",
+        "llm", "tts", "stt", "json", "http", "sql", "ssh", "vm", "ip", "phi",
+        "pii", "aws", "ssl", "tls", "cli", "sdk", "jwt", "mcp", "ado", "pr", "ci",
+    }
+)  # fmt: skip
+
+# The qwen-tts backend matches identifiers with
+# ``\w*[A-Za-z0-9]_\w*|\w*_[A-Za-z0-9]\w*``.  That form backtracks
+# quadratically on a long word run, so this is the same set of matches written
+# with boundaries: one whole word run, taken only when an ASCII alphanumeric
+# sits next to an underscore.
+_IDENTIFIER = re.compile(r"(?<!\w)(?=\w*(?:[A-Za-z0-9]_|_[A-Za-z0-9]))\w+")
+
+
+def _speak_identifier(match: re.Match[str]) -> str:
+    # Leading and trailing underscores are separators, not words: "__init__"
+    # is "init".  Interior empty parts ("a__b") collapse the same way.
+    parts = [part for part in match.group(0).split("_") if part]
+    if not parts:
+        return match.group(0)
+    return " ".join(
+        part.upper() if part.lower() in _IDENTIFIER_ACRONYMS else part for part in parts
+    )
+
+
 # Technical terms most voices mangle, as plain respellings that work on every
 # backend.  Universal terms only; an operator's audio.tts_pronunciations entry
 # or a dictionary entry for the same word wins.  The list lives in voice_config
@@ -154,31 +191,36 @@ def _speak_phone(match: re.Match[str]) -> str:
 _TECH_TERMS = dict(BUILTIN_TERMS)
 
 
-# Ordered (pattern, replacement); a replacement is a string or a callback.
-# Order matters: ``GB/s`` before ``GB`` and ``s``.  Phone numbers, ISO dates, file
-# names and the version rows come first so no later rule (ranges, units, "x")
-# can eat their digits.
-_RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = tuple(
-    (re.compile(pattern), repl)
-    for pattern, repl in (
+# Ordered (group, pattern, replacement); a replacement is a string or a
+# callback.  Order matters: ``GB/s`` before ``GB`` and ``s``.  Phone numbers,
+# ISO dates, file names and the version rows come first so no later rule
+# (ranges, units, "x") can eat their digits.  The group names the switch in
+# ``audio.tts_cleanup_disabled``; a disabled group skips all of its rows.
+_RULES: tuple[tuple[str, re.Pattern[str], str | Callable[[re.Match[str]], str]], ...] = tuple(
+    (group, re.compile(pattern), repl)
+    for group, pattern, repl in (
         # ten-digit phone numbers and ISO dates first: later rules would read
         # their parts as ranges or versions
         (
+            "phone_numbers",
             r"(?<![\w.(-])(?<!(?<!\+)\b1[ -])\(?(\d{3})\)?[\s.-]?(\d{3})[\s.-](\d{4})(?![\w-]|\.\w)",
             _speak_phone,
         ),
         (
+            "dates",
             r"(?<![\w.-])(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?![\w-]|\.\w)",
             _speak_iso_date,
         ),
         # year-month ("2026-10"); a pair of years ("2020-2025") stays a range
         (
+            "dates",
             r"(?<![\w.-])((?:19|20)\d\d)-(0[1-9]|1[0-2])(?![\w/-]|\.\w)",
             _speak_year_month,
         ),
         # file names: only the dot before a listed extension, so there is no
         # repetition for the engine to backtrack over ("speech_text.py")
         (
+            "file_names",
             r"(?<=[\w-])\.(?=(?i:py|js|mjs|ts|tsx|jsx|md|json|ya?ml|toml|txt|sh|html|css|sql"
             r"|csv|log|ini|cfg|rs|go|java|rb|php)\b)",
             " dot ",
@@ -186,49 +228,57 @@ _RULES: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]], ...]
         # versions: 3+ dotted parts only (two-part decimals like "13.9" read fine).
         # The possessive group keeps long dotted chains linear and the date guard
         # leaves 16.10.2026 alone.
-        (r"\bv(?=\d+(?:\.\d+){2,})", "version "),
-        (r"(?<![\w.])\d+(?:\.\d+){2,}+(?<!\.\d{4})(?![\w.]*\d|-\d)", _speak_version),
+        ("versions", r"\bv(?=\d+(?:\.\d+){2,})", "version "),
+        (
+            "versions",
+            r"(?<![\w.])\d+(?:\.\d+){2,}+(?<!\.\d{4})(?![\w.]*\d|-\d)",
+            _speak_version,
+        ),
         # symbols
-        (r"~\s*(?=\d)", "about "),
+        ("symbols", r"~\s*(?=\d)", "about "),
         # lookbehind + possessive tail stop quadratic backtracking on long blanks
-        (r"(?<!\s)\s*(?:--?>|→)(?:\s*+(?!--?>|→))?", " to "),
-        (r"(?<=\d)\s*×\s*(?=\d)", " by "),
-        (r"(?<![\w.])(?!0x)(\d+(?:x\d+)+)(s?)(?!\w)", _speak_dimensions),
-        (r"≈\s*", "approximately "),
-        (r"±\s*", "plus-or-minus "),  # hyphenated: Kokoro paused after "plus"
-        (r"(?<=\d)\s*%", " percent"),
+        ("symbols", r"(?<!\s)\s*(?:--?>|→)(?:\s*+(?!--?>|→))?", " to "),
+        # dimensions: the multiplication sign and the NxM form switch together
+        ("dimensions", r"(?<=\d)\s*×\s*(?=\d)", " by "),
+        ("dimensions", r"(?<![\w.])(?!0x)(\d+(?:x\d+)+)(s?)(?!\w)", _speak_dimensions),
+        ("symbols", r"≈\s*", "approximately "),
+        ("symbols", r"±\s*", "plus-or-minus "),  # hyphenated: Kokoro paused after "plus"
+        ("symbols", r"(?<=\d)\s*%", " percent"),
         # units (case-sensitive: "MB" is not "mb"); rates before their parts
-        (r"(?<=\d)\s*GB/s\b", " gigabytes per second"),
-        (r"(?<=\d)\s*MB/s\b", " megabytes per second"),
-        (r"(?<=\d)\s*GiB\b", " gibibytes"),
-        (r"(?<=\d)\s*MiB\b", " mebibytes"),
-        (r"(?<=\d)\s*GB\b", " gigabytes"),
-        (r"(?<=\d)\s*MB\b", " megabytes"),
-        (r"(?<=\d)\s*[kK]B\b", " kilobytes"),
-        (r"(?<=\d)\s*TB\b", " terabytes"),
-        (r"(?<=\d)\s*GHz\b", " gigahertz"),
-        (r"(?<=\d)\s*MHz\b", " megahertz"),
-        (r"(?<=\d)\s*ms\b", " milliseconds"),
-        (r"(?<=\d)\s*min\b", " minutes"),
+        ("units", r"(?<=\d)\s*GB/s\b", " gigabytes per second"),
+        ("units", r"(?<=\d)\s*MB/s\b", " megabytes per second"),
+        ("units", r"(?<=\d)\s*GiB\b", " gibibytes"),
+        ("units", r"(?<=\d)\s*MiB\b", " mebibytes"),
+        ("units", r"(?<=\d)\s*GB\b", " gigabytes"),
+        ("units", r"(?<=\d)\s*MB\b", " megabytes"),
+        ("units", r"(?<=\d)\s*[kK]B\b", " kilobytes"),
+        ("units", r"(?<=\d)\s*TB\b", " terabytes"),
+        ("units", r"(?<=\d)\s*GHz\b", " gigahertz"),
+        ("units", r"(?<=\d)\s*MHz\b", " megahertz"),
+        ("units", r"(?<=\d)\s*ms\b", " milliseconds"),
+        ("units", r"(?<=\d)\s*min\b", " minutes"),
         # attached only: "300W" is watts, "123 W Main Street" is a compass point
-        (r"(?<=\d)W\b", " watts"),
+        ("units", r"(?<=\d)W\b", " watts"),
         # "13.9 s", "3s" and "60s" are seconds; "1990s" and "the 80s" are decades
         # (see _is_decade).  Not inside a word: "k8s" stays.
-        (r"(?<=\d)\s+s\b", " seconds"),
-        (r"(?<![\w.])(\d+(?:\.\d+)?)s\b", _seconds_unless_decade),
+        ("units", r"(?<=\d)\s+s\b", " seconds"),
+        ("seconds_decades", r"(?<![\w.])(\d+(?:\.\d+)?)s\b", _seconds_unless_decade),
         # numeric ranges, but not dates (2026-10-16), version/decimal tails,
         # identifiers (Qwen3-8B) or calibers (30-06: a right side starting 0)
-        (r"(?<![\w.-])(\d+)-(?!0)(\d+)(?![\w/-]|\.\w)", "\\1 to \\2"),
+        ("ranges", r"(?<![\w.-])(\d+)-(?!0)(\d+)(?![\w/-]|\.\w)", "\\1 to \\2"),
         # abbreviations
-        (r"\be\.g\.", "for example"),
-        (r"\bi\.e\.", "that is"),
+        ("abbreviations", r"\be\.g\.", "for example"),
+        ("abbreviations", r"\bi\.e\.", "that is"),
         # "etc." keeps its full stop unless the sentence clearly carries on
-        (r"\betc\.(?=\s*[,;:)]|\s+[a-z])", "et cetera"),
-        (r"\betc\.", "et cetera."),
+        ("abbreviations", r"\betc\.(?=\s*[,;:)]|\s+[a-z])", "et cetera"),
+        ("abbreviations", r"\betc\.", "et cetera."),
         # like "etc.", a sentence-final "vs." keeps its full stop
-        (r"\bvs\.(?=\s*[,;:)]|\s+[a-z])", "versus"),
-        (r"\bvs\.", "versus."),
-        (r"\bvs\b", "versus"),
+        ("abbreviations", r"\bvs\.(?=\s*[,;:)]|\s+[a-z])", "versus"),
+        ("abbreviations", r"\bvs\.", "versus."),
+        ("abbreviations", r"\bvs\b", "versus"),
+        # identifiers last: the rules above must see dotted file names and
+        # versions as written, before their underscores become spaces
+        ("identifiers", _IDENTIFIER, _speak_identifier),
     )
 )
 
@@ -273,16 +323,22 @@ _Replacement = tuple[str, str, bool]
 def _replacement_rows(
     pronunciations: Mapping[str, str] | None,
     dictionary: Sequence[DictionaryEntry] | None,
+    builtin_terms_off: frozenset[str] = frozenset(),
 ) -> list[_Replacement]:
     """Collect every respelling into one precedence-ordered row list.
 
     Later sources win: built-in technical terms, then the legacy
     ``audio.tts_pronunciations`` mapping, then dictionary entries.  A
     dictionary entry without a respelling is dictation-only and is skipped.
+    Terms named in *builtin_terms_off* are left out of the built-in layer; an
+    operator respelling or dictionary entry for the same word still applies.
     """
     # Keys match case-insensitively, so merge them folded: an operator's "yaml"
     # replaces the built-in "YAML".
-    folded: dict[str, str] = {key.lower(): value for key, value in _TECH_TERMS.items()}
+    off = {name.lower() for name in builtin_terms_off}
+    folded: dict[str, str] = {
+        key.lower(): value for key, value in _TECH_TERMS.items() if key.lower() not in off
+    }
     if pronunciations:
         folded.update({key.lower(): value for key, value in pronunciations.items() if key})
     exact: dict[str, str] = {}
@@ -302,8 +358,54 @@ def _replacement_rows(
     return rows
 
 
-def _apply_replacements(text: str, rows: Sequence[_Replacement]) -> str:
-    """Replace whole-word keys in a single pass.
+# One stage's edit map: ("same" | "change", old_start, old_end, new_start,
+# new_end).  Every character of the input and the output appears in exactly one
+# segment, so a later stage can carry the preview's labels through an edit.
+_Segment = tuple[str, int, int, int, int]
+
+
+def _sub_with_segments(
+    pattern: re.Pattern[str],
+    repl: str | Callable[[re.Match[str]], str],
+    text: str,
+) -> tuple[str, list[_Segment]]:
+    """Apply *pattern* and return the text plus an input→output edit map.
+
+    Mirrors ``pattern.sub`` for the non-empty matches this engine uses, and
+    skips zero-length matches: a rewrite rule must never insert its
+    replacement between every character.  A match whose replacement equals the
+    matched text is recorded as unchanged, so the preview does not label no-ops.
+    """
+    pieces: list[str] = []
+    segments: list[_Segment] = []
+    position = 0
+    size = 0
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        if start == end:
+            continue
+        replacement = match.expand(repl) if isinstance(repl, str) else repl(match)
+        if start > position:
+            unchanged = text[position:start]
+            pieces.append(unchanged)
+            segments.append(("same", position, start, size, size + len(unchanged)))
+            size += len(unchanged)
+        if replacement == text[start:end]:
+            segments.append(("same", start, end, size, size + len(replacement)))
+        else:
+            segments.append(("change", start, end, size, size + len(replacement)))
+        pieces.append(replacement)
+        size += len(replacement)
+        position = end
+    if position < len(text):
+        unchanged = text[position:]
+        pieces.append(unchanged)
+        segments.append(("same", position, len(text), size, size + len(unchanged)))
+    return "".join(pieces), segments
+
+
+def _apply_replacements(text: str, rows: Sequence[_Replacement]) -> tuple[str, list[_Segment]]:
+    """Replace whole-word keys in a single pass; returns the text and its edits.
 
     One alternation (longest key first) keeps a respelling from being
     re-substituted by another key, so the result does not depend on input
@@ -312,7 +414,7 @@ def _apply_replacements(text: str, rows: Sequence[_Replacement]) -> str:
     rescanned.
     """
     if not rows:
-        return text
+        return text, []
     alternation = "|".join(
         f"((?i:{re.escape(key)}))" if not match_case else f"({re.escape(key)})"
         for key, _value, match_case in rows
@@ -321,18 +423,72 @@ def _apply_replacements(text: str, rows: Sequence[_Replacement]) -> str:
     # One capturing group per key: the group index names the value directly, so
     # a Unicode case fold ("ſ" matching "s") cannot miss a re-derived dict key.
     pattern = re.compile(r"(?<!\w)(?:" + alternation + r")(?!\w)")
-    return pattern.sub(lambda m: values[(m.lastindex or 1) - 1], text)
+    return _sub_with_segments(pattern, lambda m: values[(m.lastindex or 1) - 1], text)
+
+
+def _rewrite_replacement(rule: RewriteRule, match: re.Match[str]) -> str:
+    """The expansion for one custom-rule match, tolerating a stale template.
+
+    The write path validates the replacement, but a ``\\N`` can still name an
+    optional group the match did not take; leaving that match alone is better
+    than failing read-aloud.
+    """
+    try:
+        return expand_rewrite(rule, match)
+    except (re.error, IndexError):
+        return match.group(0)
+
+
+def _speech_stages(
+    text: str,
+    pronunciations: Mapping[str, str] | None,
+    dictionary: Sequence[DictionaryEntry] | None,
+    options: CleanupOptions,
+) -> Iterator[tuple[str, str, str, list[_Segment]]]:
+    """Run the cleanup pipeline one stage at a time.
+
+    Each yield is ``(new_text, source, label, segments)``; *segments* maps the
+    previous text to *new_text* so ``preview_for_speech`` can carry its labels
+    through later stages.  ``source`` and ``label`` name the stage that made
+    the edit: a cleanup group, a custom rule (1-based over the full stored
+    list) or the pronunciation layer.
+    """
+    for group, pattern, repl in _RULES:
+        if group in options.disabled_groups:
+            continue
+        text, segments = _sub_with_segments(pattern, repl, text)
+        yield text, "group", group, segments
+    for index, rule in enumerate(options.rules, start=1):
+        if not rule.enabled:
+            continue
+        try:
+            pattern = compile_rewrite_rule(rule)
+        except ValueError:
+            continue  # a stored rule that no longer compiles is skipped, not fatal
+
+        def replace(match: re.Match[str], rule: RewriteRule = rule) -> str:
+            return _rewrite_replacement(rule, match)
+
+        text, segments = _sub_with_segments(pattern, replace, text)
+        yield text, "custom", f"custom {index}", segments
+    text, segments = _apply_replacements(
+        text, _replacement_rows(pronunciations, dictionary, options.builtin_terms_off)
+    )
+    yield text, "dictionary", "dictionary", segments
 
 
 def normalize_for_speech(
     text: str,
     pronunciations: Mapping[str, str] | None = None,
     dictionary: Sequence[DictionaryEntry] | None = None,
+    options: CleanupOptions | None = None,
 ) -> str:
     """Rewrite symbols, units and versions in *text* into speakable English.
 
-    Respellings run last so they can override anything the rules produced.
-    Precedence, strongest first: *dictionary* entries, the legacy
+    *options* selects which cleanup groups run and which stored rewrite rules
+    apply; ``None`` means every group on, no custom rules and every built-in
+    term.  Respellings run last so they can override anything the rules
+    produced.  Precedence, strongest first: *dictionary* entries, the legacy
     *pronunciations* mapping, then the built-in technical terms.  Dictionary
     keys match whole-word and case-insensitively unless ``match_case`` is set,
     in which case only the exact case matches.  Entries without a
@@ -340,9 +496,51 @@ def normalize_for_speech(
     the entry's ``respelling`` is read aloud (sending IPA to a model that
     accepts it is out of scope here).
     """
-    for pattern, repl in _RULES:
-        text = pattern.sub(repl, text)
-    return _apply_replacements(text, _replacement_rows(pronunciations, dictionary))
+    normalized = text
+    for stage_text, _source, _label, _segments in _speech_stages(
+        text, pronunciations, dictionary, options or CleanupOptions()
+    ):
+        normalized = stage_text
+    return normalized
+
+
+# A label for one output character, or None when no stage changed it yet.
+# Coalescing runs of a label gives the preview's spans.
+_Annotation = tuple[str, str] | None
+
+
+def _carry_annotations(
+    annotations: Sequence[_Annotation],
+    length: int,
+    segments: Sequence[_Segment],
+    source: str,
+    label: str,
+) -> list[_Annotation]:
+    """Map the preview's per-character labels through one stage's edit map."""
+    tag: _Annotation = (source, label)
+    carried: list[_Annotation] = [None] * length
+    for kind, old_start, old_end, new_start, new_end in segments:
+        if kind == "same":
+            carried[new_start:new_end] = annotations[old_start:old_end]
+        else:
+            carried[new_start:new_end] = [tag] * (new_end - new_start)
+    return carried
+
+
+def _spans_from_annotations(annotations: Sequence[_Annotation]) -> tuple[PreviewSpan, ...]:
+    """Coalesce per-character labels into sorted, non-overlapping spans."""
+    spans: list[PreviewSpan] = []
+    start = 0
+    current: _Annotation = None
+    for index, tag in enumerate(annotations):
+        if tag == current:
+            continue
+        if current is not None:
+            spans.append(PreviewSpan(start, index, current[0], current[1]))
+        start, current = index, tag
+    if current is not None:
+        spans.append(PreviewSpan(start, len(annotations), current[0], current[1]))
+    return tuple(spans)
 
 
 def preview_for_speech(
@@ -355,6 +553,22 @@ def preview_for_speech(
 
     Contract for the Text cleanup tab: ``.text`` is exactly what
     ``normalize_for_speech(text, pronunciations, dictionary, options)`` returns.
-    Implemented by the cleanup-engine slice.
+    Both run the same stage pipeline, so the preview can never drift from what
+    the TTS model receives.
+
+    Spans come from labelling every output character while the stages run: the
+    characters a stage rewrites take that stage's label, and characters it
+    leaves alone keep the label an earlier stage gave them.  When two stages
+    rewrite the same characters the later label wins, so a label is approximate
+    where changes overlap; the spans themselves stay sorted, disjoint and
+    inside the text.
     """
-    raise NotImplementedError
+    options = options or CleanupOptions()
+    annotations: list[_Annotation] = [None] * len(text)
+    for new_text, source, label, segments in _speech_stages(
+        text, pronunciations, dictionary, options
+    ):
+        if new_text != text:
+            annotations = _carry_annotations(annotations, len(new_text), segments, source, label)
+        text = new_text
+    return SpeechPreview(text, _spans_from_annotations(annotations))
