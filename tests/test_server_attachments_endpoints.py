@@ -1248,6 +1248,7 @@ class TestTextToSpeech:
             "instructions_supported": False,
             "playback_rate": 1.0,
             "profile": profile_json(DEFAULT_PROFILE),
+            "stream": False,
         }
 
     def test_style_instruction_reaches_the_backend_when_capable(self, voice_app_client):

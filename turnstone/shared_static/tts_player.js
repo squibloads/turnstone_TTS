@@ -3,9 +3,10 @@
 //
 //  The speech pipeline lifted out of the interactive pane so the coordinator
 //  pane reads replies aloud the same way: the voice-role probe, the pure
-//  reply-to-clips walker, the speaker button on finished replies, and the
+//  reply-to-clips walker, the speaker button on finished replies, the
 //  segmented player (one fetch in flight, prefetch one ahead, one reused Audio
-//  element, token-based cancellation).
+//  element, token-based cancellation), and the streaming feeder that reads a
+//  live reply a completed sentence at a time.
 //
 //  Transport is one knob: `base` is "" for a same-origin pane and
 //  "/node/{id}" when the console proxies a node-hosted session, exactly as the
@@ -94,6 +95,15 @@ export function getTtsPlaybackRate(base) {
 // profiles existed — a model with no profile sounds exactly as it did.
 export function getTtsProfile(base) {
   return _ttsConfig(base).then((d) => _normalizeProfile(d && d.profile));
+}
+
+// Whether read-aloud speaks a reply while it is still being written
+// (audio.tts_stream).  It rides the styles probe like the playback rate and
+// the profile: one read-aloud config fetch per base per page.  A failed probe,
+// a server that predates the field and an explicit false all read as off, so
+// the old finished-reply behaviour is the fallback, never a broken player.
+export function getTtsStreamEnabled(base) {
+  return _ttsConfig(base).then((d) => !!(d && d.stream === true));
 }
 
 // The built-in profile.  Bounds, defaults and choices mirror TtsProfile,
@@ -875,6 +885,116 @@ export function shapeSpeechSegments(raw, profile) {
   return out;
 }
 
+// ===========================================================================
+//  Streaming read-aloud: deltas -> completed clips
+// ===========================================================================
+
+// Where a streaming reply may be cut.  These are the marks the shaper treats
+// as terminal punctuation (ENDS_SENTENCE); the feeder only decides WHERE a
+// sentence ends, and shapeSpeechSegments still does the cleanup, the added
+// period and the long-clip wrapping.  A line break is a clip too: markdown
+// headings, list items and table rows end on one, and waiting for the next
+// paragraph's period would keep the first audio silent.
+const STREAM_MARKS = ".!?:\u2026";
+const STREAM_CLOSERS = "\x22\x27)\\]\u201d\u2019";
+// A period inside an abbreviation or an initial is not a sentence end.  The
+// test is deliberately conservative: a false negative only folds two clips
+// together (still correct speech), while a false positive cuts "e.g." or
+// "Dr." into a clip of its own.
+const STREAM_ABBREV =
+  /(?:^|[\s(\x22\x27\[\u201c\u2018])(?:mr|mrs|ms|dr|prof|sr|jr|st|vs|etc|fig|no|approx|dept|est|inc|ltd|co|corp|mt|ft|al|ca|cf)\.$/i;
+const STREAM_INITIAL = /(?:^|[\s(\x22\x27\[\u201c\u2018])[a-z]\.$/i;
+const STREAM_DOTTED = /(?:^|[\s(\x22\x27\[\u201c\u2018])(?:[a-z]\.)+[a-z]\.$/i;
+
+function _streamAbbreviation(prefix) {
+  return (
+    STREAM_DOTTED.test(prefix) ||
+    STREAM_INITIAL.test(prefix) ||
+    STREAM_ABBREV.test(prefix)
+  );
+}
+
+// The index just past the first completed sentence in *text*, or 0 when the
+// buffer ends inside one.  A mark only completes a sentence when whitespace
+// follows it: that one rule keeps "3.14" whole and holds a delta that stops on
+// "3." or "Dr." until the next delta shows what the mark belongs to.
+function _streamCut(text, minChars) {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "\n") return i + 1;
+    if (!STREAM_MARKS.includes(ch)) continue;
+    // A run of marks ("!?", "...") is one sentence end, and closing quotes or
+    // brackets ride along with it.
+    let j = i + 1;
+    while (j < text.length && STREAM_MARKS.includes(text[j])) j++;
+    while (j < text.length && STREAM_CLOSERS.includes(text[j])) j++;
+    if (j >= text.length) return 0; // the next delta decides
+    if (!/\s/.test(text[j])) {
+      i = j - 1; // a decimal, version or file name, not a sentence end
+      continue;
+    }
+    if (ch === "." && _streamAbbreviation(text.slice(0, i + 1))) {
+      i = j - 1;
+      continue;
+    }
+    // A colon usually introduces a list; a one- or two-word lead-in ("Note:")
+    // sounds clipped on its own, so it waits for enough text to be a clip.
+    if (ch === ":" && text.slice(0, i).replace(/\s+/g, "").length < minChars) {
+      i = j - 1;
+      continue;
+    }
+    return j;
+  }
+  return 0;
+}
+
+// Turns a live reply's text deltas into clips for a streaming run.  Each
+// delta is appended to a buffer; every completed sentence is shaped and
+// handed to onClip immediately, while the trailing partial sentence waits for
+// the deltas that finish it.  end() flushes the remainder, cancel() drops it.
+//
+// Shaping stays in shapeSpeechSegments: this is one boundary scan, not a
+// second segmenter.  A completed sentence is one row, so the shaper still
+// normalises whitespace, supplies a terminal period and wraps a very long
+// sentence at the profile's clip_max_chars.
+export function createStreamFeeder(opts) {
+  opts = opts || {};
+  const profile = _normalizeProfile(opts.profile);
+  const onClip = opts.onClip || (() => {});
+  let pending = "";
+  let closed = false;
+  const emit = (text) => {
+    if (!text.trim()) return;
+    for (const clip of shapeSpeechSegments([{ text, pauseMs: 0 }], profile)) {
+      if (clip.text) onClip(clip);
+    }
+  };
+  return {
+    push(delta) {
+      if (closed) return;
+      pending += delta || "";
+      for (;;) {
+        const cut = _streamCut(pending, profile.clip_min_chars);
+        if (!cut) return;
+        const text = pending.slice(0, cut);
+        pending = pending.slice(cut);
+        emit(text);
+      }
+    },
+    end() {
+      if (closed) return;
+      closed = true;
+      emit(pending);
+      pending = "";
+      if (opts.onEnd) opts.onEnd();
+    },
+    cancel() {
+      closed = true;
+      pending = "";
+    },
+  };
+}
+
 // The style a request should name, resolved against THIS base's menu.  ""
 // means Default: the caller omits the field entirely, so the body is
 // byte-identical to a client that predates styles.  A stored name this base
@@ -903,7 +1023,8 @@ const _activeTtsRuns = new Set();
 //   announce        live-region announcer; defaults to a module-owned region.
 //   authGeneration  returns a token that changes on logout or account switch;
 //                   defaults to auth.js's.  A run holding an older token stops.
-// Returns { play(el, btn), stop(), isPlaying(), activeButton(), audio() }.
+// Returns { play(el, btn), stream(), stop(), isPlaying(), activeButton(),
+// audio() }.
 export function createTtsPlayer(opts) {
   opts = opts || {};
   const baseOf = typeof opts.base === "function" ? opts.base : () => opts.base || "";
@@ -916,6 +1037,9 @@ export function createTtsPlayer(opts) {
   let timer = null;
   let audioEl = null; // the element, set only while a clip is loaded
   let activeBtn = null;
+  // The live streaming run, if any.  It has no button, but it owns the same
+  // one-voice-per-page slot and the same stop().
+  let streamRun = null;
 
   function stop() {
     _activeTtsRuns.delete(stop);
@@ -940,6 +1064,13 @@ export function createTtsPlayer(opts) {
       btn.setAttribute("aria-pressed", "false");
       activeBtn = null;
     }
+    // Dropping the queued clips is what makes a stop immediate: the current
+    // clip is paused above, and nothing already spoken-over may follow it.
+    const stream = streamRun;
+    if (stream) {
+      streamRun = null;
+      stream._drop();
+    }
   }
 
   async function play(el, btn) {
@@ -949,6 +1080,11 @@ export function createTtsPlayer(opts) {
       stop();
       if (wasThis) return;
     }
+    // An explicit click supersedes a pending or playing streaming run.  It is
+    // not necessarily in _activeTtsRuns yet — a run that has not reached its
+    // first clip is still waiting on the config probe — so stop it by hand or
+    // its first sentence would silence the reply the user just chose.
+    if (streamRun) streamRun.cancel();
     // One voice per page: another pane's run ends before this one starts.
     for (const other of [..._activeTtsRuns]) other();
     _activeTtsRuns.add(stop);
@@ -1122,9 +1258,262 @@ export function createTtsPlayer(opts) {
     }
   }
 
+  // Read a reply aloud while it is still being written.  Deltas go into a
+  // feeder, which hands over one completed sentence at a time; those clips
+  // are fetched and played with the same one-in-flight/prefetch-one-ahead
+  // rules as play().  Returns the run: push(delta), end() to flush the tail,
+  // cancel() to stop and drop everything queued, and `heard` — the clips
+  // whose audio actually fired "ended" (a fetched or prefetched clip is not
+  // heard).
+  //
+  // audio.tts_stream is resolved once per run from the memoized styles probe.
+  // Off, a run holds its text, resolves to nothing and never fetches a clip,
+  // so the panes can feed deltas unconditionally and a deployment that has
+  // not enabled streaming behaves exactly as it did before this existed.
+  function stream() {
+    // One streaming run per player: a new reply ends the old run and drops the
+    // clips it had queued but not yet spoken.
+    if (streamRun) streamRun.cancel();
+    const run = { heard: [] };
+    let inbox = ""; // deltas held until the config probe resolves
+    let feeder = null;
+    let queue = [];
+    let ended = false; // the reply's text is complete (stream_end, or end())
+    let started = false;
+    let cancelled = false;
+    let capped = false;
+    let emitted = 0;
+    let wake = null;
+    let ready = false;
+    let enabled = false;
+    let announced = false;
+    let style = "";
+    let rate = 1;
+    let profile = DEFAULT_TTS_PROFILE;
+    let token = 0;
+    let abort = null;
+    let audio = null;
+
+    const wakeLoop = () => {
+      const resolve = wake;
+      wake = null;
+      if (resolve) resolve();
+    };
+    const drop = () => {
+      cancelled = true;
+      queue = [];
+      inbox = "";
+      if (feeder) feeder.cancel();
+      wakeLoop();
+    };
+    // Queueing a clip also starts the run, so a streaming run enters
+    // _activeTtsRuns at the same moment a clicked play() does — not when the
+    // feeder is created, which would silence another pane before this one has
+    // anything to say.
+    const enqueue = (clip) => {
+      if (cancelled) return;
+      // One request per clip, exactly like a finished reply: a runaway reply
+      // must not queue hundreds of syntheses after the cap said stop.
+      if (emitted >= profile.max_clips) {
+        if (!capped) {
+          capped = true;
+          showToast(
+            "Read-aloud stopped after the first " +
+              profile.max_clips +
+              " sections; the rest of this reply was skipped.",
+            "warn",
+          );
+        }
+        return;
+      }
+      emitted++;
+      queue.push(clip);
+      if (started) wakeLoop();
+      else start();
+    };
+    const fetchClip = async (text) => {
+      const r = await authFetch(baseOf() + "/v1/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Default (""): omit the field, byte-identical to the pre-styles body.
+        body: JSON.stringify(style ? { text, style } : { text }),
+        signal: abort.signal,
+      });
+      if (!r.ok) {
+        const b = await r.json().catch(() => null);
+        throw new Error((b && b.error) || "Speech synthesis failed");
+      }
+      return r.blob();
+    };
+    const playLoop = async () => {
+      let next = null; // {text, promise}: the one prefetched clip
+      try {
+        // Clips are authenticated one by one; a logout or account switch
+        // mid-run must not keep speaking the previous session's reply.
+        const generation = generationOf();
+        const stopIfAuthChanged = () => {
+          if (generation === generationOf()) return false;
+          stop();
+          return true;
+        };
+        for (;;) {
+          if (token !== seq) return;
+          if (!queue.length) {
+            if (ended) break;
+            await new Promise((resolve) => {
+              wake = resolve;
+            });
+            continue;
+          }
+          const clip = queue.shift();
+          let blob;
+          if (next && next.text === clip.text) {
+            blob = await next.promise;
+            next = null;
+          } else {
+            blob = await fetchClip(clip.text);
+          }
+          if (token !== seq) return;
+          if (stopIfAuthChanged()) return;
+          // Prefetch one ahead once this clip's blob has landed, never
+          // earlier: one synthesis is in flight at a time.
+          if (queue.length && !next) {
+            next = { text: queue[0].text, promise: fetchClip(queue[0].text) };
+            next.promise.catch(() => {}); // surfaced when awaited, not before
+          }
+          const url = URL.createObjectURL(blob);
+          audioEl = audio;
+          if (!announced) {
+            announced = true;
+            announce("Playing response.");
+          }
+          await new Promise((resolve, reject) => {
+            const settle = (fn, arg) => {
+              audio.removeEventListener("ended", onEnded);
+              audio.removeEventListener("error", onError);
+              fn(arg);
+            };
+            const onEnded = () => settle(resolve);
+            const onError = () => settle(reject, new Error("Audio playback failed"));
+            audio.addEventListener("ended", onEnded);
+            audio.addEventListener("error", onError);
+            // Loading a src resets playbackRate to defaultPlaybackRate, so set
+            // both, every clip: otherwise speed snaps back at each sentence.
+            audio.defaultPlaybackRate = rate;
+            audio.src = url;
+            audio.playbackRate = rate;
+            audio
+              .play()
+              .catch((e) =>
+                settle(
+                  reject,
+                  new Error(
+                    e && e.name === "NotAllowedError"
+                      ? "Playback was blocked by the browser"
+                      : "Audio playback failed",
+                  ),
+                ),
+              );
+          });
+          // The token test comes BEFORE heard: an "ended" that lands after a
+          // stop is not an acknowledgement of a clip this run played.
+          if (token !== seq) return;
+          run.heard.push(clip.text);
+          URL.revokeObjectURL(url);
+          audioEl = null;
+        }
+        stop();
+      } catch (err) {
+        if (token !== seq) return; // aborted by a stop or a newer run
+        if (err && (err.message === "auth" || err.message === "auth changed")) {
+          stop();
+          return;
+        }
+        showToast(
+          err && err.message ? err.message : "Speech synthesis failed",
+          "error",
+        );
+        stop();
+      }
+    };
+    const start = () => {
+      if (started || cancelled) return;
+      started = true;
+      // One voice per page.  Detach this run while our own stop() runs (it
+      // must not cancel the run it is starting), then reattach it so every
+      // later stop() — this pane's or another pane's — drops the queue.
+      streamRun = null;
+      for (const other of [..._activeTtsRuns]) other();
+      _activeTtsRuns.add(stop);
+      token = ++seq;
+      abort = new AbortController();
+      abortCtl = abort;
+      // One element for the whole run: iOS Safari only lets an element that a
+      // gesture unlocked play later, and swapping src keeps that one element.
+      audio = new Audio();
+      audio.preservesPitch = true;
+      streamRun = run;
+      playLoop();
+    };
+    run.push = (delta) => {
+      if (cancelled || ended) return;
+      const text = delta || "";
+      if (!ready) {
+        inbox += text;
+        return;
+      }
+      if (enabled && feeder) feeder.push(text);
+    };
+    run.end = () => {
+      if (cancelled || ended) return;
+      ended = true;
+      if (ready && enabled && feeder) feeder.end();
+    };
+    run.cancel = () => {
+      if (streamRun === run) stop(); // clears the player and drops the queue
+      else drop();
+    };
+    run._drop = drop;
+    streamRun = run;
+    // All four ride the one memoized styles probe.  A failed probe, a server
+    // that predates a field and an unusable value each read as the defaults —
+    // the same degradation a finished reply gets.
+    Promise.all([
+      getTtsStreamEnabled(baseOf()),
+      _requestStyle(baseOf()).catch(() => ""),
+      getTtsPlaybackRate(baseOf()).catch(() => 1),
+      getTtsProfile(baseOf()).catch(() => DEFAULT_TTS_PROFILE),
+    ]).then(([on, chosenStyle, chosenRate, chosenProfile]) => {
+      if (cancelled) return;
+      enabled = on === true;
+      style = chosenStyle;
+      rate = chosenRate;
+      profile = chosenProfile;
+      ready = true;
+      if (!enabled) {
+        inbox = ""; // streaming is off: nothing was fetched and nothing plays
+        return;
+      }
+      feeder = createStreamFeeder({
+        profile,
+        onClip: enqueue,
+        onEnd: () => {
+          ended = true;
+          wakeLoop();
+        },
+      });
+      const text = inbox;
+      inbox = "";
+      if (text) feeder.push(text);
+      if (ended) feeder.end();
+    });
+    return run;
+  }
+
   return {
     play,
     stop,
+    stream,
     isPlaying: () => activeBtn !== null,
     activeButton: () => activeBtn,
     audio: () => audioEl,

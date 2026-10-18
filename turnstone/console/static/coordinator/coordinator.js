@@ -3908,6 +3908,7 @@ function createCoordinatorPane(root, wsId, opts) {
         break;
       case "content":
         appendContentToken(ev.text || "");
+        _feedTtsStream(ev.text || "");
         break;
       case "reasoning":
         appendReasoningToken(ev.text || "");
@@ -3961,6 +3962,9 @@ function createCoordinatorPane(root, wsId, opts) {
         // always retires the card with an end event before any stream_end
         // can follow) — remove it instead of leaving a frozen bar.
         resetCompactionHolder(compactionHolder);
+        // This segment's text is complete: speak the sentence still in the
+        // feeder's buffer, then let the run drain its queue.
+        _endTtsStream();
         finishAssistantStream();
         break;
       case "stream_overflow":
@@ -4382,6 +4386,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // Force Stop after 2s. state_change → idle is what actually
         // clears busy; the 10s safety timer covers the connection-drop
         // case.
+        _cancelTtsStream(); // drop anything spoken for the cancelled text
         reasoningActivity.finish();
         if (!busy) break;
         clearTimeout(cancelTimeoutId);
@@ -6639,6 +6644,31 @@ function createCoordinatorPane(root, wsId, opts) {
   // /v1/api/models reports a tts role (see init).
   let voiceRoles = { stt: false, tts: false };
   const ttsPlayer = createTtsPlayer({ base: "" });
+  // The live streaming-read-aloud run for the reply being written, if any
+  // (created on the first content delta and flushed at stream_end).
+  let ttsStream = null;
+
+  // Streaming read-aloud: content deltas go to one feeder per reply, which
+  // hands the player only completed sentences.  The player discards a run
+  // created while audio.tts_stream is off, so this stays unconditional and a
+  // deployment with streaming off behaves exactly as it did before.
+  function _feedTtsStream(text) {
+    if (!voiceRoles.tts || !text) return;
+    if (!ttsStream) ttsStream = ttsPlayer.stream();
+    ttsStream.push(text);
+  }
+
+  function _endTtsStream() {
+    if (!ttsStream) return;
+    ttsStream.end();
+    ttsStream = null; // the run keeps draining; the next reply starts fresh
+  }
+
+  function _cancelTtsStream() {
+    if (!ttsStream) return;
+    ttsStream.cancel();
+    ttsStream = null;
+  }
 
   // Speaker on every FINISHED assistant reply, beside copy.  The bubble still
   // streaming is skipped so half a reply is never read; the settle edge
@@ -6888,6 +6918,7 @@ function createCoordinatorPane(root, wsId, opts) {
     )
       return;
     const scrollTop = messagesEl.scrollTop;
+    ttsStream = null; // a rebuild must not keep speaking the old reply
     ttsPlayer.stop(); // the speaker button is about to be detached
     messagesEl.replaceChildren();
     _syncApprovalChip();
@@ -7326,6 +7357,7 @@ function createCoordinatorPane(root, wsId, opts) {
   // backgrounded pane keeps an SSE open and fires renders into detached DOM.
   function destroy() {
     reasoningActivity.finish();
+    ttsStream = null;
     ttsPlayer.stop();
     mic.destroy(); // release the microphone and abort a transcription in flight
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
