@@ -822,8 +822,43 @@ reopening the session.
 
 ## Agent reports
 
-Stub: a finished agent's report is saved and offered on your next spoken turn
-(`coordinator.voice_report_chime`).
+A text coordinator waits for its children: it calls `wait_for_workstream` and
+its turn ends when they finish. A voice session cannot do that. The user has
+usually finished speaking long before an agent does, and a turn that blocks
+leaves the microphone silent with nothing to say. So a finished agent does not
+interrupt anything. Its report is saved, and the next thing you say is where
+it comes up.
+
+When an agent you started stops — normally, or with an error — the session
+stores its last message as a report. On your next spoken turn the model is
+told, in one short internal note, which reports are waiting; it does not
+receive their text. It answers you first, then offers them in one sentence,
+for example "Your research came back — want the short version?". Only if you
+say yes does it read the report aloud, and it can also drop a report you are
+not interested in. Nothing is read aloud unasked, and nothing is lost if you
+say nothing: a report waits until you ask for it or dismiss it.
+
+Reports live in the database, not in the conversation, so they survive the
+console restarting or the session being reopened. An agent that finished while
+the console was down is offered the next time you speak.
+
+Each agent gets one report per finished turn. An agent that runs again and
+finishes again leaves a second report; state changes that do not finish a turn
+produce nothing. A report whose agent never produced any text carries a short
+placeholder rather than an empty body, and an agent that failed carries its
+recorded error where there is one, so a failure is offered as readily as a
+success.
+
+`coordinator.voice_report_chime` (default off) controls the audible nudge for a
+report that arrives while you are not speaking: a short chime and a badge
+instead of the session starting to talk. The report is offered on your next
+turn whether the setting is on or off, and the setting never makes the session
+speak on its own. It applies only to voice sessions.
+
+Voice sessions no longer have `wait_for_workstream`. If the model asks for it
+the call is refused, and the next turn's report offer is how the result
+arrives. Text coordinators are unchanged: they keep the tool and the blocking
+wait.
 
 ## Auto-stop
 
