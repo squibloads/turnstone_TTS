@@ -9,6 +9,12 @@
    (turnstone/core/voice_config.py) is the authority on shape, duplicates and
    the 200-entry cap, and its message is shown inline in the shelf.
 
+   Below the operator's entries the same tab lists Turnstone's built-in
+   technical respellings (`BUILTIN_TERMS` in voice_config, served by
+   /v1/api/admin/voice/meta).  They are reference rows with one switch each;
+   a switch writes the whole `audio.tts_builtin_terms_off` list.  A dictionary
+   entry for the same term overrides a built-in without switching it off.
+
    The legacy `audio.tts_pronunciations` lines (`word = respelling`) still
    apply on their own, so the list offers a one-click import.  Import is two
    PUTs — the dictionary first, the legacy value only after that succeeds —
@@ -29,6 +35,13 @@
 
   const DICTIONARY_KEY = "audio.voice_dictionary";
   const LEGACY_KEY = "audio.tts_pronunciations";
+  const TERMS_OFF_KEY = "audio.tts_builtin_terms_off";
+  const META_URL = "/v1/api/admin/voice/meta";
+  // Mirrors VOICE_DOCS_URL in turnstone/core/voice_config.py.  Hard-coded:
+  // this is a classic script with no import path, and the docs host is part
+  // of the published contract rather than deployment configuration.
+  const VOICE_DOCS_URL =
+    "https://github.com/turnstonelabs/turnstone/blob/main/docs/voice.md";
   // Mirrors turnstone/core/voice_config.py.  These cap what the UI offers;
   // every write still goes through the server's validate_dictionary.
   const MAX_ENTRIES = 200;
@@ -39,6 +52,12 @@
   // once and re-used across shows so its field state never needs rebuilding.
   let _entries = [];
   let _legacyRaw = "";
+  // Built-in terms are reference data from the meta endpoint; the switch
+  // state lives in its own settings value.  A failed meta request only takes
+  // out the Built in section, never the operator's entries.
+  let _builtinTerms = [];
+  let _termsOff = [];
+  let _builtinError = "";
   let _container = null;
   // Our own block inside the tab container: the Voice shell may render a
   // heading around us, so the loader replaces this panel, never the host's
@@ -262,6 +281,92 @@
   }
 
   // -------------------------------------------------------------------------
+  // Built-in terms
+  // -------------------------------------------------------------------------
+
+  /** Tolerant read of the meta payload's `builtin_terms`: bad rows are
+   *  skipped, a missing respelling is blank, and a repeated term keeps the
+   *  first (the server ships a tuple of unique terms). */
+  function parseBuiltinTerms(meta) {
+    const items = meta && Array.isArray(meta.builtin_terms) ? meta.builtin_terms : [];
+    const out = [];
+    const seen = new Set();
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const term = _text(item.term);
+      if (!term || term.length > MAX_TEXT || seen.has(term)) continue;
+      seen.add(term);
+      out.push({ term: term, respelling: _text(item.respelling) });
+    }
+    return out;
+  }
+
+  /** Tolerant read of audio.tts_builtin_terms_off, mirroring the server's
+   *  parse_builtin_terms_off: unknown names (a term a later release dropped)
+   *  are ignored, the stored order is kept and repeats collapse. */
+  function parseTermsOff(raw, terms) {
+    let items;
+    try {
+      items = JSON.parse(raw);
+    } catch (e) {
+      return [];
+    }
+    if (!Array.isArray(items)) return [];
+    const allowed = new Set(terms || []);
+    const out = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (typeof item !== "string" || !allowed.has(item) || out.indexOf(item) !== -1) {
+        continue;
+      }
+      out.push(item);
+    }
+    return out;
+  }
+
+  /** The whole setting after one switch flip: on removes the term, off appends
+   *  it.  Never mutates *termsOff*, and the stored order survives a flip. */
+  function nextTermsOff(termsOff, term, on) {
+    const out = [];
+    for (let i = 0; i < (termsOff || []).length; i++) {
+      const current = termsOff[i];
+      if (current !== term && out.indexOf(current) === -1) out.push(current);
+    }
+    if (!on) out.push(term);
+    return out;
+  }
+
+  function termsOffJson(termsOff) {
+    return JSON.stringify(termsOff || []);
+  }
+
+  /** The operator entry that overrides built-in *term*, or null.
+   *
+   *  Read-aloud keys dictionary entries by their term, folded unless
+   *  match_case is set, and only an entry with a respelling replaces anything
+   *  — a dictation-only entry still lets the built-in respelling be spoken.
+   *  A later matching entry wins, as it does in the read-aloud merge. */
+  function overrideFor(term, entries) {
+    const wanted = _text(term);
+    if (!wanted) return null;
+    const folded = wanted.toLowerCase();
+    let found = null;
+    for (let i = 0; i < (entries || []).length; i++) {
+      const entry = entries[i];
+      if (!entry) continue;
+      const entryTerm = _text(entry.term);
+      if (!entryTerm || !_text(entry.respelling)) continue;
+      const matches =
+        entry.match_case === true
+          ? entryTerm === wanted
+          : entryTerm.toLowerCase() === folded;
+      if (matches) found = entry;
+    }
+    return found;
+  }
+
+  // -------------------------------------------------------------------------
   // Markup
   // -------------------------------------------------------------------------
 
@@ -325,7 +430,92 @@
     );
   }
 
-  function renderHtml(entries, legacyCount, canWrite) {
+  /** Built-in rows reuse the entry columns: TERM | TYPE | SAY AS | DICTATION
+   *  ALSO HEARS | CASE | ON.  The switch is the only editable control; it
+   *  stays live on an overridden row (switching a term off is separate from
+   *  overriding its respelling). */
+  function builtinRowsHtml(terms, termsOff, entries, canWrite) {
+    if (!terms.length) {
+      return '<div class="dashboard-empty">No built-in terms.</div>';
+    }
+    const off = new Set(termsOff || []);
+    let html = "";
+    for (let i = 0; i < terms.length; i++) {
+      const item = terms[i];
+      const isOn = !off.has(item.term);
+      const overridden = overrideFor(item.term, entries);
+      html +=
+        '<div class="admin-row voice-dict-grid voice-dict-builtin-row" role="listitem">' +
+        '<span class="admin-col"><code>' +
+        escapeHtml(item.term) +
+        "</code>" +
+        (overridden
+          ? '<span class="admin-col-subtitle voice-dict-override">overridden by your entry</span>'
+          : "") +
+        "</span>" +
+        '<span class="admin-col voice-dict-type"><span class="scope-badge">built-in</span></span>' +
+        '<span class="admin-col">' +
+        escapeHtml(item.respelling || "\u2014") +
+        "</span>" +
+        '<span class="admin-col voice-dict-hears">\u2014</span>' +
+        '<span class="admin-col voice-dict-case">\u2014</span>' +
+        '<span class="admin-col voice-dict-on">' +
+        '<label class="toggle-switch toggle--flush">' +
+        '<input type="checkbox" data-vd-term="' +
+        escapeHtml(item.term) +
+        '" aria-label="Speak ' +
+        escapeHtml(item.term) +
+        ' aloud"' +
+        (isOn ? " checked" : "") +
+        (canWrite ? "" : " disabled") +
+        " />" +
+        '<span class="toggle-track" aria-hidden="true"></span>' +
+        "</label>" +
+        "</span>" +
+        "</div>";
+    }
+    return html;
+  }
+
+  /** The Built in section, below the operator's list.  *error* replaces the
+   *  table with one line when the meta request fails, so a broken reference
+   *  list cannot look like an empty one. */
+  function builtinSectionHtml(terms, termsOff, entries, canWrite, error) {
+    let html =
+      '<div class="voice-dict-builtin">' +
+      '<div class="voice-dict-builtin-head">' +
+      '<span class="section-header voice-dict-builtin-title">Built in</span>' +
+      '<span class="voice-dict-builtin-note">technical terms Turnstone ships; add an entry with the same term to override, or switch one off</span>' +
+      '<button type="button" class="settings-help-btn" data-help-target="voice-dict-builtin-help" aria-label="Help for built-in terms" aria-expanded="false" title="More info"></button>' +
+      "</div>" +
+      '<div id="voice-dict-builtin-help" class="settings-help-popover" style="display:none">' +
+      '<span class="settings-help-text">Turnstone ships respellings for a few technical terms so every TTS model says them the same way. Switching one off leaves that word to the model. A dictionary entry with the same term overrides the shipped respelling without switching it off.</span> ' +
+      '<a href="' +
+      VOICE_DOCS_URL +
+      '#built-in-terms" target="_blank" rel="noopener" class="settings-help-ref">learn more</a>' +
+      "</div>";
+    if (error) {
+      html +=
+        '<div class="voice-dict-builtin-error">' + escapeHtml(error) + "</div>";
+    } else {
+      html +=
+        '<div class="admin-colheaders voice-dict-grid" aria-hidden="true">' +
+        '<span class="admin-col">TERM</span>' +
+        '<span class="admin-col voice-dict-type">TYPE</span>' +
+        '<span class="admin-col">SAY AS</span>' +
+        '<span class="admin-col voice-dict-hears">DICTATION ALSO HEARS</span>' +
+        '<span class="admin-col voice-dict-case">CASE</span>' +
+        '<span class="admin-col voice-dict-on">ON</span>' +
+        "</div>" +
+        '<div class="voice-dict-list" role="list" aria-label="Built-in pronunciations" aria-live="polite">' +
+        builtinRowsHtml(terms, termsOff, entries, canWrite) +
+        "</div>";
+    }
+    html += "</div>";
+    return html;
+  }
+
+  function renderHtml(entries, legacyCount, canWrite, builtins) {
     let html =
       '<div class="admin-toolbar">' +
       '<span class="voice-dict-count">' +
@@ -348,6 +538,15 @@
       '<div class="voice-dict-list" role="list" aria-label="Voice dictionary" aria-live="polite">' +
       rowsHtml(entries, canWrite) +
       "</div>";
+    if (builtins) {
+      html += builtinSectionHtml(
+        builtins.terms || [],
+        builtins.termsOff || [],
+        entries,
+        canWrite,
+        builtins.error || "",
+      );
+    }
     return html;
   }
 
@@ -689,7 +888,14 @@
   function render() {
     if (!_panel) return;
     const legacyCount = parseLegacyPronunciations(_legacyRaw).length;
-    setSafeHtml(_panel, renderHtml(_entries, legacyCount, canWrite()));
+    setSafeHtml(
+      _panel,
+      renderHtml(_entries, legacyCount, canWrite(), {
+        terms: _builtinTerms,
+        termsOff: _termsOff,
+        error: _builtinError,
+      }),
+    );
 
     const newButton = _panel.querySelector("[data-vd-new]");
     if (newButton) {
@@ -701,19 +907,58 @@
     if (importButton) importButton.addEventListener("click", runImport);
 
     const list = _panel.querySelector(".voice-dict-list");
-    if (!list) return;
-    const edits = list.querySelectorAll("[data-vd-edit]");
-    for (let i = 0; i < edits.length; i++) {
-      edits[i].addEventListener("click", function () {
-        openShelf(parseInt(this.getAttribute("data-vd-edit"), 10));
+    if (list) {
+      const edits = list.querySelectorAll("[data-vd-edit]");
+      for (let i = 0; i < edits.length; i++) {
+        edits[i].addEventListener("click", function () {
+          openShelf(parseInt(this.getAttribute("data-vd-edit"), 10));
+        });
+      }
+      const deletes = list.querySelectorAll("[data-vd-delete]");
+      for (let i = 0; i < deletes.length; i++) {
+        deletes[i].addEventListener("click", function () {
+          deleteEntry(parseInt(this.getAttribute("data-vd-delete"), 10));
+        });
+      }
+    }
+    // The built-in switches live in a second list; wire them separately so
+    // the operator's row actions above are untouched by a failed meta load.
+    const toggles = _panel.querySelectorAll("[data-vd-term]");
+    for (let i = 0; i < toggles.length; i++) {
+      toggles[i].addEventListener("change", function () {
+        saveBuiltinTerm(this);
       });
     }
-    const deletes = list.querySelectorAll("[data-vd-delete]");
-    for (let i = 0; i < deletes.length; i++) {
-      deletes[i].addEventListener("click", function () {
-        deleteEntry(parseInt(this.getAttribute("data-vd-delete"), 10));
+  }
+
+  /** Flip one built-in term: PUT the whole list, then re-read both the
+   *  settings and the meta list so the switch reflects what was stored.
+   *  Every switch is disabled for the round trip, so a second flip cannot
+   *  build its list from a stale `_termsOff` and drop the first change. */
+  function saveBuiltinTerm(input) {
+    const term = input.getAttribute("data-vd-term") || "";
+    if (!term) return;
+    const on = input.checked;
+    const next = nextTermsOff(_termsOff, term, on);
+    setBuiltinSwitchesDisabled(true);
+    putSetting(TERMS_OFF_KEY, termsOffJson(next))
+      .then(function () {
+        _termsOff = next;
+        showToast(term + (on ? " switched on" : " switched off"));
+        loadVoiceDictionary(_container);
+      })
+      .catch(function (e) {
+        // The stored list did not change; put the switch back where it was.
+        input.checked = !on;
+        setBuiltinSwitchesDisabled(false);
+        showToast("Error: " + (e.message || "Save failed"), "error");
       });
-    }
+  }
+
+  function setBuiltinSwitchesDisabled(disabled) {
+    if (!_panel) return;
+    const toggles = _panel.querySelectorAll("[data-vd-term]");
+    for (let i = 0; i < toggles.length; i++) toggles[i].disabled = disabled;
   }
 
   /** The Voice tab's entry point; safe to call on every show. */
@@ -727,22 +972,47 @@
       panel,
       '<div class="dashboard-empty">Loading dictionary\u2026</div>',
     );
-    authFetch("/v1/api/admin/settings")
+    const settingsRequest = authFetch("/v1/api/admin/settings").then(function (r) {
+      if (!r.ok) throw new Error("Failed to load settings");
+      return r.json();
+    });
+    // The built-in list is reference data: a failed meta request must leave
+    // the operator's entries editable, so it resolves with a one-line error
+    // instead of rejecting the whole load.
+    const metaRequest = authFetch(META_URL)
       .then(function (r) {
-        if (!r.ok) throw new Error("Failed to load settings");
+        if (!r.ok) throw new Error("Failed to load built-in terms");
         return r.json();
       })
-      .then(function (data) {
+      .then(function (meta) {
+        return { terms: parseBuiltinTerms(meta), error: "" };
+      })
+      .catch(function () {
+        return { terms: [], error: "Built-in terms could not be loaded." };
+      });
+    Promise.all([settingsRequest, metaRequest])
+      .then(function (results) {
         if (seq !== _loadSeq) return; // an older response lost the race
-        const settings = (data && data.settings) || [];
+        const settings = (results[0] && results[0].settings) || [];
+        const meta = results[1];
         let dictionary = "[]";
         let legacy = "";
+        let termsOff = "[]";
         for (let i = 0; i < settings.length; i++) {
           if (settings[i].key === DICTIONARY_KEY) dictionary = settings[i].value;
           else if (settings[i].key === LEGACY_KEY) legacy = settings[i].value;
+          else if (settings[i].key === TERMS_OFF_KEY) termsOff = settings[i].value;
         }
         _entries = parseEntries(dictionary);
         _legacyRaw = typeof legacy === "string" ? legacy : "";
+        _builtinTerms = meta.terms;
+        _builtinError = meta.error;
+        _termsOff = parseTermsOff(
+          typeof termsOff === "string" ? termsOff : "",
+          _builtinTerms.map(function (item) {
+            return item.term;
+          }),
+        );
         render();
       })
       .catch(function () {
@@ -773,5 +1043,12 @@
     rowsHtml: rowsHtml,
     renderHtml: renderHtml,
     putSetting: putSetting,
+    parseBuiltinTerms: parseBuiltinTerms,
+    parseTermsOff: parseTermsOff,
+    nextTermsOff: nextTermsOff,
+    overrideFor: overrideFor,
+    termsOffJson: termsOffJson,
+    builtinRowsHtml: builtinRowsHtml,
+    builtinSectionHtml: builtinSectionHtml,
   };
 })();
