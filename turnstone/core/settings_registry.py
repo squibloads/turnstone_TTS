@@ -13,7 +13,15 @@ import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from turnstone.core.voice_config import DEFAULT_STYLES, validate_dictionary, validate_styles
+from turnstone.core.voice_config import (
+    DEFAULT_STYLES,
+    validate_builtin_terms_off,
+    validate_dictionary,
+    validate_disabled_groups,
+    validate_profiles,
+    validate_rewrite_rules,
+    validate_styles,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -790,6 +798,56 @@ def _build_registry() -> dict[str, SettingDef]:
             "audio",
             help="After transcription, each whole-phrase match of an entry's also_hears is "
             "replaced with its term. Works with every model, since it runs on the transcript.",
+        ),
+        SettingDef(
+            "audio.tts_profiles",
+            "str",
+            "{}",
+            "Read-aloud pacing, structure and clip sizes per TTS model",
+            "audio",
+            validator=validate_profiles,
+            help="A JSON object keyed by TTS model alias, edited in Admin › Voice › Settings "
+            "(Pacing, Structure, Clips). Each profile holds only the fields changed from the "
+            "defaults: pauses after headings, paragraphs, table rows, code markers and list "
+            "items; how table cells and headers are read; what replaces code and diagrams; "
+            "and how replies are cut into clips. A model with no profile uses the defaults. "
+            "Switching the TTS model role switches to that model's profile.",
+        ),
+        SettingDef(
+            "audio.tts_rewrite_rules",
+            "str",
+            "[]",
+            "Custom rewrite rules applied to read-aloud text",
+            "audio",
+            validator=validate_rewrite_rules,
+            help="A JSON list edited in Admin › Voice › Text cleanup. Each rule replaces "
+            "`find` with `replace` before the text reaches the TTS model. Plain-text rules "
+            "match whole words and ignore case; rules with `regex` true use Python regular "
+            "expressions (case-sensitive unless they start with (?i); \\1 inserts a group). "
+            "Rules run top to bottom after the built-in cleanup groups and before the "
+            "dictionary. Only used when audio.tts_normalize is on. At most 100.",
+        ),
+        SettingDef(
+            "audio.tts_cleanup_disabled",
+            "str",
+            "[]",
+            "Built-in text cleanup groups that are switched off",
+            "audio",
+            validator=validate_disabled_groups,
+            help="A JSON list of cleanup group ids switched off in Admin › Voice › Text "
+            'cleanup, for example ["versions"] when the TTS model already reads version '
+            "numbers well. Every other group keeps running while audio.tts_normalize is on.",
+        ),
+        SettingDef(
+            "audio.tts_builtin_terms_off",
+            "str",
+            "[]",
+            "Built-in pronunciations that are switched off",
+            "audio",
+            validator=validate_builtin_terms_off,
+            help="A JSON list of built-in terms (PostgreSQL, systemctl, kubectl, YAML, JSON) "
+            "switched off in Admin › Voice › Dictionary. A dictionary entry for the same "
+            "term overrides a built-in without switching it off.",
         ),
         # -- judge ----------------------------------------------------------
         SettingDef(

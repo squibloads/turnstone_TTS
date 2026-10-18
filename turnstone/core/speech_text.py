@@ -39,10 +39,12 @@ import datetime
 import re
 from typing import TYPE_CHECKING
 
+from turnstone.core.voice_config import BUILTIN_TERMS
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-    from turnstone.core.voice_config import DictionaryEntry
+    from turnstone.core.voice_config import CleanupOptions, DictionaryEntry, SpeechPreview
 
 
 def _speak_version(match: re.Match[str]) -> str:
@@ -147,14 +149,9 @@ def _speak_phone(match: re.Match[str]) -> str:
 
 # Technical terms most voices mangle, as plain respellings that work on every
 # backend.  Universal terms only; an operator's audio.tts_pronunciations entry
-# or a dictionary entry for the same word wins.
-_TECH_TERMS = {
-    "PostgreSQL": "Postgres",
-    "systemctl": "system control",
-    "kubectl": "kube control",
-    "YAML": "yammel",
-    "JSON": "jay-son",
-}
+# or a dictionary entry for the same word wins.  The list lives in voice_config
+# so the Dictionary tab can show it and audio.tts_builtin_terms_off can name it.
+_TECH_TERMS = dict(BUILTIN_TERMS)
 
 
 # Ordered (pattern, replacement); a replacement is a string or a callback.
@@ -346,3 +343,18 @@ def normalize_for_speech(
     for pattern, repl in _RULES:
         text = pattern.sub(repl, text)
     return _apply_replacements(text, _replacement_rows(pronunciations, dictionary))
+
+
+def preview_for_speech(
+    text: str,
+    pronunciations: Mapping[str, str] | None = None,
+    dictionary: Sequence[DictionaryEntry] | None = None,
+    options: CleanupOptions | None = None,
+) -> SpeechPreview:
+    """``normalize_for_speech`` plus which rule changed which part of the output.
+
+    Contract for the Text cleanup tab: ``.text`` is exactly what
+    ``normalize_for_speech(text, pronunciations, dictionary, options)`` returns.
+    Implemented by the cleanup-engine slice.
+    """
+    raise NotImplementedError
