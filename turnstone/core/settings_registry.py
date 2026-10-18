@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+SETTINGS_DOCS_URL = "https://github.com/turnstonelabs/turnstone/blob/main/docs/settings.md"
+
+
 @dataclass(frozen=True)
 class SettingDef:
     """Definition of a single configuration setting."""
@@ -201,6 +204,20 @@ def _build_registry() -> dict[str, SettingDef]:
             "session",
             help="Text that tells the model how to behave (e.g. \u2018You are a helpful coding assistant\u2019). "
             "Applied to every conversation before any skills.",
+        ),
+        SettingDef(
+            "session.environment_notes",
+            "str",
+            "",
+            "Deployment facts appended to every agent's system prompt",
+            "session",
+            help="Free text describing the host every agent works against \u2014 for "
+            "example where the host filesystem is mounted in this deployment, or "
+            "which directories are developers' scratch copies rather than the "
+            "deployed code. When set, every new session appends it to the system "
+            "prompt under an Environment heading, and spawned child agents see it "
+            "too. Empty (the default) leaves the prompt unchanged.",
+            reference_url=SETTINGS_DOCS_URL + "#environment-notes",
         ),
         SettingDef(
             "session.retention_days",
@@ -1331,6 +1348,24 @@ def _build_registry() -> dict[str, SettingDef]:
             "are refused with a note telling the model to ask you first. Spoken asides "
             "are easy to mistake for requests, so the default is 1. Set 0 to stop voice "
             "sessions starting agents at all.",
+            reference_url=VOICE_DOCS_URL + "#voice-persona",
+        ),
+        SettingDef(
+            "coordinator.voice_max_requested_agents",
+            "int",
+            4,
+            "Agents a voice coordinator may start when the user names a count",
+            "coordinator",
+            min_value=0,
+            max_value=10,
+            help="Applies only to coordinators created with the voice persona. When the "
+            "user's latest message explicitly names a number of agents and the spawn call "
+            "sets user_requested_count, the turn's budget becomes the larger of this and "
+            "coordinator.voice_max_agents_per_turn. The number in the user's message must "
+            "be at least the batch size, so the model cannot widen the cap on its own; a "
+            "claim the message does not support falls back to the normal cap. A "
+            "coordinator.voice_max_agents_per_turn of 0 stays a hard stop. Set this to 0 "
+            "to refuse explicit-request spawns.",
             reference_url=VOICE_DOCS_URL + "#voice-persona",
         ),
         SettingDef(

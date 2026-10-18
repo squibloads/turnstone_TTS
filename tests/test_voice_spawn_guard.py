@@ -13,8 +13,14 @@ import json
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from turnstone.core.personas import PersonaSnapshot
-from turnstone.core.session import ChatSession, _GenuineUserTurnPlan
+from turnstone.core.session import (
+    ChatSession,
+    _GenuineUserTurnPlan,
+    _voice_explicit_agent_count,
+)
 from turnstone.core.settings_registry import SETTINGS
 from turnstone.prompts import ClientType
 
@@ -150,6 +156,15 @@ def _tc(name: str, args: dict[str, Any], call_id: str = "call-1") -> dict[str, A
 
 def _spawn_result(ws_id: str = "child-1") -> dict[str, Any]:
     return {"ws_id": ws_id, "name": "kid", "node_id": "node-1", "status": 200}
+
+
+def _batch_args(count: int, *, requested: bool | None = None) -> dict[str, Any]:
+    args: dict[str, Any] = {
+        "children": [{"initial_message": f"task {idx}"} for idx in range(count)]
+    }
+    if requested is not None:
+        args["user_requested_count"] = requested
+    return args
 
 
 def _append_user_turn(sess: ChatSession, text: str = "next question") -> None:
@@ -480,3 +495,188 @@ def test_plain_coordinator_is_unaffected_by_the_voice_guard(monkeypatch):
 
     assert coord.spawn.call_count == 2
     assert all(call.kwargs["model"] == "" for call in coord.spawn.call_args_list)
+
+
+# ---------------------------------------------------------------------------
+# Explicitly requested batches
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("chunk it up to four different agents", 4),
+        ("start 4 agents", 4),
+        ("please start four agents", 4),
+        ("one agent each", 1),
+        ("hand one to each of the 3 agents", 3),
+        ("spawn 10 agents", 10),
+        ("back in five minutes", 0),
+        ("start some agents", 0),
+        ("do eleven agents", 0),
+        ("four different researchers", 0),
+        ("", 0),
+    ],
+)
+def test_voice_explicit_agent_count(message: str, expected: int) -> None:
+    """Only a count tied to agents/each licenses the requested ceiling."""
+    assert _voice_explicit_agent_count(message) == expected
+
+
+def test_voice_explicit_four_agent_batch_is_allowed(monkeypatch):
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.side_effect = lambda **kwargs: _spawn_result(f"child-{coord.spawn.call_count}")
+    _append_user_turn(sess, "chunk it up to four different agents")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True)))
+
+    assert "error" not in batch
+    assert batch["needs_approval"] is True
+    sess._exec_spawn_batch(batch)
+    assert coord.spawn.call_count == 4
+
+
+def test_voice_four_agent_batch_without_the_flag_is_refused(monkeypatch):
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    _append_user_turn(sess, "chunk it up to four different agents")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(4)))
+
+    assert "error" in batch
+    assert "at most 1 agent" in batch["error"]
+    assert "whole batch" in batch["error"]
+    assert coord.spawn.call_count == 0
+
+
+def test_voice_flag_without_a_count_in_the_user_message_is_refused(monkeypatch):
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    _append_user_turn(sess, "go ahead and chunk it up")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True)))
+
+    assert "error" in batch
+    assert "at most 1 agent" in batch["error"]
+    assert "Ask the user to confirm the number" in batch["error"]
+    assert "user_requested_count" in batch["error"]
+    assert coord.spawn.call_count == 0
+
+
+def test_voice_flag_count_below_the_batch_size_is_refused(monkeypatch):
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    _append_user_turn(sess, "start two agents")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True)))
+
+    assert "error" in batch
+    assert "at most 1 agent" in batch["error"]
+    assert coord.spawn.call_count == 0
+
+
+def test_voice_batch_above_the_requested_ceiling_is_refused(monkeypatch):
+    sess, coord, _ui = _make_session(
+        monkeypatch,
+        voice=True,
+        settings={"coordinator.voice_max_requested_agents": 4},
+    )
+    _append_user_turn(sess, "start five agents")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(5, requested=True)))
+
+    assert "error" in batch
+    assert "at most 4 agents" in batch["error"]
+    assert "whole batch" in batch["error"]
+    assert coord.spawn.call_count == 0
+
+
+def test_voice_flag_widens_the_single_spawn_budget(monkeypatch):
+    """An explicit count applies to spawn_workstream too, not just batches."""
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.side_effect = lambda **kwargs: _spawn_result(f"child-{coord.spawn.call_count}")
+
+    first = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "one"}))
+    sess._exec_spawn_workstream(first)
+
+    _append_user_turn(sess, "start one more agent")
+    second = sess._prepare_tool(
+        _tc("spawn_workstream", {"initial_message": "two", "user_requested_count": True})
+    )
+    assert "error" not in second
+    sess._exec_spawn_workstream(second)
+    assert coord.spawn.call_count == 2
+
+
+def test_voice_cap_zero_still_refuses_everything(monkeypatch):
+    """The operator's off switch is not reopened by an explicit request."""
+    sess, coord, _ui = _make_session(
+        monkeypatch,
+        voice=True,
+        settings={"coordinator.voice_max_agents_per_turn": 0},
+    )
+    _append_user_turn(sess, "start four agents")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True)))
+    assert "error" in batch
+    assert "no agents" in batch["error"]
+
+    single = sess._prepare_tool(
+        _tc("spawn_workstream", {"initial_message": "go", "user_requested_count": True})
+    )
+    assert "error" in single
+    assert "no agents" in single["error"]
+    assert coord.spawn.call_count == 0
+
+
+def test_voice_requested_ceiling_zero_refuses_a_wider_batch(monkeypatch):
+    sess, coord, _ui = _make_session(
+        monkeypatch,
+        voice=True,
+        settings={
+            "coordinator.voice_max_agents_per_turn": 1,
+            "coordinator.voice_max_requested_agents": 0,
+        },
+    )
+    _append_user_turn(sess, "start four agents")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True)))
+
+    assert "error" in batch
+    assert "at most 1 agent" in batch["error"]
+    assert coord.spawn.call_count == 0
+
+
+def test_voice_explicit_budget_resets_on_the_next_user_turn(monkeypatch):
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.side_effect = lambda **kwargs: _spawn_result(f"child-{coord.spawn.call_count}")
+    _append_user_turn(sess, "start four agents")
+
+    first = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True), "call-1"))
+    assert "error" not in first
+    sess._exec_spawn_batch(first)
+    assert coord.spawn.call_count == 4
+
+    denied = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True), "call-2"))
+    assert "error" in denied
+    assert "at most 4 agents" in denied["error"]
+
+    _append_user_turn(sess, "start four more agents")
+    second = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True), "call-3"))
+    assert "error" not in second
+    sess._exec_spawn_batch(second)
+    assert coord.spawn.call_count == 8
+
+
+def test_plain_coordinator_ignores_user_requested_count(monkeypatch):
+    sess, coord, _ui = _make_session(
+        monkeypatch,
+        voice=False,
+        settings={
+            "coordinator.voice_max_agents_per_turn": 0,
+            "coordinator.voice_max_requested_agents": 0,
+        },
+    )
+    coord.spawn.side_effect = lambda **kwargs: _spawn_result(f"child-{coord.spawn.call_count}")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True)))
+    assert "error" not in batch
+    sess._exec_spawn_batch(batch)
+    assert coord.spawn.call_count == 4
