@@ -898,7 +898,7 @@
       '-find-label">Find</label>' +
       '<input id="' +
       prefix +
-      '-find" type="text" class="sh-mono" autocomplete="off" spellcheck="false" autofocus />' +
+      '-find" type="text" class="sh-mono voice-cleanup-find" autocomplete="off" spellcheck="false" autofocus />' +
       '<p class="label-hint hint-block" id="' +
       prefix +
       '-find-hint"></p>' +

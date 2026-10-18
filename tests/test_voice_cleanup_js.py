@@ -111,6 +111,8 @@ def test_contract_strings_and_shelf_copy_are_present() -> None:
         '"admin.settings"',
         "RWR-NEW",
         "RWR-EDIT",
+        "voice-cleanup-find",
+        "voice-cleanup-field-error",
         "Type the word or phrase exactly as it appears. Matches whole words and ignores case:",
         "Find is now a regular expression (Python flavor), case-sensitive; start with (?i) to ignore case.",
         "Don't write regex?",
