@@ -507,8 +507,9 @@ def tts_style_instruction(
 
 
 def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, Any]:
-    """The body of ``GET /v1/api/tts/styles``: the style picker's choices, plus
-    the admin playback rate every read-aloud plays at.
+    """The body of ``GET /v1/api/tts/styles``: the style picker's choices, the
+    admin playback rate every read-aloud plays at, and the active model's
+    pacing profile.
 
     Instruction text never leaves the server; the browser only needs names and
     ``in_menu``.  ``instructions_supported`` is the exact gate the POST path
@@ -531,7 +532,25 @@ def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, 
         "default": str(config_store.get("audio.tts_style") or "") if config_store else "",
         "instructions_supported": supported,
         "playback_rate": _tts_playback_rate(config_store),
+        "profile": _tts_profile(config_store, alias),
     }
+
+
+def _tts_profile(config_store: Any, alias: str | None) -> dict[str, Any]:
+    """The pacing profile for *alias*, every field present.
+
+    Rides the styles probe for the same reason the playback rate does: the
+    player already fetches it per transport base, and the profile decides how
+    a reply is cut into clips.  No resolved role, no settings, or an alias
+    with no profile reads as ``DEFAULT_PROFILE`` — today's player behaviour —
+    and a bad stored value degrades per field through the tolerant parser
+    rather than breaking read-aloud.
+    """
+    from turnstone.core.voice_config import parse_profiles, profile_json, resolve_profile
+
+    raw = config_store.get("audio.tts_profiles") if config_store is not None else None
+    profiles = parse_profiles(raw if isinstance(raw, str) else "")
+    return profile_json(resolve_profile(profiles, alias or ""))
 
 
 def _tts_playback_rate(config_store: Any) -> float:
