@@ -9,9 +9,10 @@ the speaker button.
 
 The page requires the `admin.settings` permission, the same as the Settings
 tab. Every control writes an `audio.*` setting, so a saved change applies to
-the next request without a restart. Pacing and playback speed are the
-exception: the browser player reads them with the rest of its read-aloud
-configuration, so they reach replies played after a page reload.
+the next request without a restart. Pacing, playback speed and the dictation
+auto-stop settings are the exception: the browser reads them with the rest of
+its voice configuration, so they reach recordings and replies started after a
+page reload.
 
 ## Overview
 
