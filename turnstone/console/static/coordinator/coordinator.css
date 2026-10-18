@@ -109,3 +109,56 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ==========================================================================
+   Voice mode - the hands-free toggle beside the mic and its status line.
+   The button reuses .composer-mic-btn for the composer row geometry (same
+   height, border, focus ring), so only the text sizing and the on-state are
+   new.  The status line sits below the composer row: it is the only place
+   the user can see why the mic is closed (thinking / speaking).
+   ========================================================================== */
+.composer-voice-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+/* The shared .has-mic rule gives EVERY .composer-mic-btn an auto left margin;
+   two of them in one row split the free space and strand the pair mid-row.
+   The mic keeps the margin, the voice button merely follows it.  Written at
+   the shared rule's specificity (three classes) so load order is not the
+   tie-breaker. */
+.composer-row.has-mic .composer-voice-btn {
+  margin-left: 0;
+}
+/* On: the accent edge is the at-a-glance signal that the mic is live; the
+   pulse would read as "recording", which is the mic button's own state. */
+.composer-voice-btn.is-on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.coord-voice-status {
+  padding: 2px 2px 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+}
+.coord-voice-status[data-state="listening"] {
+  color: var(--accent);
+}
+/* Muted inside voice mode: the mic button reads as switched off, and the
+   status line says replies still play, so a quiet session is not mistaken
+   for a broken one. */
+.composer-mic-btn.is-muted {
+  color: var(--fg-dim);
+  border-style: dashed;
+  opacity: 0.8;
+}
+.coord-voice-status[data-state="muted"] {
+  color: var(--fg-dim);
+}
+.coord-voice-status[data-state="speaking"] {
+  color: var(--ink-2);
+}

@@ -138,6 +138,130 @@ class TextToSpeechRequest(BaseModel):
     voice: str = Field(
         default="", description="Optional voice override (else audio.tts_voice setting)"
     )
+    style: str | None = Field(
+        default=None,
+        description=(
+            "Optional speaking-style name from audio.tts_styles.  Null or absent uses the "
+            'audio.tts_style default; an unknown name (or "") sends no instruction, never '
+            "an error.  Only applied when the configured TTS model accepts instructions."
+        ),
+    )
+
+
+class TextToSpeechStyleInfo(BaseModel):
+    """One configured speaking style, as offered to the read-aloud UI."""
+
+    name: str = Field(description="Style name (the value to send as `style`)")
+    in_menu: bool = Field(description="Whether the picker should offer this style")
+
+
+class TextToSpeechProfile(BaseModel):
+    """Pacing, structure and clip settings for the active TTS model.
+
+    Every field is present: a model with no stored profile reads as the
+    defaults, so the player never has to merge a partial object.
+    """
+
+    pause_heading_ms: int = Field(
+        default=600, description="Silence after a heading before the next clip (ms)"
+    )
+    pause_paragraph_ms: int = Field(
+        default=500, description="Silence after a paragraph or blockquote (ms)"
+    )
+    pause_table_row_ms: int = Field(default=150, description="Silence between table rows (ms)")
+    pause_code_ms: int = Field(
+        default=400, description="Silence after a code or diagram marker (ms)"
+    )
+    pause_list_item_ms: int = Field(
+        default=0,
+        description="Silence between list items (ms); 0 reads a whole list as one clip",
+    )
+    table_cell_joiner: str = Field(
+        default="comma",
+        description="What goes between the cells of a table row: comma | semicolon | pause",
+    )
+    table_header_mode: str = Field(
+        default="row", description="How a table header row is read: row | prefix | skip"
+    )
+    inline_code_max_chars: int = Field(
+        default=40,
+        description="Inline code up to this length is spoken; longer becomes the code marker",
+    )
+    code_marker: str = Field(
+        default="Code omitted.",
+        description="Said in place of a code block (empty = skip silently)",
+    )
+    diagram_marker: str = Field(
+        default="Diagram omitted.",
+        description="Said in place of a diagram (empty = skip silently)",
+    )
+    clip_min_chars: int = Field(
+        default=20, description="A shorter line folds into the next clip (headings, labels)"
+    )
+    clip_max_chars: int = Field(
+        default=600, description="Longest clip; longer text splits at a comma or space"
+    )
+    max_clips: int = Field(
+        default=200, description="Clips read per reply before it stops with a notice"
+    )
+
+
+class TextToSpeechStylesResponse(BaseModel):
+    """The style choices a read-aloud client may offer for the TTS role."""
+
+    styles: list[TextToSpeechStyleInfo] = Field(
+        description="Every configured style, in stored order; instruction text stays server-side"
+    )
+    default: str = Field(
+        description="Default style name from audio.tts_style (empty = no instruction)"
+    )
+    instructions_supported: bool = Field(
+        description=(
+            "Whether the configured TTS model accepts instructions; false when no TTS role "
+            "is configured"
+        )
+    )
+    playback_rate: float = Field(
+        default=1.0,
+        description="Read-aloud playback speed from audio.tts_playback_rate (0.5-2.0)",
+    )
+    profile: TextToSpeechProfile = Field(
+        default_factory=TextToSpeechProfile,
+        description=(
+            "Pacing, structure and clip settings for the alias the TTS role resolves to; "
+            "audio.tts_profiles with the defaults filled in"
+        ),
+    )
+    stream: bool = Field(
+        default=False,
+        description=(
+            "Whether read-aloud speaks a reply while it is still being written (audio.tts_stream)"
+        ),
+    )
+
+
+class SttConfigResponse(BaseModel):
+    """The dictation knobs the browser applies while recording.
+
+    Fetched per transport base by the mic module, so a coordinator pane and a
+    node-hosted interactive pane each read their own process's settings.
+    """
+
+    auto_stop: bool = Field(
+        default=False,
+        description="audio.stt_auto_stop: end dictation when the speaker goes quiet",
+    )
+    silence_ms: int = Field(
+        default=900,
+        description="audio.stt_silence_ms: quiet milliseconds before auto-stop fires (300-5000)",
+    )
+    vad_threshold: float = Field(
+        default=0.5,
+        description=(
+            "audio.stt_vad_threshold: speech probability that counts as talking (0.1-0.9); "
+            "silence is this value minus 0.15"
+        ),
+    )
 
 
 class ApproveRequest(BaseModel):

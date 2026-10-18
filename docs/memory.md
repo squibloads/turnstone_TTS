@@ -33,10 +33,14 @@ Each memory has four index dimensions:
 | `workstream`  | Visible only within the originating workstream                  |
 | `user`        | Follows the authenticated user across workstreams               |
 | `coordinator` | Coordinator sessions only; follows the acting user              |
+| `voice`       | Voice sessions only; follows the acting user                    |
 | `project`     | Shared by workstreams attached to one active project             |
 
 A memory's identity is the tuple `(name, scope, scope_id)`. Saving a memory
 with the same identity upserts -- updating content while preserving the ID.
+The `voice` scope is the voice persona's per-user namespace; see
+[Voice persona](voice.md#voice-persona) for why it is kept separate from
+`coordinator`.
 
 ### Name normalization and legacy rows
 

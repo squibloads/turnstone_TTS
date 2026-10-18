@@ -55,6 +55,7 @@ from turnstone.console.schedule_timing import (
     no_next_run_reason,
     resolve_zone,
 )
+from turnstone.console.voice_admin import admin_voice_meta, admin_voice_preview
 from turnstone.core.audit import record_audit
 from turnstone.core.auth import (
     AUTH_COOKIE_CONSOLE,
@@ -139,6 +140,7 @@ from turnstone.core.storage import (
     WorkstreamLeaseLostError,
 )
 from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
+from turnstone.core.voice_config import VOICE_MEMORY_SCOPE
 from turnstone.core.web_helpers import (
     RevalidatingStaticFiles,
     is_safe_static_asset_path,
@@ -296,6 +298,24 @@ _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 # _COMMAND_RESPONSE_BACKSTOP_S); a test pins the inequality.  The SSE
 # proxy client's granular Timeout is a separate contract.
 _PROXY_CLIENT_TIMEOUT_S = 30
+
+
+def _proxy_tts_timeout(request: Request) -> float | None:
+    """The ``audio.tts_timeout_seconds`` setting, or None to keep the pool's timeout.
+
+    The node's ``tts`` route answers only when the whole clip is synthesized, so
+    a long reply on a local backend outlasts ``_PROXY_CLIENT_TIMEOUT_S``.  Read
+    per request; an unusable value falls back to the shared timeout.
+    """
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store is None:
+        return None
+    try:
+        value = float(config_store.get("audio.tts_timeout_seconds"))
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value < float("inf") else None
+
 
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
 
@@ -1714,6 +1734,17 @@ async def list_available_models(request: Request) -> JSONResponse:
     # the session model on.
     if not judge_default_alias or judge_default_alias not in enabled_aliases:
         judge_default_alias = coordinator_default_alias
+    # STT/TTS are media roles: advertise a default only when the alias exists in
+    # the coordinator registry AND is capability-eligible (the gate the TTS
+    # endpoint applies), so the UI offers read-aloud only where it will work.
+    from turnstone.core.audio import resolve_role_alias
+
+    stt_default_alias = (
+        resolve_role_alias(config_store=cs, registry=coord_registry, role="stt") or ""
+    )
+    tts_default_alias = (
+        resolve_role_alias(config_store=cs, registry=coord_registry, role="tts") or ""
+    )
     return JSONResponse(
         {
             "models": models,
@@ -1721,7 +1752,105 @@ async def list_available_models(request: Request) -> JSONResponse:
             "channel_default_alias": channel_default_alias,
             "coordinator_default_alias": coordinator_default_alias,
             "judge_default_alias": judge_default_alias,
+            "stt_default_alias": stt_default_alias,
+            "tts_default_alias": tts_default_alias,
         }
+    )
+
+
+async def text_to_speech(request: Request) -> Response:
+    """POST /v1/api/tts — read a coordinator reply aloud.
+
+    Coordinator sessions run in the console, not on a node, so the console must
+    serve the same TTS contract the node does; the registry here is the
+    coordinator's (``coord_registry``), which may be ``None`` when no models are
+    configured — that surfaces as the standard "not configured" 503.
+    """
+    from turnstone.core.web_helpers import text_to_speech_response
+
+    return await text_to_speech_response(
+        request, registry=getattr(request.app.state, "coord_registry", None)
+    )
+
+
+async def list_tts_styles(request: Request) -> JSONResponse:
+    """GET /v1/api/tts/styles — speaking styles for coordinator read-aloud.
+
+    Mirrors the node's route against the coordinator registry (``coord_registry``),
+    so the picker offers the same choices wherever a reply is read aloud.
+    """
+    from turnstone.core.web_helpers import tts_styles_payload
+
+    return JSONResponse(
+        tts_styles_payload(
+            config_store=getattr(request.app.state, "config_store", None),
+            registry=getattr(request.app.state, "coord_registry", None),
+        )
+    )
+
+
+async def stt_config(request: Request) -> JSONResponse:
+    """GET /v1/api/stt/config — the browser-side dictation knobs.
+
+    Coordinator sessions run in the console, so the console's own composers
+    must be able to read its settings without a node in between; the payload is
+    the node's, served from this process's config store.
+    """
+    from turnstone.core.web_helpers import stt_config_payload
+
+    return JSONResponse(
+        stt_config_payload(config_store=getattr(request.app.state, "config_store", None))
+    )
+
+
+async def _authorize_coordinator_ws(request: Request, ws_id: str) -> JSONResponse | None:
+    """Gate a speech-to-text request on the caller's access to coordinator ``ws_id``.
+
+    Same ladder as the other per-coordinator verbs (``admin.coordinator``, then
+    coordinator subsystem up, then a kind-strict, project-tenancy-aware lookup).
+    Kind-strictness matters here: this route shares its path with the node's
+    interactive one, and a console that answered for any stored workstream
+    would be an existence oracle for interactive sessions it does not serve.
+    """
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    storage = getattr(request.app.state, "auth_storage", None)
+    _ws, err404 = await _resolve_coordinator_or_404(
+        request, coord_mgr, storage, ws_id, _auth_user_id(request)
+    )
+    return err404
+
+
+async def speech_to_text(request: Request) -> JSONResponse:
+    """POST /v1/api/workstreams/{ws_id}/speech-to-text — dictate into a coordinator composer.
+
+    Coordinators run in the console, so it serves the node's STT contract
+    against the coordinator registry; the transcript only fills the composer.
+    """
+    from turnstone.core.web_helpers import speech_to_text_response
+
+    return await speech_to_text_response(
+        request,
+        registry=getattr(request.app.state, "coord_registry", None),
+        authorize=_authorize_coordinator_ws,
+    )
+
+
+async def speech_to_text_stream(request: Request) -> Response:
+    """POST /v1/api/workstreams/{ws_id}/speech-to-text/stream — streamed dictation.
+
+    Console twin of the node route; see :func:`speech_to_text`.
+    """
+    from turnstone.core.web_helpers import speech_to_text_stream_response
+
+    return await speech_to_text_stream_response(
+        request,
+        registry=getattr(request.app.state, "coord_registry", None),
+        authorize=_authorize_coordinator_ws,
     )
 
 
@@ -3732,11 +3861,18 @@ async def _proxy_post(
     try:
         headers = {"Content-Type": content_type}
         headers.update(_proxy_auth_headers(request))
+        extra: dict[str, Any] = {}
+        if path == "tts":
+            tts_timeout = _proxy_tts_timeout(request)
+            if tts_timeout is not None:
+                # Only the wait for the clip; connecting and the pool keep the shared bound.
+                extra["timeout"] = httpx.Timeout(_PROXY_CLIENT_TIMEOUT_S, read=tts_timeout)
         resp = await client.request(
             request.method,
             target,
             content=body,
             headers=headers,
+            **extra,
         )
         return Response(
             content=resp.content,
@@ -10011,9 +10147,10 @@ def _memory_scope_label(
     scope: str, scope_id: str, storage: Any, cache: dict[tuple[str, str], str]
 ) -> str:
     """Resolve a memory's ``scope_id`` to a human label — username for user /
-    coordinator scope, workstream title for workstream scope, project name for
-    project scope.  Cached per (scope, scope_id) so a list of 200 memories costs
-    one lookup per distinct target; falls back to the raw id on miss/error."""
+    coordinator / voice scope, workstream title for workstream scope, project
+    name for project scope.  Cached per (scope, scope_id) so a list of 200
+    memories costs one lookup per distinct target; falls back to the raw id on
+    miss/error."""
     if not scope_id:
         return ""
     key = (scope, scope_id)
@@ -10021,7 +10158,7 @@ def _memory_scope_label(
         return cache[key]
     label = scope_id
     try:
-        if scope in ("user", "coordinator"):
+        if scope in ("user", "coordinator", VOICE_MEMORY_SCOPE):
             user = storage.get_user(scope_id)
             label = (user or {}).get("username") or scope_id
         elif scope == "workstream":
@@ -17714,6 +17851,17 @@ def create_app(
                 "/v1",
                 routes=[
                     *coord_workstream_routes,
+                    # Dictation for the coordinator composer (coordinators live here).
+                    Route(
+                        "/api/workstreams/{ws_id}/speech-to-text",
+                        speech_to_text,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/workstreams/{ws_id}/speech-to-text/stream",
+                        speech_to_text_stream,
+                        methods=["POST"],
+                    ),
                     Route("/api/cluster/overview", cluster_overview),
                     Route("/api/cluster/nodes", cluster_nodes),
                     Route("/api/cluster/workstreams", cluster_workstreams),
@@ -17786,6 +17934,9 @@ def create_app(
                     ),
                     Route("/api/route", route_lookup, methods=["GET"]),
                     Route("/api/models", list_available_models),
+                    Route("/api/tts", text_to_speech, methods=["POST"]),
+                    Route("/api/tts/styles", list_tts_styles),
+                    Route("/api/stt/config", stt_config),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
@@ -18036,6 +18187,13 @@ def create_app(
                         "/api/admin/settings/{key:path}",
                         admin_delete_setting,
                         methods=["DELETE"],
+                    ),
+                    # Voice: read-aloud tuning metadata and the cleanup preview
+                    Route("/api/admin/voice/meta", admin_voice_meta),
+                    Route(
+                        "/api/admin/voice/preview",
+                        admin_voice_preview,
+                        methods=["POST"],
                     ),
                     # System: MCP Registry
                     Route("/api/admin/mcp-registry/search", admin_registry_search),

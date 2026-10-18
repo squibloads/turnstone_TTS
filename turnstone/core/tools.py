@@ -13,6 +13,9 @@ _META_KEYS = {
     "task_agent",
     "coordinator",
     "interactive",
+    # Voice-persona-only coordinator tool: kept out of COORDINATOR_TOOLS and
+    # added back by VOICE_COORDINATOR_TOOLS (see the lists below).
+    "voice",
     "auto_approve",
     "primary_key",
     # Per-kind variant overrides.  Schema:
@@ -96,12 +99,37 @@ def _apply_kind_variant(tool: dict[str, Any], kind: str, meta: dict[str, Any]) -
 TOOLS, _META = _load_tools()
 
 TASK_AGENT_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("task_agent")]
-# COORDINATOR_TOOLS apply the ``coordinator`` kind variant (if any) so a
-# coord session sees the coord-tailored description + parameter schema.
-COORDINATOR_TOOLS = [
+# The full coordinator-kind shelf: every tool carrying ``"coordinator": true``,
+# with the ``coordinator`` kind variant (if any) applied.  The two public lists
+# below are views of it - kept in this order so a future coordinator-flavoured
+# variant reaches a voice session too (voice layers its own variant ON TOP of
+# the coordinator flavour, never instead of it).
+_COORDINATOR_KIND_TOOLS = [
     _apply_kind_variant(t, "coordinator", _META[t["function"]["name"]])
     for t in TOOLS
     if _META[t["function"]["name"]].get("coordinator")
+]
+# ``"voice": true`` marks a tool that belongs to the voice persona only; it
+# rides TOOLS (and the coordinator-kind metadata) so the tool loader and
+# introspection see it, but it is not on the plain coordinator surface.
+COORDINATOR_TOOLS = [
+    t for t in _COORDINATOR_KIND_TOOLS if not _META[t["function"]["name"]].get("voice")
+]
+# The one coordinator tool a voice session must NOT have: its call parks the
+# turn until a child finishes, and a spoken turn has no one watching the wait.
+# Voice receives reports on the user's next turn instead (``voice_report``).
+VOICE_EXCLUDED_COORDINATOR_TOOLS = frozenset({"wait_for_workstream"})
+# Voice coordinators are coordinator-kind sessions built under the ``voice``
+# persona.  They see the coordinator shelf minus the blocking wait, then apply
+# the ``voice`` kind variant on top: the memory variant narrows the scope enum
+# to the private voice namespace (plus project) and replaces the coordinator
+# description, so it must WIN over the coordinator variant rather than merge
+# with it.  Every tool with no ``voice`` variant passes through unchanged
+# (same object, no copy).
+VOICE_COORDINATOR_TOOLS = [
+    _apply_kind_variant(t, "voice", _META[t["function"]["name"]])
+    for t in _COORDINATOR_KIND_TOOLS
+    if t["function"]["name"] not in VOICE_EXCLUDED_COORDINATOR_TOOLS
 ]
 # Interactive sessions — the default session kind — must NOT see coordinator-only
 # tools (``spawn_workstream`` et al.) in their tool set.  Coordinator-only tools

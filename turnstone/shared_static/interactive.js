@@ -58,6 +58,15 @@ import {
 import { redactCredentials, tryPrettyJson } from "./redact_credentials.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "./mcp_error.js";
 import { authFetch } from "./auth.js";
+import {
+  addTtsAction,
+  addTtsActionsToFinished,
+  createTtsPlayer,
+  extractSpeechSegments,
+  getVoiceRoles,
+  shapeSpeechSegments,
+} from "./tts_player.js";
+import { createMicController } from "./stt_mic.js";
 import { showToast } from "./toast.js";
 import { Composer } from "./composer.js";
 import {
@@ -112,15 +121,6 @@ import {
 
 let _paneCounter = 0;
 
-// Voice-role availability comes from /v1/api/models (stt_default_alias /
-// tts_default_alias — present only when an audio-capable model role is
-// configured).  Memoized so all panes share a single fetch; affordances stay
-// hidden until it resolves.
-// Memoized per transport base — a console pane proxies a node-hosted session,
-// so its voice roles come from THAT node's /v1/api/models (base "/node/{id}"),
-// not the console's; standalone panes use base "" and share one fetch.
-const _voiceRolesPromises = {};
-
 // Max child steps held per task agent while its parent row is unpainted (see
 // InteractivePane._bufferAgentOrphan).  A real agent's whole sub-trajectory is
 // well under this; the cap only bounds a pathological never-arriving parent.
@@ -131,20 +131,6 @@ const _AGENT_ORPHAN_CAP = 256;
 // escaped to a top-level row so it stays VISIBLE rather than buffered forever.
 // The ordering race the buffer targets resolves within a frame, far inside it.
 const _AGENT_ORPHAN_GRACE_MS = 500;
-
-function getVoiceRoles(base) {
-  base = base || "";
-  if (!_voiceRolesPromises[base]) {
-    _voiceRolesPromises[base] = authFetch(base + "/v1/api/models")
-      .then((r) => (r.ok ? r.json() : {}))
-      .then((d) => ({
-        stt: !!(d && d.stt_default_alias),
-        tts: !!(d && d.tts_default_alias),
-      }))
-      .catch(() => ({ stt: false, tts: false }));
-  }
-  return _voiceRolesPromises[base];
-}
 
 // Visually-hidden polite live region for voice status (recording / playback)
 // so screen-reader users perceive state changes otherwise conveyed only by
@@ -497,19 +483,17 @@ class Pane {
     this._pendingEditSend = null;
     // Voice I/O (mic STT + per-message TTS playback)
     this._voiceRoles = { stt: false, tts: false };
-    this._micBtn = null;
-    this._micIcon = null;
-    this._micDenied = false;
-    this._recorder = null;
-    this._recordingStream = null;
-    this._isRecording = false;
-    this._discardRecording = false;
-    this._recordAborted = false;
-    this._recordTimer = null;
-    this._recordStartMs = 0;
-    this._ttsAudio = null;
-    this._ttsBtnActive = null;
-    this._ttsSeq = 0;
+    this._mic = null;
+    // The live streaming-read-aloud run for the reply being written, if any
+    // (created on the first content delta and flushed at stream_end).
+    this._ttsStream = null;
+    // reset() and replayHistory() call _stopTTS() before any playback, so the
+    // player exists from construction (the base is read per request: a console
+    // pane's is fixed, but a test or host may set it after construction).
+    this._ttsPlayer = createTtsPlayer({
+      base: () => this._base,
+      announce: voiceAnnounce,
+    });
     this._createDOM();
   }
 
@@ -583,8 +567,11 @@ class Pane {
     // orphan grace timers silently dropped buffered steps.  Ws-switch and
     // full-reload cleanup happens in _loadHistoryThenConnect; terminal
     // cleanup in the factory's destroy().
+    //
+    // Read-aloud is NOT stopped here: hiding the tab closes the stream, and
+    // audio that stops when you switch tabs defeats listening.  It stops where
+    // its button goes away (reset, replayHistory, destroy).
     this._stopRecording(true);
-    this._stopTTS();
   }
 
   // composer.setBusy runs unconditionally so the Stop button label /
@@ -613,14 +600,7 @@ class Pane {
     if (edge && !next) this.queue.onIdleEdge();
     // The mic produces composer input the user can only send when idle — keep
     // it in lockstep with the send button (which composer.setBusy gates).
-    if (this._micBtn && !this._micDenied) {
-      if (next) {
-        this._stopRecording(true); // abandon any in-flight recording
-        this._micBtn.disabled = true;
-      } else if (!this._micBtn.classList.contains("is-busy")) {
-        this._micBtn.disabled = false;
-      }
-    }
+    if (this._mic) this._mic.syncBusy();
   }
 
   // Shared-workstream send gate: while another participant's turn is in flight,
@@ -1453,15 +1433,22 @@ class Pane {
 
     // Voice input: mic button, hidden until the STT role is confirmed
     // available (so it never appears when voice isn't configured).
-    this._buildMicButton();
-    getVoiceRoles(this._base).then((roles) => {
-      this._voiceRoles = roles;
-      if (this._micBtn) this._micBtn.style.display = roles.stt ? "" : "none";
-      // Right-align the mic next to send (instead of stranded by the model
-      // chip) only when STT is actually available; .has-mic drives the CSS.
-      if (this.composer && this.composer.actionsRowEl)
-        this.composer.actionsRowEl.classList.toggle("has-mic", !!roles.stt);
+    this._mic = createMicController({
+      composer: this.composer,
+      base: () => this._base,
+      wsId: () => this.wsId,
+      announce: voiceAnnounce,
+      isBusy: () => this.busy,
     });
+    getVoiceRoles(this._base).then((roles) => this._applyVoiceRoles(roles));
+  }
+
+  _applyVoiceRoles(roles) {
+    this._voiceRoles = roles;
+    if (this._mic) this._mic.setAvailable(!!roles.stt);
+    // The roles resolve asynchronously, usually after the first replay has
+    // already built bubbles; give those their speaker now.
+    this._addTtsActionsToFinished();
   }
 
   connectSSE(wsId) {
@@ -2347,6 +2334,7 @@ class Pane {
         }
         this.contentBuffer += evt.text;
         streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
+        this._streamTTS(evt.text);
         this.scrollToBottom();
         break;
 
@@ -2366,6 +2354,9 @@ class Pane {
         // frozen bar until the abandoned worker notices at its next
         // checkpoint.
         resetCompactionHolder(this._compaction);
+        // This segment's text is complete: speak the sentence still in the
+        // feeder's buffer, then let the run drain its queue.
+        this._endTTSStream();
         // Reset the segment state BEFORE the finalize render, and guard the
         // render with a plain-text fallback (mirrors coordinator.js).  With
         // the old order a finalize throw skipped these clears, so every
@@ -2744,6 +2735,7 @@ class Pane {
         // Show "Cancelling..." state; state_change will transition to ready.
         // If state_change already arrived (busy is false), the cancel is
         // already handled — don't re-enter the cancelling state.
+        this._cancelTTSStream(); // drop anything spoken for the cancelled text
         if (!this.busy) break;
         // Clear any prior timeouts first (duplicate cancelled events).
         clearTimeout(this._cancelTimeout);
@@ -3108,7 +3100,8 @@ class Pane {
   // O(1) per message, unlike the removed whole-transcript sweep this
   // file's retry attach deliberately avoids (see
   // _attachRetryToLastAssistant).  The bar is shared with the transient
-  // retry / TTS buttons the holder mechanism adds and removes.  Callers
+  // retry button the holder mechanism adds and removes (and the speaker
+  // _addTtsActionsToFinished adds once the reply settles).  Callers
   // pass a JUST-CREATED bubble (both stream branches via
   // _newAssistantBubble, and replay) — no dedup needed against an empty
   // bar.
@@ -3128,380 +3121,74 @@ class Pane {
   // Voice I/O: microphone dictation (STT) + per-message playback (TTS)
   // -------------------------------------------------------------------------
 
-  _buildMicButton() {
-    if (!this.composer || !this.composer.actionsRowEl) return;
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "composer-mic-btn";
-    btn.style.display = "none"; // revealed once the STT role is confirmed
-    btn.title = "Record speech to text";
-    btn.setAttribute("aria-label", "Record speech to text");
-    btn.setAttribute("aria-pressed", "false");
-    const icon = document.createElement("span");
-    icon.className = "composer-mic-icon icon-mic";
-    icon.setAttribute("aria-hidden", "true");
-    btn.appendChild(icon);
-    this._micIcon = icon;
-    btn.addEventListener("click", () => this._toggleRecording());
-    this.composer.actionsRowEl.insertBefore(btn, this.sendBtn || null);
-    this._micBtn = btn;
-  }
-
-  _syncMicButton() {
-    if (!this._micBtn) return;
-    const rec = !!this._isRecording;
-    this._micBtn.classList.toggle("is-recording", rec);
-    this._micBtn.setAttribute("aria-pressed", rec ? "true" : "false");
-    if (this._micIcon) {
-      this._micIcon.classList.toggle("icon-stop", rec);
-      this._micIcon.classList.toggle("icon-mic", !rec);
-    }
-    const label = rec
-      ? "Stop recording and transcribe"
-      : "Record speech to text";
-    this._micBtn.title = label;
-    this._micBtn.setAttribute("aria-label", label);
-  }
-
-  _toggleRecording() {
-    if (this._isRecording) {
-      this._stopRecording(false);
-    } else {
-      this._startRecording();
-    }
-  }
-
-  _startRecording() {
-    if (this._isRecording || this.busy) return;
-    if (
-      !navigator.mediaDevices ||
-      !navigator.mediaDevices.getUserMedia ||
-      typeof MediaRecorder === "undefined"
-    ) {
-      showToast("Microphone capture is not supported in this browser", "error");
-      return;
-    }
-    // Synchronous abort latch: if teardown (reset / pane switch) runs while the
-    // permission prompt is open, the stream the promise later hands us must be
-    // stopped instead of going hot after teardown.
-    this._recordAborted = false;
-    navigator.mediaDevices
-      .getUserMedia({ audio: true })
-      .then((stream) => {
-        if (this._recordAborted) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        this._recordingStream = stream;
-        let mimeType = "";
-        const candidates = [
-          "audio/webm;codecs=opus",
-          "audio/webm",
-          "audio/ogg;codecs=opus",
-          "audio/mp4",
-        ];
-        for (let i = 0; i < candidates.length; i++) {
-          if (
-            MediaRecorder.isTypeSupported &&
-            MediaRecorder.isTypeSupported(candidates[i])
-          ) {
-            mimeType = candidates[i];
-            break;
-          }
-        }
-        const rec = mimeType
-          ? new MediaRecorder(stream, { mimeType })
-          : new MediaRecorder(stream);
-        const chunks = [];
-        rec.addEventListener("dataavailable", (e) => {
-          if (e.data && e.data.size) chunks.push(e.data);
-        });
-        rec.addEventListener("stop", () => {
-          this._teardownRecordingStream();
-          this._isRecording = false;
-          this._stopRecordTimer();
-          this._syncMicButton();
-          const discard = this._discardRecording;
-          this._discardRecording = false;
-          if (discard) return;
-          const blob = new Blob(chunks, {
-            type: rec.mimeType || mimeType || "audio/webm",
-          });
-          if (blob.size) this._uploadForTranscription(blob);
-        });
-        this._recorder = rec;
-        this._isRecording = true;
-        this._discardRecording = false;
-        this._startRecordTimer();
-        this._syncMicButton();
-        voiceAnnounce(
-          "Recording. Activate the microphone button again to stop.",
-        );
-        rec.start();
-      })
-      .catch(() => {
-        // Denied / hardware unavailable: leave a persistent disabled state with
-        // guidance — a hot button reads as dead once the browser blocks re-prompts.
-        this._teardownRecordingStream();
-        this._isRecording = false;
-        this._stopRecordTimer();
-        this._setMicDenied();
-      });
-  }
-
-  _setMicDenied() {
-    this._micDenied = true;
-    showToast("Microphone access was denied", "error");
-    this._syncMicButton();
-    if (this._micBtn) {
-      this._micBtn.disabled = true;
-      const msg =
-        "Microphone blocked — enable it in your browser's site settings";
-      this._micBtn.title = msg;
-      this._micBtn.setAttribute("aria-label", msg);
-    }
-  }
-
-  _startRecordTimer() {
-    this._recordStartMs = Date.now();
-    this._stopRecordTimer();
-    this._recordTimer = window.setInterval(() => this._tickRecordTimer(), 500);
-  }
-
-  _stopRecordTimer() {
-    if (this._recordTimer) {
-      window.clearInterval(this._recordTimer);
-      this._recordTimer = null;
-    }
-  }
-
-  _tickRecordTimer() {
-    if (!this._isRecording || !this._micBtn) return;
-    const secs = Math.max(
-      0,
-      Math.floor((Date.now() - this._recordStartMs) / 1000),
-    );
-    const mmss =
-      Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
-    this._micBtn.title = "Recording " + mmss + " — activate to stop";
-  }
-
+  // The recorder lives in stt_mic.js; reset / hide / destroy reach it here.
   _stopRecording(discard) {
-    this._discardRecording = !!discard;
-    this._recordAborted = true; // abort a getUserMedia still in flight
-    if (this._recorder && this._recorder.state !== "inactive") {
-      try {
-        this._recorder.stop();
-      } catch (e) {
-        /* already stopped */
-      }
-      return;
-    }
-    this._teardownRecordingStream();
-    this._stopRecordTimer();
-    if (this._isRecording) {
-      this._isRecording = false;
-      this._syncMicButton();
-    }
-  }
-
-  _teardownRecordingStream() {
-    if (this._recordingStream) {
-      this._recordingStream.getTracks().forEach((t) => t.stop());
-      this._recordingStream = null;
-    }
-    this._recorder = null;
-  }
-
-  _uploadForTranscription(blob) {
-    if (!this.wsId) return;
-    const ext =
-      blob.type.indexOf("ogg") !== -1
-        ? "ogg"
-        : blob.type.indexOf("mp4") !== -1
-          ? "mp4"
-          : "webm";
-    const fd = new FormData();
-    fd.append("audio", blob, "speech." + ext);
-    if (this._micBtn) {
-      this._micBtn.disabled = true;
-      this._micBtn.classList.add("is-busy");
-    }
-    voiceAnnounce("Transcribing…");
-    const resetMic = () => {
-      if (this._micBtn && !this._micDenied) {
-        this._micBtn.disabled = !!this.busy;
-        this._micBtn.classList.remove("is-busy");
-      }
-    };
-    authFetch(
-      this._base +
-        "/v1/api/workstreams/" +
-        encodeURIComponent(this.wsId) +
-        "/speech-to-text/stream",
-      { method: "POST", body: fd },
-    )
-      .then(async (r) => {
-        if (!r.ok) {
-          let msg = "Transcription failed";
-          try {
-            const body = await r.json();
-            if (body && body.error) msg = body.error;
-          } catch (_e) {
-            /* non-JSON error body */
-          }
-          showToast(msg, "error");
-          return;
-        }
-        // Stream transcript deltas into the composer as they arrive (first word
-        // in ~0.3s) instead of waiting for the whole transcript.
-        const reader = r.body.getReader();
-        const decoder = new TextDecoder();
-        let started = false;
-        let got = false;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          if (!chunk || !this.inputEl) continue;
-          got = true;
-          if (!started) {
-            // Read the composer's value now (not before the await) so text the
-            // user typed while transcribing isn't clobbered.
-            const cur = this.inputEl.value || "";
-            this.inputEl.value = cur
-              ? cur.replace(/\s*$/, "") + " " + chunk
-              : chunk;
-            started = true;
-          } else {
-            this.inputEl.value += chunk;
-          }
-          // Drive the composer's auto-resize + send-enable listeners.
-          this.inputEl.dispatchEvent(new Event("input", { bubbles: true }));
-        }
-        if (got) {
-          if (this.inputEl) this.inputEl.focus();
-          voiceAnnounce("Transcript added to message.");
-        } else {
-          showToast("No speech detected", "error");
-        }
-      })
-      .catch((err) => {
-        showToast(
-          "Transcription failed: " + (err && err.message ? err.message : err),
-          "error",
-        );
-      })
-      .finally(resetMic);
+    if (this._mic) this._mic.stop(discard);
   }
 
   _addTtsAction(el) {
-    const bar = ensureMsgActionsBar(el);
-    if (bar.querySelector(".msg-tts-btn")) return; // already added
-    // Inserted BEFORE the persistent copy button (below) so DOM order,
-    // tab order and visual order agree: [retry, tts, copy], with copy
-    // anchoring the corner on every bubble.
-    const btn = document.createElement("button");
-    btn.className = "msg-action-btn msg-tts-btn";
-    btn.title = "Play response aloud";
-    btn.setAttribute("aria-label", "Play response aloud");
-    btn.setAttribute("aria-pressed", "false");
-    const icon = document.createElement("span");
-    icon.className = "icon-speaker";
-    icon.setAttribute("aria-hidden", "true");
-    btn.appendChild(icon);
-    btn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this._playMessageTTS(el, btn);
-    });
-    bar.insertBefore(btn, bar.querySelector(".msg-copy-btn"));
+    // The style probe rides the same transport base as the TTS POST: a console
+    // pane's replies live on its node, not on the console.
+    addTtsAction(el, (btn) => this._playMessageTTS(el, btn), () => this._base);
   }
 
-  // Strip code blocks / inline code / rendered math so TTS doesn't read source
-  // or KaTeX accessibility text out character-by-character.
-  _extractSpeakableText(bodyEl) {
-    const clone = bodyEl.cloneNode(true);
-    clone
-      .querySelectorAll("pre, code, .katex, .katex-display")
-      .forEach((n) =>
-        n.replaceWith(document.createTextNode(" (code omitted) ")),
-      );
-    return (clone.textContent || "").replace(/\s+/g, " ").trim();
+  // Speaker on every finished assistant reply, not just the retry holder (the
+  // walk lives in tts_player.js, shared with the coordinator pane).  The bubble
+  // still streaming is skipped so half a reply is never read; the settle edge
+  // (_attachRetryToLastAssistant) picks it up.
+  _addTtsActionsToFinished() {
+    if (!(this._voiceRoles && this._voiceRoles.tts) || !this.messagesEl) return;
+    addTtsActionsToFinished(
+      this.messagesEl,
+      this.currentAssistantEl,
+      (el, btn) => this._playMessageTTS(el, btn),
+      () => this._base,
+    );
   }
 
-  _playMessageTTS(el, btn) {
-    // Toggle: clicking the active button (or any while playing) stops first.
-    if (this._ttsAudio) {
-      const wasThis = this._ttsBtnActive === btn;
-      this._stopTTS();
-      if (wasThis) return;
-    }
-    const bodyEl = el.querySelector(".msg-body") || el;
-    const text = this._extractSpeakableText(bodyEl);
-    if (!text) return;
-    // Serialize: a monotonic token guards against an earlier (slower) request
-    // resolving after a newer one — which would double-play and leak the blob.
-    const token = ++this._ttsSeq;
-    btn.classList.add("is-busy");
-    btn.disabled = true;
-    authFetch(this._base + "/v1/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    })
-      .then((r) => {
-        if (!r.ok) {
-          return r.json().then((b) => {
-            throw new Error((b && b.error) || "Speech synthesis failed");
-          });
-        }
-        return r.blob();
-      })
-      .then((audioBlob) => {
-        const url = URL.createObjectURL(audioBlob);
-        if (token !== this._ttsSeq) {
-          URL.revokeObjectURL(url); // superseded — don't play or leak
-          return;
-        }
-        const audio = new Audio(url);
-        this._ttsAudio = audio;
-        this._ttsBtnActive = btn;
-        btn.classList.add("is-playing");
-        btn.setAttribute("aria-pressed", "true");
-        voiceAnnounce("Playing response.");
-        audio.addEventListener("ended", () => this._stopTTS());
-        audio.addEventListener("error", () => this._stopTTS());
-        audio.play().catch(() => this._stopTTS());
-      })
-      .catch((err) => {
-        showToast(
-          err && err.message ? err.message : "Speech synthesis failed",
-          "error",
-        );
-      })
-      .finally(() => {
-        btn.classList.remove("is-busy");
-        btn.disabled = false;
-      });
+  // Speech extraction and shaping are pure functions in tts_player.js; these
+  // keep the pane's method names as the seam hosts and tests reach them by.
+  _extractSpeechSegments(bodyEl) {
+    return extractSpeechSegments(bodyEl);
+  }
+
+  _shapeSpeechSegments(raw) {
+    return shapeSpeechSegments(raw);
+  }
+
+  async _playMessageTTS(el, btn) {
+    return this._ttsPlayer.play(el, btn);
+  }
+
+  // Streaming read-aloud: content deltas go to one feeder per reply, which
+  // hands the player only completed sentences.  A streaming run auto-plays,
+  // so it starts only in a voice session (_voiceMode); worker panes have
+  // none and stay silent, with the per-message speaker still available.
+  _streamTTS(text) {
+    if (!this._voiceMode) return;
+    if (!(this._voiceRoles && this._voiceRoles.tts) || !text) return;
+    if (!this._ttsStream) this._ttsStream = this._ttsPlayer.stream();
+    this._ttsStream.push(text);
+  }
+
+  _endTTSStream() {
+    if (!this._ttsStream) return;
+    this._ttsStream.end();
+    this._ttsStream = null; // the run keeps draining; the next reply starts fresh
+  }
+
+  _cancelTTSStream() {
+    if (!this._ttsStream) return;
+    this._ttsStream.cancel();
+    this._ttsStream = null;
   }
 
   _stopTTS() {
-    this._ttsSeq++; // invalidate any in-flight request
-    if (this._ttsAudio) {
-      try {
-        this._ttsAudio.pause();
-      } catch (e) {
-        /* ignore */
-      }
-      const src = this._ttsAudio.src || "";
-      if (src.indexOf("blob:") === 0) URL.revokeObjectURL(src);
-      this._ttsAudio = null;
-    }
-    if (this._ttsBtnActive) {
-      this._ttsBtnActive.classList.remove("is-playing");
-      this._ttsBtnActive.setAttribute("aria-pressed", "false");
-      this._ttsBtnActive = null;
-    }
+    // A reference left over a stop would swallow the next reply's deltas;
+    // clearing it lets the next content start a fresh run.  The player's own
+    // stop() drops the streaming run it is holding.
+    this._ttsStream = null;
+    this._ttsPlayer.stop();
   }
 
   _retryLast() {
@@ -3701,6 +3388,7 @@ class Pane {
 
   replayHistory(messages) {
     const scrollTop = this.messagesEl.scrollTop;
+    this._stopTTS(); // the speaker button is about to be detached
     this.messagesEl.replaceChildren();
     // A full committed-history render repairs any recorded truncation
     // gap — from the resync itself or an unrelated clear_ui rebuild — so
@@ -4103,22 +3791,23 @@ class Pane {
   }
 
   _attachRetryToLastAssistant() {
-    // Remove the previous holder's retry / TTS buttons via the tracked ref —
-    // the old whole-transcript ".msg.assistant .msg-actions" sweep was O(N)
-    // per busy→idle edge.  The bar itself stays: every assistant bubble owns
-    // one for its persistent copy button (_addCopyAction, at creation), and
-    // only the transient retry / TTS buttons move with the holder.  At most
-    // one bubble carries them (this method is their only writer); a holder
-    // detached by a rebuild no-ops harmlessly.
+    // Remove the previous holder's retry button via the tracked ref — the
+    // old whole-transcript ".msg.assistant .msg-actions" sweep was O(N) per
+    // busy→idle edge.  The bar itself stays: every assistant bubble owns one
+    // for its persistent copy and read-aloud buttons, and only the transient
+    // retry button moves with the holder.  At most one bubble carries it
+    // (this method is its only writer); a holder detached by a rebuild
+    // no-ops harmlessly.  The speaker is NOT removed: it belongs to every
+    // finished reply, and removing it would also kill a reply that is
+    // playing right now.
     if (this._retryHolderEl) {
       const oldBar = findMsgActionsBar(this._retryHolderEl);
       if (oldBar) {
-        oldBar
-          .querySelectorAll(".msg-retry-btn, .msg-tts-btn")
-          .forEach((b) => b.remove());
+        oldBar.querySelectorAll(".msg-retry-btn").forEach((b) => b.remove());
       }
       this._retryHolderEl = null;
     }
+    this._addTtsActionsToFinished();
     // Find the last assistant message with content and add retry.
     // Reasoning blocks emit as .msg.reasoning (distinct modifier) so the
     // .msg.assistant selector already excludes them — no extra guard needed.
@@ -4154,9 +3843,6 @@ class Pane {
     }
     if (lastAssistant) {
       this._addRetryAction(lastAssistant);
-      if (this._voiceRoles && this._voiceRoles.tts) {
-        this._addTtsAction(lastAssistant);
-      }
       this._retryHolderEl = lastAssistant;
     }
   }
@@ -6122,6 +5808,7 @@ function createInteractivePane(root, wsId, opts) {
       }
       pane._reasoningActivity.finish();
       pane.disconnectSSE();
+      pane._stopTTS();
       // The document-level visibilitychange listener holds a strong ref
       // to the pane — leaving it registered would both leak the pane and
       // let a show edge reopen a stream for a destroyed controller.

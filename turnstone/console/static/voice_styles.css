@@ -1,0 +1,97 @@
+/* Admin › Voice › Styles — the speaking-style list.
+   The list rides on the console's .admin-colheaders / .admin-row grid and the
+   create/edit shelf on shared_static/hatch.{css,js}; only the grid tracks, the
+   two-line instruction clamp and the default marker are local. */
+
+.voice-styles-toolbar {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+.voice-styles-explainer {
+  flex: 1 1 280px;
+  min-width: 0;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--fg-dim);
+}
+.voice-styles-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+/* `display:flex` above would beat the UA's [hidden] rule — restate it. */
+.voice-styles-toolbar-actions[hidden] {
+  display: none;
+}
+.voice-styles-toolbar .admin-action-btn {
+  margin-left: 0;
+}
+
+/* NAME | INSTRUCTION | IN MENU | DEFAULT | ACTIONS */
+.voice-styles-grid {
+  grid-template-columns: minmax(110px, 1fr) minmax(0, 2.2fr) 64px 64px 168px;
+  align-items: start;
+}
+/* Read-only renders no actions cell, so the tracks lose their fifth column. */
+.voice-styles-root.is-readonly .voice-styles-grid {
+  grid-template-columns: minmax(110px, 1fr) minmax(0, 2.2fr) 64px 64px;
+}
+.voice-styles-grid [data-vs-actions-header][hidden] {
+  display: none;
+}
+
+/* Instruction is a two-line clamp; the full text is still in the row's DOM
+   for copy/selection (the truncated tail is clipped, not annihilated). */
+.voice-styles-grid .admin-col-vs-instruction {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  white-space: normal;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+.voice-styles-grid .admin-col-vs-instruction.is-empty {
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+.voice-styles-default {
+  color: var(--green);
+  font-size: 14px;
+  line-height: 1;
+  text-shadow: 0 0 6px var(--green-glow);
+}
+
+.voice-styles-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.voice-styles-actions .admin-btn-action,
+.voice-styles-actions .admin-btn-danger {
+  margin-right: 0;
+}
+
+.voice-styles-count {
+  font-variant-numeric: tabular-nums;
+}
+
+/* A narrow pane (mobile or a tight split) drops the two columns that do not
+   fit; NAME, DEFAULT and ACTIONS keep their meaning. */
+@media (max-width: 700px) {
+  .voice-styles-grid {
+    grid-template-columns: minmax(0, 1fr) 58px 150px;
+  }
+  .voice-styles-root.is-readonly .voice-styles-grid {
+    grid-template-columns: minmax(0, 1fr) 58px;
+  }
+  .voice-styles-grid .admin-col-vs-instruction,
+  .voice-styles-grid .admin-col-vs-menu {
+    display: none;
+  }
+}

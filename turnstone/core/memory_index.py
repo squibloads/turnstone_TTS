@@ -32,7 +32,8 @@ _SCOPE_ORDER = {
     "workstream": 1,
     "user": 2,
     "coordinator": 3,
-    "project": 4,
+    "voice": 4,
+    "project": 5,
 }
 
 # ECMAScript ``\s`` plus U+0085 NEXT LINE. Keeping this explicit gives Python

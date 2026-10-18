@@ -1186,6 +1186,7 @@ class StorageBackend(Protocol):
         ws_id: str,
         principal_id: str,
         *,
+        voice: bool = False,
         commit_context: Callable[[dict[str, Any]], AbstractContextManager[None]] | None = None,
     ) -> dict[str, Any] | None:
         """Atomically bind the first principal's complete index.
@@ -1200,6 +1201,12 @@ class StorageBackend(Protocol):
         yield. Its post-yield phase runs after commit and must remain
         deterministic publication — an exception there cannot roll back the
         already-committed snapshot.
+
+        ``voice`` selects the private namespace captured for a
+        COORDINATOR-kind row: ``voice`` instead of ``coordinator``. The row
+        stores only the kind, so the caller supplies the immutable persona
+        fact. A later capture on the same row always returns the first
+        snapshot; the flag cannot rewrite visibility after the fact.
         """
         ...
 
@@ -3304,6 +3311,55 @@ class StorageBackend(Protocol):
         successor instead — that clears the old default atomically), and
         cannot change ``applies_to_kinds``; setting ``is_default=True`` clears
         the flag on other personas sharing a kind."""
+        ...
+
+    # -- Voice reports ----------------------------------------------------------
+    # A voice coordinator never blocks its turn on a child.  A finished child
+    # leaves a row here; the next genuine user turn offers the outstanding
+    # reports.  Rows outlive the session, so the queue survives a resume.
+    # Dict shape: every column as a string (``state`` is one of
+    # ``voice_config.VOICE_REPORT_STATES``), ordered oldest first.
+
+    def create_voice_report(
+        self,
+        coord_ws_id: str,
+        child_ws_id: str,
+        title: str,
+        body: str,
+        *,
+        report_id: str = "",
+        state: str = "pending",
+    ) -> dict[str, Any]:
+        """Insert one report and return its stored row.
+
+        ``report_id`` defaults to a fresh uuid hex.  Raises ValueError on an
+        empty coordinator/child id, an unknown ``state``, or a title/body
+        over the storage-edge caps (see ``_utils``).  A duplicate explicit
+        ``report_id`` also raises rather than overwriting a live report.
+        """
+        ...
+
+    def list_voice_reports(
+        self,
+        coord_ws_id: str,
+        states: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return one coordinator's reports, oldest first.
+
+        ``states`` narrows to those lifecycle values (``None`` = every
+        state); an empty iterable returns nothing.  An unknown state raises
+        ValueError, so a typo cannot masquerade as "no reports".
+        """
+        ...
+
+    def update_voice_report_state(self, report_id: str, state: str) -> bool:
+        """Move one report to ``state``; return whether the row existed.
+
+        An unknown state raises ValueError.  Transitions are not ordered here
+        — the lifecycle rules live with the producers (capture writes
+        ``pending``, the offer marks ``offered``, the tool reads/dismisses) —
+        so a caller can also repair a row without a state machine in storage.
+        """
         ...
 
     # -- Prompt policies -------------------------------------------------------

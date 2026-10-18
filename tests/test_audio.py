@@ -480,6 +480,46 @@ class TestSynthesize:
         response.read.assert_not_called()
 
 
+class TestSpeechInstructions:
+    """The optional ``instructions`` pass-through on ``synthesize``."""
+
+    def _client(self, body: bytes = b"audio") -> tuple[MagicMock, _FakeRegistry]:
+        client = MagicMock()
+        manager, _response = _response_manager(body=body)
+        client.audio.speech.with_streaming_response.create.return_value = manager
+        return client, _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
+
+    def test_flag_is_an_explicit_capability_only(self):
+        # Unlike the role gate there is no model-name inference: sending an
+        # unknown field to a backend is not a harmless extra.
+        assert audio.model_supports_speech_instructions(
+            _Cfg("anything", {"supports_speech_instructions": True})
+        )
+        assert not audio.model_supports_speech_instructions(
+            _Cfg("anything", {"supports_speech_instructions": False})
+        )
+        assert not audio.model_supports_speech_instructions(_Cfg("gpt-4o-mini-tts"))
+
+    def test_empty_instructions_omit_the_field(self):
+        # Requests to backends that never heard of the field stay identical.
+        client, reg = self._client()
+        audio.synthesize(registry=reg, alias="voice", text="hi", voice="nova")
+        kwargs = client.audio.speech.with_streaming_response.create.call_args.kwargs
+        assert "instructions" not in kwargs
+
+    def test_non_empty_instructions_reach_the_sdk(self):
+        client, reg = self._client()
+        audio.synthesize(
+            registry=reg,
+            alias="voice",
+            text="hi",
+            voice="nova",
+            instructions="Speak warmly and slowly.",
+        )
+        kwargs = client.audio.speech.with_streaming_response.create.call_args.kwargs
+        assert kwargs["instructions"] == "Speak warmly and slowly."
+
+
 class TestOpenAIAudioModelsKnown:
     """The current OpenAI STT/TTS lineup is registered in the static capability
     table, so the admin 'suggested capabilities' recognizes them and they show
@@ -513,6 +553,20 @@ class TestOpenAIAudioModelsKnown:
         caps = lookup_model_capabilities("openai", "gpt-5") or {}
         assert not caps.get("supports_transcription")
         assert not caps.get("supports_speech_synthesis")
+
+    def test_speech_instructions_are_declared_per_model(self):
+        """Only a model whose API takes ``instructions`` declares the flag.
+
+        ``tts-1`` has no instructions parameter, so a style must never reach
+        it; ``gpt-4o-mini-tts`` documents one.
+        """
+        from turnstone.core.providers import lookup_model_capabilities
+
+        mini = lookup_model_capabilities("openai", "gpt-4o-mini-tts") or {}
+        assert mini.get("supports_speech_instructions") is True
+        for m in ("tts-1", "tts-1-hd"):
+            caps = lookup_model_capabilities("openai", m) or {}
+            assert caps.get("supports_speech_instructions") is False, m
 
 
 class TestTranscribeCached:

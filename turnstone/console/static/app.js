@@ -1143,6 +1143,115 @@ function _createCoordinator(opts) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Voice session launcher — a one-click coordinator with the `voice` persona.
+// ---------------------------------------------------------------------------
+//
+// A voice session is not a fourth workstream kind: it is an ordinary
+// coordinator whose persona is `voice`, so it uses the same create endpoint
+// and opens the same pane as the composer's Coordinator kind.  The action
+// lives outside the kind radiogroup and never reads the composer's task text.
+const _VOICE_PERSONA = "voice";
+
+// The audio.voice_mode_enabled switch, once an admin-settings read answers.
+// `null` means "not known": the read needs admin.settings, which
+// admin.coordinator does not imply, so an unreadable switch fails OPEN — the
+// pane still enforces it, and hiding the only entry point on a permission
+// error would strand users who can launch voice sessions but not read
+// settings.  `_voiceModeRead` records a parsed payload so the fail-open retry
+// cannot re-fetch on every repaint.
+let _voiceModeEnabled = null;
+let _voiceModeRead = false;
+let _voiceModeReading = false;
+
+// Is the voice persona on this user's coordinator shelf?  Reads the SAME
+// kind-filtered list the launcher's Persona picker renders
+// (window.TurnstonePersonas), so a persona the picker cannot offer is never
+// launchable from the one-click action.
+function _voicePersonaAvailable() {
+  const TP = window.TurnstonePersonas;
+  if (!TP) return false;
+  return TP.personaChoices("coordinator").some(function (choice) {
+    return choice.value === _VOICE_PERSONA;
+  });
+}
+
+// Best-effort one-shot read of the switch.  Only a definitive `false` hides
+// the action; a denied or failed read leaves the current state alone.
+function _readVoiceModeSetting() {
+  if (_voiceModeReading || _voiceModeRead) return;
+  // admin.settings is a separate scope from admin.coordinator.  Without it the
+  // read is a guaranteed 403 on every page load, so skip the request and leave
+  // the switch unknown (the fail-open state above).  Permissions land after
+  // auth, and the launcher repaints then, so a real admin still reads it.
+  if (!_consoleHasPermission("admin.settings")) return;
+  _voiceModeReading = true;
+  authFetch("/v1/api/admin/settings")
+    .then(function (r) {
+      return r.ok ? r.json() : null;
+    })
+    .then(function (data) {
+      if (!data || !Array.isArray(data.settings)) return;
+      _voiceModeRead = true;
+      for (let i = 0; i < data.settings.length; i++) {
+        const row = data.settings[i];
+        if (row && row.key === "audio.voice_mode_enabled") {
+          _voiceModeEnabled = !!row.value;
+          return;
+        }
+      }
+    })
+    .catch(function () {
+      // Fail-open: see the flag comment above.
+    })
+    .finally(function () {
+      _voiceModeReading = false;
+      _refreshVoiceLauncher(false);
+    });
+}
+
+// Reveal/hide the voice action.  `readSetting === false` is the read's own
+// settle path: it must repaint the result without immediately starting another
+// read (a failed read would otherwise retry forever in one call stack).
+// Called from every place the answer can change — permissions settling, the
+// persona cache refreshing, and the switch read landing.
+function _refreshVoiceLauncher(readSetting) {
+  const btn = document.getElementById("start-voice-session");
+  if (!btn) return;
+  // A voice session is a coordinator, so it needs the same create permission
+  // as the Coordinator kind: the panel can be visible for Interactive or
+  // Scheduled alone.
+  const show =
+    _hasCoordPermission() &&
+    _voicePersonaAvailable() &&
+    _voiceModeEnabled !== false;
+  btn.style.display = show ? "" : "none";
+  if (show && readSetting !== false) _readVoiceModeSetting();
+}
+
+// Create the voice coordinator and open it exactly like a normal create.  No
+// open-time pane hint is passed: the coordinator pane factory does not accept
+// one (shell.js drops openPane's `extra`), so the persona IS the handshake —
+// a voice-persona coordinator starts in voice mode inside the pane.
+function startVoiceSession() {
+  // The button is hidden when the persona is gone, but a shelf refresh can
+  // land between the paint and the click; refuse with the reason instead of
+  // posting a persona the server would reject.
+  if (!_voicePersonaAvailable()) {
+    showToast("The voice persona is not available");
+    return;
+  }
+  _homeShowError("");
+  _createCoordinator({
+    persona: _VOICE_PERSONA,
+    errEl: document.getElementById("home-coord-error"),
+    setBusy: function (busy) {
+      const btn = document.getElementById("start-voice-session");
+      if (btn) btn.disabled = !!busy;
+    },
+  });
+}
+
 // Which workstream KIND the launcher creates: "coordinator" (console-local),
 // "interactive" (proxied to a compute node), or "scheduled" (an interactive
 // session the console's scheduler starts later, on a timer).  The composer
@@ -1674,6 +1783,10 @@ function _ensureHomeComposerInit() {
   _mountHomeCoordComposer();
   _mountLauncherWhen();
   _wireLauncherToggle();
+  // The voice action is static markup; wire its one handler with the rest of
+  // the launcher's controls.
+  const voiceBtn = document.getElementById("start-voice-session");
+  if (voiceBtn) voiceBtn.addEventListener("click", startVoiceSession);
   _refreshAndPopulateSkills();
   _refreshAndPopulateModels();
   _refreshAndPopulateProjects();
@@ -1744,6 +1857,9 @@ function _populateHomePersonaDropdown() {
     const dflt = TP.defaultPersona(_launcherPersonaKind());
     if (dflt) _homeCoordComposer.setOptionValue("persona", dflt.name);
   }
+  // The voice shortcut keys off the same shelf: a refresh can add or remove
+  // the persona after the launcher painted.
+  _refreshVoiceLauncher();
 }
 
 // Refresh the shared projects cache (window.TurnstoneProjects — also feeds the
@@ -2079,6 +2195,9 @@ function _refreshHomeComposerVisibility() {
     return k.kind === _launcherKind;
   });
   if (!allowed && avail.length) _setLauncherKind(avail[0].kind);
+  // Permissions settling (and re-login) also decide whether the voice
+  // shortcut may show: it creates a coordinator, not the selected kind.
+  _refreshVoiceLauncher();
 }
 
 function submitHomeCoord(textFromComposer) {

@@ -64,6 +64,13 @@ import { redactCredentials } from "/shared/redact_credentials.js";
 import { mountConversationScroll } from "/shared/conversation_scroll.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "/shared/mcp_error.js";
 import {
+  addTtsActionsToFinished,
+  createTtsPlayer,
+  getVoiceRoles,
+} from "/shared/tts_player.js";
+import { createMicController } from "/shared/stt_mic.js";
+import { createVoiceLoop } from "./voice_loop.js";
+import {
   acceptUserTurnEvent,
   clientSendMaySettleForViewer,
   createQueueController,
@@ -560,6 +567,45 @@ function createCoordinatorPane(root, wsId, opts) {
   // Provenance of the current busy=true (see setBusy): "server" |
   // "optimistic" | null when idle.
   let busySource = null;
+  // Dictation: the console's own /v1/api/workstreams/{id}/speech-to-text/stream
+  // (base ""), one controller per pane so a destroyed pane releases its own
+  // microphone.  The button stays hidden until /v1/api/models reports an stt
+  // role (see _applyVoiceRoles) and, like send, is off while a turn is running.
+  //
+  // Hands-free Voice mode consumes the same microphone: the controller's
+  // transcript/state hooks feed voice_loop.js, which closes the mic for the
+  // whole think/play part of the turn (half-duplex).  The hooks are inert on a
+  // mic module that predates them, so the mode's own gate also requires
+  // `mic.start()` — the detectable half of that contract — and a player run
+  // that reports `done`; a build with neither simply never offers the button.
+  let voiceLoop = null;
+  let voiceModeOn = false;
+  let voiceOffer = false;
+  let voiceSetup = null;
+  // null until probed; true when the player's stream/play runs expose `done`.
+  let voiceDoneProbe = null;
+  // audio.stt_auto_stop, read on the same probe as the setting.  With it on,
+  // the mic button becomes voice mode's mic on/off switch; with it off the
+  // press is still how a spoken turn ends, so dictation keeps it.
+  let voiceAutoStop = false;
+  const mic = createMicController({
+    composer: composer,
+    base: "",
+    wsId: () => wsId,
+    isBusy: () => busy,
+    onTranscript: (text) => {
+      if (voiceLoop) voiceLoop.onTranscript(text);
+    },
+    onState: (state) => {
+      if (voiceLoop) voiceLoop.onMicState(state);
+    },
+    onToggle: () => _voiceMicToggle(),
+  });
+  // The Voice button joins the mic in the composer action row; the status
+  // line sits under the row.  Built once and reused for the pane's lifetime.
+  const voiceControls = _buildVoiceControls();
+  const voiceBtn = voiceControls.button;
+  const voiceStatusEl = voiceControls.status;
   // Acting user (turn initiator) of the in-flight turn, from state_change
   // events; drives the shared-workstream cross-user send gate. Carries the
   // owner id even single-user (the gate just no-ops — it equals this viewer);
@@ -2772,6 +2818,14 @@ function createCoordinatorPane(root, wsId, opts) {
     busy = next;
     reconcileSendBlock();
     if (edge && !next) queue.onIdleEdge();
+    // The mic produces composer input the user can only send when idle.
+    mic.syncBusy();
+    // In voice mode the button is the mute switch, which matters most while
+    // a turn runs, so it stays pressable (the press never records then).
+    if (voiceModeOn && voiceAutoStop && mic.button) mic.button.disabled = false;
+    // Voice mode follows the turn: a busy edge closes the mic (half-duplex)
+    // and a quiet edge is one of the two conditions for listening again.
+    if (voiceLoop) voiceLoop.onBusy(next);
   }
 
   // Shared-workstream send gate: block this viewer's send while another
@@ -3890,6 +3944,7 @@ function createCoordinatorPane(root, wsId, opts) {
         break;
       case "content":
         appendContentToken(ev.text || "");
+        _feedTtsStream(ev.text || "");
         break;
       case "reasoning":
         appendReasoningToken(ev.text || "");
@@ -3943,6 +3998,9 @@ function createCoordinatorPane(root, wsId, opts) {
         // always retires the card with an end event before any stream_end
         // can follow) — remove it instead of leaving a frozen bar.
         resetCompactionHolder(compactionHolder);
+        // This segment's text is complete: speak the sentence still in the
+        // feeder's buffer, then let the run drain its queue.
+        _endTtsStream();
         finishAssistantStream();
         break;
       case "stream_overflow":
@@ -4364,6 +4422,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // Force Stop after 2s. state_change → idle is what actually
         // clears busy; the 10s safety timer covers the connection-drop
         // case.
+        _cancelTtsStream(); // drop anything spoken for the cancelled text
         reasoningActivity.finish();
         if (!busy) break;
         clearTimeout(cancelTimeoutId);
@@ -6616,7 +6675,413 @@ function createCoordinatorPane(root, wsId, opts) {
     bar.insertBefore(btn, bar.firstChild);
   }
 
+  // Read-aloud: the console's own /v1/api/tts (base ""), one player per pane
+  // so a destroyed pane silences itself.  The affordance stays hidden until
+  // /v1/api/models reports a tts role (see init).
+  let voiceRoles = { stt: false, tts: false };
+  const ttsPlayer = createTtsPlayer({ base: "" });
+  // The live streaming-read-aloud run for the reply being written, if any
+  // (created on the first content delta and flushed at stream_end).  Only
+  // Voice mode starts one: a streaming run auto-plays, and a text pane that
+  // nobody is listening to must stay silent even when audio.tts_stream is on.
+  let ttsStream = null;
+  // The settled reply whose stream run produced no audio and which voice mode
+  // still has to speak (see _voiceSpeakAwaiting).  Consumed by the first
+  // attempt, so a reply with nothing to say spends it once and ends the turn —
+  // it can never bounce between the stream path and the fallback.
+  let voiceAwaitingReply = null;
+
+  // Streaming read-aloud inside Voice mode: content deltas go to one feeder
+  // per reply, which hands the player only completed sentences.  The `voice`
+  // option asks the player for a run that speaks even when audio.tts_stream is
+  // off — a hands-free turn must be heard, and the stream gate is a text-pane
+  // policy.  Today's player ignores the option and settles an empty `heard`
+  // instead; _watchVoiceRun then speaks the settled reply through play().
+  function _feedTtsStream(text) {
+    if (!voiceModeOn || !voiceRoles.tts || !text) return;
+    if (!ttsStream) {
+      ttsStream = ttsPlayer.stream({ voice: true });
+      _watchVoiceRun(ttsStream, currentAssistantEl);
+      if (voiceLoop) voiceLoop.onReplyStarted();
+    }
+    ttsStream.push(text);
+  }
+
+  function _endTtsStream() {
+    if (!ttsStream) return;
+    ttsStream.end();
+    ttsStream = null; // the run keeps draining; the next reply starts fresh
+  }
+
+  function _cancelTtsStream() {
+    if (!ttsStream) return;
+    ttsStream.cancel();
+    ttsStream = null;
+  }
+
+  // The loop ends a spoken turn on the player's `done`; the run is created
+  // before the reply has finished, so the bubble reference travels with it
+  // (currentAssistantEl is cleared at stream_end, before playback ends).
+  function _watchVoiceRun(run, replyEl) {
+    if (!run || !run.done || typeof run.done.then !== "function") {
+      // A run without `done` cannot say when it stops speaking.  Reopening the
+      // mic now would record the reply, so voice mode stands itself down
+      // instead of parking the loop in `speaking` with the mic shut.
+      _voiceNoDone();
+      return;
+    }
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (!voiceModeOn || !voiceLoop) return;
+      const r = result || { reason: "finished", heard: [] };
+      // A stream run created while audio.tts_stream is off drops its text and
+      // reports an empty `heard`.  Voice mode still has to speak, so the
+      // settled reply is played through the finished-reply path instead.
+      if (r.reason !== "cancelled" && (!r.heard || !r.heard.length)) {
+        // No bubble reference means the run started before the reply had
+        // anywhere to render; there is nothing to play, so end the turn.
+        if (!replyEl) {
+          voiceLoop.onPlaybackDone(r);
+          return;
+        }
+        voiceAwaitingReply = replyEl;
+        _voiceSpeakAwaiting();
+        return;
+      }
+      voiceLoop.onPlaybackDone(r);
+    };
+    run.done.then(finish, () => finish({ reason: "cancelled", heard: [] }));
+  }
+
+  // Speak the reply whose stream run produced no audio.  It can only be played
+  // once the reply has settled and `_addTtsActions` has given its bubble a
+  // speaker, which is why this is called again from the settle edge
+  // (_refreshRetryButton) — at the first content delta the bubble has neither.
+  // Returns true when playback (or the stand-down) took ownership of the
+  // turn's completion.
+  function _voiceSpeakAwaiting() {
+    const replyEl = voiceAwaitingReply;
+    if (!replyEl) return false;
+    // Still streaming: the settle edge will call again.
+    if (replyEl === currentAssistantEl) return false;
+    voiceAwaitingReply = null;
+    if (_voicePlayFinished(replyEl)) return true;
+    // Nothing playable (a tool-only turn, a reply cancelled before it
+    // rendered): report the empty run so the mic reopens instead of waiting
+    // for audio nobody will hear.
+    if (voiceModeOn && voiceLoop) {
+      voiceLoop.onPlaybackDone({ reason: "finished", heard: [] });
+    }
+    return false;
+  }
+
+  // Fallback for a player whose stream gate is off: speak the settled reply
+  // through the speaker button (the existing finished-reply path) and feed the
+  // result back to the loop.  Returns true when this call owns the turn's
+  // completion (playing, or standing voice mode down because the run it got
+  // cannot report its end), false when there is nothing to play — the caller
+  // then reports the empty run and the mic reopens.
+  function _voicePlayFinished(replyEl) {
+    if (!replyEl || !replyEl.isConnected) return false;
+    const btn = replyEl.querySelector(".msg-tts-btn");
+    if (!btn) return false;
+    let run = null;
+    try {
+      run = ttsPlayer.play(replyEl, btn);
+    } catch (_e) {
+      return false;
+    }
+    if (!run || !run.done || typeof run.done.then !== "function") {
+      // Audio may be starting with no way to hear its end — same stand-down.
+      _voiceNoDone();
+      return true;
+    }
+    if (voiceLoop) voiceLoop.onReplyStarted();
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (voiceModeOn && voiceLoop) {
+        voiceLoop.onPlaybackDone(result || { reason: "finished", heard: [] });
+      }
+    };
+    run.done.then(finish, () => finish({ reason: "cancelled", heard: [] }));
+    return true;
+  }
+
+  // Speaker on every FINISHED assistant reply, beside copy.  The bubble still
+  // streaming is skipped so half a reply is never read; the settle edge
+  // (_refreshRetryButton, via finishAssistantStream) picks it up.
+  function _addTtsActions() {
+    if (!voiceRoles.tts) return;
+    addTtsActionsToFinished(messagesEl, currentAssistantEl, (el, btn) =>
+      ttsPlayer.play(el, btn),
+    );
+  }
+
+  // The roles resolve after the first history paint, so the bubbles it built
+  // get their speaker now, and the mic appears once an stt role is confirmed.
+  function _applyVoiceRoles(roles) {
+    voiceRoles = roles;
+    mic.setAvailable(!!roles.stt);
+    _addTtsActions();
+    _voiceRefresh();
+  }
+
+  // ------------------------------------------------------------------
+  // Voice mode (hands-free)
+  // ------------------------------------------------------------------
+
+  // The button copies the mic's composer pattern (same base class, inserted
+  // right after it) but carries a text label: the mic glyph already means
+  // dictation, and the two modes must be distinguishable at a glance.  It
+  // sits after the mic so the mic keeps the row's right-alignment margin.
+  function _buildVoiceControls() {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "composer-mic-btn composer-voice-btn";
+    button.style.display = "none";
+    button.textContent = "Voice";
+    button.title = "Hands-free voice mode";
+    button.setAttribute("aria-label", "Enable hands-free voice mode");
+    button.setAttribute("aria-pressed", "false");
+    const micBtn = mic && mic.button;
+    if (composer && composer.actionsRowEl) {
+      if (micBtn && micBtn.parentNode === composer.actionsRowEl) {
+        composer.actionsRowEl.insertBefore(button, micBtn.nextSibling);
+      } else {
+        composer.actionsRowEl.insertBefore(button, composer.sendBtn || null);
+      }
+    }
+    const status = document.createElement("div");
+    status.className = "coord-voice-status";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.hidden = true;
+    if (composer && composer.el) composer.el.appendChild(status);
+    button.addEventListener("click", _voiceToggle);
+    return { button: button, status: status };
+  }
+
+  // Both halves of the loop must exist in this build: the mic's `start()` and
+  // a player whose runs resolve `done`.  The player check is structural — a
+  // throwaway stream() probe would cancel a live reply (one voice per page).
+  // A run that turns out to have no `done` is handled at runtime by
+  // _voiceNoDone(): the mode switches itself off rather than waiting forever.
+  function _voiceHooksReady() {
+    return !!(
+      mic &&
+      typeof mic.start === "function" &&
+      voiceRoles.stt &&
+      voiceRoles.tts &&
+      _voicePlayerSupportsDone()
+    );
+  }
+
+  function _voicePlayerSupportsDone() {
+    if (voiceDoneProbe !== null) return voiceDoneProbe;
+    voiceDoneProbe = !!(
+      typeof ttsPlayer.stream === "function" &&
+      typeof ttsPlayer.play === "function"
+    );
+    return voiceDoneProbe;
+  }
+
+  // The player can still answer with a run that has no `done` (an older
+  // shared module served beside this pane).  Voice mode cannot know when
+  // playback ends, so it takes itself off the menu instead of guessing.
+  function _voiceNoDone() {
+    voiceDoneProbe = false;
+    if (voiceModeOn) _voiceTurnOff();
+    _voiceShow(false);
+  }
+
+  // The offer gate rides the STT config probe: it is the settings read the
+  // coordinator's own transport already serves (/v1/api/stt/config).  A
+  // missing field (an older console) reads as the registry default, on.
+  function _readVoiceModeEnabled() {
+    if (typeof authFetch !== "function") return Promise.resolve(true);
+    return authFetch("/v1/api/stt/config")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body) => {
+        voiceAutoStop = !!body && body.auto_stop === true;
+        return !body || body.voice_mode_enabled !== false;
+      })
+      .catch(() => true);
+  }
+
+  // The workstream detail response does not carry the persona, but the live
+  // coordinator list does; one row is this pane.  Unknown reads as "not
+  // voice": the mode is offered but starts off, because a pane cannot guess a
+  // default it was never told.
+  function _readVoicePersona() {
+    if (typeof authFetch !== "function") return Promise.resolve(false);
+    return authFetch("/v1/api/workstreams")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body) => {
+        const rows = (body && body.workstreams) || [];
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          if (row && row.ws_id === wsId) return row.persona === "voice";
+        }
+        return false;
+      })
+      .catch(() => false);
+  }
+
+  function _voiceSetStatus(state) {
+    const labels = {
+      listening: "Listening\u2026",
+      transcribing: "Transcribing\u2026",
+      thinking: "Thinking\u2026",
+      speaking: "Speaking\u2026",
+      muted: "Mic off \u2014 replies still play",
+    };
+    const label = labels[state] || "";
+    voiceStatusEl.textContent = label;
+    voiceStatusEl.hidden = !label;
+    voiceStatusEl.setAttribute("data-state", state || "off");
+  }
+
+  function _voiceShow(on) {
+    voiceOffer = !!on;
+    voiceBtn.style.display = on ? "" : "none";
+    if (!on) {
+      if (voiceModeOn) _voiceTurnOff();
+      else _voiceSetStatus("off");
+    }
+  }
+
+  function _voiceCreateLoop() {
+    voiceLoop = createVoiceLoop({
+      // The mic refuses a start while a turn is running.  Reporting that back
+      // (false) lets the loop defer the start to the idle edge instead of
+      // silently sitting in `listening` with a closed mic.
+      startListening: () => {
+        if (busy) return false;
+        mic.start();
+        return true;
+      },
+      // Discard, not send: leaving listening for any reason other than a
+      // transcript (disable, a typed turn) must not post a half clip.
+      stopListening: () => mic.stop(true),
+      // stt_mic already inserted the transcript into the composer, so send
+      // what is there; `text` is the fallback for a mic that does not.
+      send: (text) => _sendVoiceText(text),
+      setStatus: _voiceSetStatus,
+    });
+  }
+
+  function _sendVoiceText(text) {
+    if (!composer.value || !composer.value.trim()) composer.value = text;
+    coordSend();
+    // coordSend clears the composer and flips busy on acceptance; a refusal
+    // (attachment upload, blocked send) leaves both alone.  Do not strand the
+    // loop waiting for a reply nobody requested.
+    if (!busy && voiceLoop) {
+      voiceLoop.onPlaybackDone({ reason: "cancelled", heard: [] });
+    }
+  }
+
+  function _voiceTurnOn() {
+    if (!voiceOffer || voiceModeOn || !_voiceHooksReady()) return;
+    voiceModeOn = true;
+    voiceBtn.classList.add("is-on");
+    voiceBtn.setAttribute("aria-pressed", "true");
+    voiceBtn.title = "Hands-free voice mode is on \u2014 activate to stop";
+    voiceBtn.setAttribute("aria-label", "Disable hands-free voice mode");
+    if (!voiceLoop) _voiceCreateLoop();
+    voiceLoop.enable();
+    _voicePaintMute();
+  }
+
+  function _voiceTurnOff() {
+    if (!voiceModeOn) return;
+    voiceModeOn = false;
+    voiceBtn.classList.remove("is-on");
+    voiceBtn.setAttribute("aria-pressed", "false");
+    voiceBtn.title = "Hands-free voice mode";
+    voiceBtn.setAttribute("aria-label", "Enable hands-free voice mode");
+    if (voiceLoop) voiceLoop.disable();
+    // Drop any stream run the mode owned; with the mode off nothing should
+    // keep auto-playing into the pane.
+    _cancelTtsStream();
+    _voiceSetStatus("off");
+    _voicePaintMute();
+  }
+
+  // The mic button inside voice mode: mute/unmute the mic without leaving
+  // the mode, so replies and worker reports still play while the user talks
+  // to someone else.  Returns true when it claimed the press.
+  function _voiceMicToggle() {
+    if (!voiceModeOn || !voiceLoop || !voiceAutoStop) return false;
+    voiceLoop.setMuted(!voiceLoop.muted);
+    _voicePaintMute();
+    return true;
+  }
+
+  function _voicePaintMute() {
+    const b = mic && mic.button;
+    if (!b) return;
+    const on = !!(voiceModeOn && voiceLoop && voiceLoop.muted);
+    if (on) b.classList.add("is-muted");
+    else b.classList.remove("is-muted");
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    const label = on
+      ? "Microphone off \u2014 press to listen again"
+      : voiceModeOn && voiceAutoStop
+        ? "Turn the microphone off (voice mode keeps playing replies)"
+        : "Record speech to text";
+    b.title = label;
+    b.setAttribute("aria-label", label);
+  }
+
+  function _voiceToggle() {
+    if (voiceModeOn) _voiceTurnOff();
+    else _voiceTurnOn();
+  }
+
+  // Re-derive the offer from the three inputs (roles, setting, persona).  The
+  // setup probe is memoized so repeated role resolutions cannot refetch; the
+  // button paints immediately once a decision exists.
+  function _voiceRefresh() {
+    if (!_voiceHooksReady()) {
+      _voiceShow(false);
+      return;
+    }
+    if (!voiceSetup) voiceSetup = _voiceSetup();
+    _voiceShow(voiceOffer);
+  }
+
+  function _voiceSetup() {
+    return _readVoiceModeEnabled().then((enabled) => {
+      if (!enabled) {
+        _voiceShow(false);
+        return;
+      }
+      return _readVoicePersona().then((voicePersona) => {
+        if (!_voiceHooksReady()) {
+          _voiceShow(false);
+          return;
+        }
+        _voiceShow(true);
+        // A voice-persona session is a spoken conversation by construction,
+        // so it opens listening.  Every other persona offers the button off.
+        if (voicePersona) _voiceTurnOn();
+      });
+    });
+  }
+
   function _refreshRetryButton() {
+    // Every settle edge and history render lands here, so the speakers follow
+    // the same cadence as retry (and are persistent, unlike it).
+    _addTtsActions();
+    // A voice turn whose stream run produced no audio plays now, when the
+    // settled reply has just received its speaker.  The pending reference is
+    // consumed by that attempt, so this cannot re-arm itself.
+    _voiceSpeakAwaiting();
     // Remove only the transient retry buttons — a bar that still holds
     // other controls (the copy button appendMsg attaches) persists.  On
     // the degraded no-bridge path the fallback bar held ONLY retry, and
@@ -6654,6 +7119,9 @@ function createCoordinatorPane(root, wsId, opts) {
   // ------------------------------------------------------------------
 
   async function init() {
+    // Voice roles are memoized per base, so this is one /v1/api/models fetch
+    // however many panes open; a failed probe resolves to "no roles".
+    getVoiceRoles("").then(_applyVoiceRoles);
     let wsSnapshot = null;
     try {
       wsSnapshot = await getJSON(
@@ -6840,6 +7308,8 @@ function createCoordinatorPane(root, wsId, opts) {
     )
       return;
     const scrollTop = messagesEl.scrollTop;
+    ttsStream = null; // a rebuild must not keep speaking the old reply
+    ttsPlayer.stop(); // the speaker button is about to be detached
     messagesEl.replaceChildren();
     _syncApprovalChip();
     // A full committed-history render repairs any recorded truncation gap —
@@ -7277,6 +7747,16 @@ function createCoordinatorPane(root, wsId, opts) {
   // backgrounded pane keeps an SSE open and fires renders into detached DOM.
   function destroy() {
     reasoningActivity.finish();
+    // Leaving the pane ends hands-free mode: the loop stops asking the mic for
+    // turns (and discards a clip in flight) before the mic itself is released.
+    voiceModeOn = false;
+    if (voiceLoop) voiceLoop.disable();
+    ttsStream = null;
+    ttsPlayer.stop();
+    if (voiceBtn.parentNode) voiceBtn.parentNode.removeChild(voiceBtn);
+    if (voiceStatusEl.parentNode)
+      voiceStatusEl.parentNode.removeChild(voiceStatusEl);
+    mic.destroy(); // release the microphone and abort a transcription in flight
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
     // truncated resync).
     closeStreamTransport();

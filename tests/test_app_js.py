@@ -3966,9 +3966,8 @@ function loadMemoryIndexHealth(force) {load_health}
 def test_copy_button_survives_retry_teardown_in_both_clients() -> None:
     """Every assistant bubble carries a persistent copy button in its
     ``.msg-actions`` bar; the retry-holder teardown in BOTH clients must
-    remove only the transient buttons (``.msg-retry-btn`` /
-    ``.msg-tts-btn``), never the bar — removing the bar (the pre-copy
-    behavior) silently strips copy from the previous holder bubble on
+    remove only the transient retry button (``.msg-retry-btn``), never the
+    bar — removing the bar (the pre-copy behavior) silently strips copy from the previous holder bubble on
     every busy→idle edge, and only manual testing would notice.
 
     Interactive: the tracked-holder teardown targets the button classes.
@@ -3978,8 +3977,11 @@ def test_copy_button_survives_retry_teardown_in_both_clients() -> None:
     start = _pane_method_offset(interactive, "_attachRetryToLastAssistant")
     end = _pane_method_offset(interactive, "announceToolBlock")
     teardown = interactive[start:end]
-    assert '".msg-retry-btn, .msg-tts-btn"' in teardown, (
-        "interactive teardown must remove the transient retry/TTS buttons by class"
+    assert '".msg-retry-btn"' in teardown and ".msg-tts-btn" not in teardown.split(
+        "_addTtsActionsToFinished"
+    )[0], (
+        "interactive teardown must remove only the transient retry button by class; "
+        "the read-aloud button belongs to every finished reply"
     )
     assert "oldBar.remove()" not in teardown, (
         "interactive teardown removes the whole .msg-actions bar — that "

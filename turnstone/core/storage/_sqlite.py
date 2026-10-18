@@ -103,6 +103,7 @@ from turnstone.core.storage._schema import (
     usage_events,
     user_roles,
     users,
+    voice_reports,
     watches,
     workstream_attachments,
     workstream_config,
@@ -253,6 +254,12 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     validate_and_clear_default_persona as _validate_and_clear_default_persona,
+)
+from turnstone.core.storage._utils import (
+    validate_voice_report_fields as _validate_voice_report_fields,
+)
+from turnstone.core.storage._utils import (
+    validate_voice_report_state as _validate_voice_report_state,
 )
 from turnstone.core.workstream import (
     SAVED_PAGE_DEFAULT_LIMIT,
@@ -1668,6 +1675,10 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         )
         conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
         conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id))
+        # A deleted coordinator's report queue goes with it; a report about a
+        # deleted CHILD survives, because the coordinator still owes the user
+        # a mention of the turn that child finished.
+        conn.execute(sa.delete(voice_reports).where(voice_reports.c.coord_ws_id == ws_id))
         # Null-out parent_ws_id on children before dropping the row —
         # otherwise a deleted coordinator leaves orphaned pointers and
         # ``list_workstreams(parent_ws_id=<deleted>)`` keeps returning
@@ -5518,6 +5529,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         ws_id: str,
         principal_id: str,
         *,
+        voice: bool = False,
         commit_context: Callable[[dict[str, Any]], contextlib.AbstractContextManager[None]]
         | None = None,
     ) -> dict[str, Any] | None:
@@ -5527,6 +5539,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 conn,
                 ws_id=ws_id,
                 principal_id=principal_id,
+                voice=voice,
             )
             context = (
                 commit_context(row)
@@ -7026,6 +7039,85 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 _assert_single_default_persona(conn, personas, promote_kinds[0])
             conn.commit()
             return True
+
+    # -- Voice reports ----------------------------------------------------------
+
+    def create_voice_report(
+        self,
+        coord_ws_id: str,
+        child_ws_id: str,
+        title: str,
+        body: str,
+        *,
+        report_id: str = "",
+        state: str = "pending",
+    ) -> dict[str, Any]:
+
+        _validate_voice_report_fields(coord_ws_id, child_ws_id, title, body, state)
+        # Microseconds, unlike the rest of the schema: a fan-out finishes
+        # several children inside one second, and the offer note lists
+        # reports oldest first.  Second-resolution stamps would tie and fall
+        # back to a random id order, so the order the user hears would not be
+        # the order the agents finished.
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
+        values = {
+            "report_id": report_id or uuid.uuid4().hex,
+            "coord_ws_id": coord_ws_id,
+            "child_ws_id": child_ws_id,
+            "title": title,
+            "body": body,
+            "state": state,
+            "created": now,
+            "updated": now,
+        }
+        with self._conn() as conn:
+            existing = conn.execute(
+                sa.select(voice_reports.c.report_id).where(
+                    voice_reports.c.report_id == values["report_id"]
+                )
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(f"voice report already exists: {values['report_id']}")
+            try:
+                conn.execute(sa.insert(voice_reports), values)
+            except sa.exc.IntegrityError as exc:
+                # SELECT-then-INSERT loser on the primary key: the same
+                # ValueError shape as the pre-check, so callers map one
+                # error instead of an opaque 500 on a retried write.
+                raise ValueError(f"voice report already exists: {values['report_id']}") from exc
+            conn.commit()
+        return dict(values)
+
+    def list_voice_reports(
+        self,
+        coord_ws_id: str,
+        states: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+
+        q = sa.select(voice_reports).where(voice_reports.c.coord_ws_id == coord_ws_id)
+        if states is not None:
+            wanted = tuple(states)
+            if not wanted:
+                return []
+            for state in wanted:
+                _validate_voice_report_state(state)
+            q = q.where(voice_reports.c.state.in_(wanted))
+        q = q.order_by(voice_reports.c.created, voice_reports.c.report_id)
+        with self._conn() as conn:
+            return [_row_to_dict(row) for row in conn.execute(q).fetchall()]
+
+    def update_voice_report_state(self, report_id: str, state: str) -> bool:
+
+        _validate_voice_report_state(state)
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(voice_reports)
+                .where(voice_reports.c.report_id == report_id)
+                .values(state=state, updated=now)
+            )
+            conn.commit()
+            return result.rowcount > 0
 
     # -- Prompt policies -------------------------------------------------------
 

@@ -296,8 +296,13 @@ def test_interactive_and_coordinator_tool_sets_overlap_only_on_dual_kind():
     # Coordinator set is non-empty (spawn/inspect/send/close/delete/list).
     assert coord_names, "expected at least one coordinator tool"
     # Union covers every loaded tool (no tool is in neither set).
+    # ``voice_report`` is voice-persona only: on the voice coordinator
+    # shelf, not the plain coordinator one.
+    from turnstone.core.tools import VOICE_COORDINATOR_TOOLS
+
+    voice_names = {t["function"]["name"] for t in VOICE_COORDINATOR_TOOLS}
     all_names = {t["function"]["name"] for t in TOOLS}
-    assert interactive_names | coord_names == all_names
+    assert interactive_names | coord_names | voice_names == all_names
 
 
 def test_chatsession_interactive_kind_excludes_coordinator_tools(tmp_db):

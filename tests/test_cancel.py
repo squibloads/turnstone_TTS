@@ -3417,6 +3417,7 @@ class TestSendGenerationInitializationPublication:
             _ws_id: str,
             principal_id: str,
             *,
+            voice: bool = False,
             commit_context: Any,
         ) -> dict[str, Any]:
             if principal_id == "old-private-user":

@@ -9833,10 +9833,12 @@ class TestMemoryIndexSnapshotLifecycle:
             ws_id: str,
             principal_id: str,
             *,
+            voice: bool = False,
             commit_context: Any,
         ) -> dict[str, Any]:
             assert ws_id == session.ws_id
             assert principal_id == "owner"
+            assert voice is False
             with commit_context(candidate):
                 raise RuntimeError("snapshot commit failed")
             raise AssertionError("snapshot commit unexpectedly returned")
@@ -10059,6 +10061,7 @@ class TestMemoryIndexSnapshotLifecycle:
             _ws_id: str,
             _principal_id: str,
             *,
+            voice: bool = False,
             commit_context: Any,
         ) -> dict[str, Any]:
             nonlocal attempts
@@ -10114,6 +10117,7 @@ class TestMemoryIndexSnapshotLifecycle:
             _ws_id: str,
             _principal_id: str,
             *,
+            voice: bool = False,
             commit_context: Any,
         ) -> dict[str, Any]:
             nonlocal attempts

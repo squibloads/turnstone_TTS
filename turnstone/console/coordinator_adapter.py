@@ -19,6 +19,7 @@ import queue
 import threading
 from typing import TYPE_CHECKING, Any
 
+from turnstone.console.coordinator_client import _wait_message_for
 from turnstone.core import session_worker
 from turnstone.core.adapters._ui_cleanup import cleanup_session_ui
 from turnstone.core.child_event_bus import ChildEventBus
@@ -26,7 +27,13 @@ from turnstone.core.child_source import ClusterChildSource
 from turnstone.core.children_registry import ChildrenRegistry
 from turnstone.core.log import get_logger
 from turnstone.core.memory import get_workstream_display_name, get_workstream_display_names
-from turnstone.core.storage import is_storage_initialized
+from turnstone.core.metacognition import sanitize_name
+from turnstone.core.storage import get_storage, is_storage_initialized
+from turnstone.core.storage._utils import VOICE_REPORT_TITLE_MAX
+from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
+from turnstone.core.nudge_queue import NudgeQueue
+from turnstone.core.settings_registry import SETTINGS
+from turnstone.core.voice_config import is_voice_persona
 from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
@@ -44,6 +51,13 @@ if TYPE_CHECKING:
     from turnstone.core.session_manager import SessionManager
 
 log = get_logger(__name__)
+
+# Child states that mean "this turn is finished" for a voice coordinator's
+# report queue.  ``idle`` is the ordinary stop; ``error`` is a stop the user
+# needs to hear about even more.  Everything else (``thinking`` / ``running``
+# / ``attention`` / ``evaluation``) is work in progress and must not queue a
+# report — it also re-arms capture for the child's NEXT finish.
+_VOICE_REPORT_CAPTURE_STATES: frozenset[str] = frozenset({"idle", "error"})
 
 
 def _emit_coord_ui(ui: Any, ws: Workstream, hook: str, *args: Any) -> None:
@@ -130,6 +144,16 @@ class CoordinatorAdapter:
         # exposure can simply delegate; ``CoordinatorClient`` picks it
         # up via the coord client factory closure.
         self._child_event_bus = ChildEventBus()
+        # Voice-report capture bookkeeping: the last state OBSERVED per
+        # (coordinator, child).  A voice coordinator has no
+        # ``wait_for_workstream`` to park on, so a finished child's last
+        # message is saved as a report instead — but only on a transition
+        # INTO ``idle``/``error``.  The map is what turns a repeated state
+        # delta (the collector re-emits unchanged states) from a second row
+        # into the same finished turn.  Only voice coordinators' children
+        # enter it, so a console full of text coordinators never grows it.
+        self._voice_report_lock = threading.Lock()
+        self._last_child_states: dict[tuple[str, str], str] = {}
         # Cross-node child events arrive via ``ClusterChildSource``
         # (Stage 3 Step 2): a strategy that subscribes to the
         # collector's listener channel and runs a daemon thread that
@@ -271,6 +295,12 @@ class CoordinatorAdapter:
         # pointers forever — :meth:`ChildrenRegistry.uninstall`
         # handles forward set + reverse entries + presence atomically.
         self._registry.uninstall(ws_id)
+        # Voice-report capture keeps a last-observed-state entry per child;
+        # a closed coordinator will never capture again, so drop its entries
+        # rather than growing the map for the console process's lifetime.
+        with self._voice_report_lock:
+            for key in [k for k in self._last_child_states if k[0] == ws_id]:
+                del self._last_child_states[key]
         try:
             self._collector.emit_console_ws_closed(ws_id)
         except Exception:
@@ -847,6 +877,197 @@ class CoordinatorAdapter:
             # is a no-op when no waiter is registered — the steady
             # state for the hot dispatch path.
             self._child_event_bus.notify(ws_id)
+            if etype == "cluster_state":
+                # After the UI enqueue + wake: capture reads storage, and a
+                # report must never delay a dashboard update or a woken wait.
+                # The sink is the dispatch thread's last line of defence —
+                # ``ClusterChildSource`` wraps the whole call, but this keeps
+                # one bad report from costing the remaining bookkeeping below.
+                try:
+                    self._maybe_capture_voice_report(
+                        coord_id, owning_ws, ws_id, event.get("state", "")
+                    )
+                except Exception:
+                    log.debug(
+                        "coord_adapter.voice_report_capture_failed coord=%s child=%s",
+                        coord_id[:8],
+                        ws_id[:8],
+                        exc_info=True,
+                    )
+            elif etype == "ws_closed":
+                # The child is gone; its last observed state can never be
+                # needed again (a same-id reincarnation starts fresh).
+                with self._voice_report_lock:
+                    self._last_child_states.pop((coord_id, ws_id), None)
+
+    def _maybe_capture_voice_report(
+        self,
+        coord_ws_id: str,
+        coord_ws: Workstream,
+        child_ws_id: str,
+        state: str,
+    ) -> None:
+        """Save one finished child's report for a voice coordinator.
+
+        A voice session's turn is spoken: nothing is watching a blocked
+        ``wait_for_workstream``, and the user has almost certainly moved on
+        before the child finishes.  So a child that reaches ``idle`` or
+        ``error`` leaves its last message (or persisted ``last_error``) as a
+        row the next genuine user turn offers.  Text coordinators keep the
+        blocking-wait flow untouched — this returns before any read for them.
+
+        Idempotence is by TRANSITION, not by row: the collector re-emits
+        unchanged states (``ws_state`` deltas carry every token tick), so the
+        per-(coord, child) last-state map decides whether an ``idle`` event
+        is a new finish or the same one repeated.  A child's next turn
+        necessarily passes through a non-terminal state, which is what arms
+        the next capture.
+
+        Best-effort: a failed storage read or insert logs and drops.  The
+        state dispatch thread must never die over a report, and the next
+        event on another child still has to reach every dashboard.
+        """
+        if not is_voice_persona(coord_ws.persona):
+            return
+        key = (coord_ws_id, child_ws_id)
+        with self._voice_report_lock:
+            previous = self._last_child_states.get(key)
+            self._last_child_states[key] = state
+        if state not in _VOICE_REPORT_CAPTURE_STATES or state == previous:
+            return
+        if not is_storage_initialized():
+            return
+        try:
+            storage = get_storage()
+            # ``_wait_message_for`` is the one producer of a finished-child
+            # message: last assistant text for ``idle``, persisted
+            # ``last_error`` first for ``error``, and a hedged sentinel when
+            # the tail holds nothing usable.  ``None`` means the read itself
+            # failed; a report with no body is not worth offering.
+            message, _truncated = _wait_message_for(storage, child_ws_id, state)
+            if message is None:
+                log.debug(
+                    "coord_adapter.voice_report_no_body child=%s state=%s",
+                    child_ws_id[:8],
+                    state,
+                )
+                return
+            # Child names are model-authored, and the title is lowered into
+            # a system note on the next turn: sanitise at capture so every
+            # reader (note, tool result, operator) sees the same clean text.
+            title = sanitize_name(get_workstream_display_name(child_ws_id) or "")
+            title = (title[:VOICE_REPORT_TITLE_MAX] or f"agent {child_ws_id[:8]}").strip()
+            report = storage.create_voice_report(
+                coord_ws_id,
+                child_ws_id,
+                title=title,
+                body=message,
+            )
+        except Exception:
+            log.warning(
+                "coord_adapter.voice_report_capture_failed coord=%s child=%s state=%s",
+                coord_ws_id[:8],
+                child_ws_id[:8],
+                state,
+                exc_info=True,
+            )
+            return
+        log.info(
+            "coord_adapter.voice_report_captured coord=%s child=%s report=%s",
+            coord_ws_id[:8],
+            child_ws_id[:8],
+            str(report.get("report_id", ""))[:8],
+        )
+        try:
+            self._maybe_announce_voice_report(coord_ws_id, coord_ws, report)
+        except Exception:
+            # The report is saved; a failed announcement only means it waits
+            # for the next spoken turn, exactly as with the setting off.
+            log.warning(
+                "coord_adapter.voice_report_announce_failed coord=%s",
+                coord_ws_id[:8],
+                exc_info=True,
+            )
+
+    def _maybe_announce_voice_report(
+        self,
+        coord_ws_id: str,
+        coord_ws: Workstream,
+        report: dict[str, Any],
+    ) -> None:
+        """Wake an idle voice session so it tells the user an agent finished.
+
+        Opt-in (``audio.voice_announce_reports``): a voice session otherwise
+        never speaks unprompted.  Only an IDLE coordinator is woken — mid-turn
+        the next genuine user turn's offer note already covers the report, and
+        a wake queued behind a running turn would announce it a second time.
+
+        The wake reuses the idle-nudge pipeline: one ``"wake"``-channel entry
+        on the session's queue, then the shared wake gate, which starts a
+        synthetic turn whose only content is this note.  The note carries the
+        title, never the body: the user decides whether to hear it.  Its
+        ``valid_until`` re-reads the report at delivery, so a user who spoke
+        first (the offer note marked it ``offered``) is not told twice.
+        """
+        session = coord_ws.session
+        if session is None:
+            return
+        if not _voice_announce_enabled(getattr(session, "_config_store", None)):
+            return
+        if coord_ws.state is not WorkstreamState.IDLE:
+            return
+        queue = getattr(session, "_nudge_queue", None)
+        if not isinstance(queue, NudgeQueue):
+            return
+        report_id = str(report.get("report_id") or "")
+        if not report_id:
+            return
+        title = sanitize_name(str(report.get("title") or "")) or "an agent"
+
+        def _still_pending() -> bool:
+            return _voice_report_still_pending(coord_ws_id, report_id)
+
+        queue.enqueue(
+            "voice_reports",
+            _format_voice_report_announce(title),
+            "wake",
+            valid_until=_still_pending,
+            metadata={"report_id": report_id},
+        )
+        wake_workstream_if_pending(coord_ws, trigger="voice-report")
+
+
+def _voice_announce_enabled(config_store: Any) -> bool:
+    """``audio.voice_announce_reports``, read live; off when unreadable."""
+    key = "audio.voice_announce_reports"
+    try:
+        raw = config_store.get(key) if config_store is not None else SETTINGS[key].default
+    except Exception:
+        return False
+    return raw is True or (isinstance(raw, str) and raw.strip().lower() in ("true", "1", "yes"))
+
+
+def _voice_report_still_pending(coord_ws_id: str, report_id: str) -> bool:
+    """Whether the report is still unoffered — the announcement's drain check.
+
+    Fails closed: a storage error drops the announcement, and the report is
+    still offered on the next spoken turn.
+    """
+    try:
+        rows = get_storage().list_voice_reports(coord_ws_id, ("pending",))
+    except Exception:
+        return False
+    return any(str(r.get("report_id") or "") == report_id for r in rows)
+
+
+def _format_voice_report_announce(title: str) -> str:
+    """The wake turn's whole instruction: announce, ask, do not read."""
+    return (
+        f"An agent you started has finished: {title}. Nobody is talking to you "
+        "right now. In one short spoken sentence, tell the user it finished and "
+        "ask whether they would like to hear it. Do not read or summarise the "
+        "report, and do not call voice_report until the user says yes."
+    )
 
 
 def _enqueue_on_ui(ui: Any, coord_ws_id: str, payload: dict[str, Any]) -> None:

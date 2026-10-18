@@ -529,6 +529,8 @@ def test_postgresql_conditional_delete_uses_returning_when_rowcount_is_unknown()
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
+        # voice_reports: the coordinator's report queue
+        _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(row=(ws_id,)),
     )
@@ -551,6 +553,8 @@ def test_postgresql_stale_creating_reaper_locks_state_age_and_exact_incarnation(
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
+        # voice_reports: the coordinator's report queue
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(row=(ws_id,)),
@@ -593,6 +597,8 @@ def test_postgresql_stale_creating_reaper_recovers_tokenless_locked_row(
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
+        # voice_reports: the coordinator's report queue
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(row=(ws_id,)),
