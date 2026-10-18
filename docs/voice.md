@@ -499,6 +499,10 @@ the whole reply:
   math's hidden accessibility text are not spoken and cannot be matched.
 - A clip boundary falls between constructs, so a `find` cannot span two
   headings, a heading and the paragraph below it, or two table rows.
+- The rule groups have already run. While `identifiers` is on, `user_id` has
+  already become `user ID`, so a rule (or dictionary entry) written for the
+  snake_case form never matches; match the spoken form, or switch the
+  `identifiers` group off.
 
 If a rule must see a construct the player removes, change the profile (for
 example the code marker) or handle the text before it reaches the player;
