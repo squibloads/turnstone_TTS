@@ -973,10 +973,10 @@ to hear the answer.
 
 It needs both a **Speech-to-text** and a **Text-to-speech** role
 ([Models → Roles](#speech-to-text-model-role)); without both, the button does
-not appear. It also requires dictation's auto-stop: the turn ends when you stop
-talking, so
-[`audio.stt_auto_stop`](#turning-it-on) should be on — clicking the mic button
-still stops a recording by hand if it is not.
+not appear. It is also meant to run with dictation's auto-stop on
+([`audio.stt_auto_stop`](#turning-it-on)): the turn ends when you stop talking.
+With auto-stop off the mode still works, but a turn ends only when you press
+the mic button, so a spoken reply needs two clicks instead of none.
 
 ### Half-duplex
 
