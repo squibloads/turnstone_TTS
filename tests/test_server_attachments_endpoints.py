@@ -17,6 +17,8 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.testclient import TestClient
 
+from turnstone.core.voice_config import DEFAULT_PROFILE, profile_json
+
 # Magic-byte-valid 1x1 PNG
 PNG_1x1 = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
@@ -1244,6 +1246,8 @@ class TestTextToSpeech:
             ],
             "default": "",
             "instructions_supported": False,
+            "playback_rate": 1.0,
+            "profile": profile_json(DEFAULT_PROFILE),
         }
 
     def test_style_instruction_reaches_the_backend_when_capable(self, voice_app_client):

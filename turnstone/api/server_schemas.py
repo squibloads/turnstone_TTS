@@ -155,6 +155,57 @@ class TextToSpeechStyleInfo(BaseModel):
     in_menu: bool = Field(description="Whether the picker should offer this style")
 
 
+class TextToSpeechProfile(BaseModel):
+    """Pacing, structure and clip settings for the active TTS model.
+
+    Every field is present: a model with no stored profile reads as the
+    defaults, so the player never has to merge a partial object.
+    """
+
+    pause_heading_ms: int = Field(
+        default=600, description="Silence after a heading before the next clip (ms)"
+    )
+    pause_paragraph_ms: int = Field(
+        default=500, description="Silence after a paragraph or blockquote (ms)"
+    )
+    pause_table_row_ms: int = Field(default=150, description="Silence between table rows (ms)")
+    pause_code_ms: int = Field(
+        default=400, description="Silence after a code or diagram marker (ms)"
+    )
+    pause_list_item_ms: int = Field(
+        default=0,
+        description="Silence between list items (ms); 0 reads a whole list as one clip",
+    )
+    table_cell_joiner: str = Field(
+        default="comma",
+        description="What goes between the cells of a table row: comma | semicolon | pause",
+    )
+    table_header_mode: str = Field(
+        default="row", description="How a table header row is read: row | prefix | skip"
+    )
+    inline_code_max_chars: int = Field(
+        default=40,
+        description="Inline code up to this length is spoken; longer becomes the code marker",
+    )
+    code_marker: str = Field(
+        default="Code omitted.",
+        description="Said in place of a code block (empty = skip silently)",
+    )
+    diagram_marker: str = Field(
+        default="Diagram omitted.",
+        description="Said in place of a diagram (empty = skip silently)",
+    )
+    clip_min_chars: int = Field(
+        default=20, description="A shorter line folds into the next clip (headings, labels)"
+    )
+    clip_max_chars: int = Field(
+        default=600, description="Longest clip; longer text splits at a comma or space"
+    )
+    max_clips: int = Field(
+        default=200, description="Clips read per reply before it stops with a notice"
+    )
+
+
 class TextToSpeechStylesResponse(BaseModel):
     """The style choices a read-aloud client may offer for the TTS role."""
 
@@ -173,6 +224,13 @@ class TextToSpeechStylesResponse(BaseModel):
     playback_rate: float = Field(
         default=1.0,
         description="Read-aloud playback speed from audio.tts_playback_rate (0.5-2.0)",
+    )
+    profile: TextToSpeechProfile = Field(
+        default_factory=TextToSpeechProfile,
+        description=(
+            "Pacing, structure and clip settings for the alias the TTS role resolves to; "
+            "audio.tts_profiles with the defaults filled in"
+        ),
     )
 
 
