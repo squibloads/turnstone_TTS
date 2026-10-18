@@ -24,6 +24,7 @@ def test_report_states() -> None:
         ("audio.stt_silence_ms", 900, "#auto-stop"),
         ("audio.stt_vad_threshold", 0.5, "#auto-stop"),
         ("audio.tts_stream", False, "#streaming-read-aloud"),
+        ("audio.voice_mode_enabled", True, "#voice-mode"),
     ],
 )
 def test_settings(key: str, default: object, anchor: str) -> None:

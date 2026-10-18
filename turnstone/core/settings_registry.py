@@ -711,6 +711,18 @@ def _build_registry() -> dict[str, SettingDef]:
             reference_url=VOICE_DOCS_URL + "#streaming-read-aloud",
         ),
         SettingDef(
+            "audio.voice_mode_enabled",
+            "bool",
+            True,
+            "Offer hands-free Voice mode in coordinator sessions",
+            "audio",
+            help="When on, coordinator sessions show a Voice mode button: the mic listens, "
+            "your turn is sent when you stop talking, and the reply is read aloud before "
+            "the mic opens again. The mic is closed while a reply plays, so it never "
+            "hears itself. Needs speech-to-text and text-to-speech models configured.",
+            reference_url=VOICE_DOCS_URL + "#voice-mode",
+        ),
+        SettingDef(
             "audio.tts_model_alias",
             "str",
             "",

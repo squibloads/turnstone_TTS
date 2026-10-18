@@ -962,3 +962,7 @@ browser with the rest of the read-aloud configuration, so a saved change
 applies after a page reload. The browser may refuse to start audio that no
 click preceded — a page that has had no interaction yet — in which case the
 speaker on the finished reply still works.
+
+## Voice mode
+
+Stub: hands-free back-and-forth (`audio.voice_mode_enabled`).
