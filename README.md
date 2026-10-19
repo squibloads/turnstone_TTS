@@ -1,6 +1,6 @@
 # Voice work on Turnstone (a personal fork)
 
-This is a personal fork of [turnstonelabs/turnstone](https://github.com/turnstonelabs/turnstone). It adds voice to Turnstone: read-aloud (TTS), dictation (STT), a Voice admin page, and a hands-free voice mode on the coordinator. It is not an official Turnstone project. Upstream has not reviewed this code, and none of it is a proposal to merge. It runs on one home server, built from upstream `dev` with the branches below merged on top.
+This is a personal fork of [turnstonelabs/turnstone](https://github.com/turnstonelabs/turnstone). It adds voice to Turnstone: read-aloud (TTS), dictation (STT), a Voice admin page, and a hands-free voice mode on the coordinator. It is not an official Turnstone project. Upstream has not reviewed most of this code. A few small, self-contained pieces are offered upstream one PR at a time, starting with the branches at the top of the table. It runs on one home server, built from upstream `dev` with the branches below merged on top.
 
 **The code is LLM-generated** (Claude Code, plus Turnstone working on itself), with tests and a human checking that it behaves correctly. No experienced Turnstone developer has reviewed it. Read it as a set of ideas and working references, not as code ready to merge.
 
