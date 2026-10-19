@@ -710,6 +710,31 @@ def test_voice_cap_zero_still_refuses_everything(monkeypatch):
     assert coord.spawn.call_count == 0
 
 
+def test_voice_non_numeric_requested_ceiling_falls_back_to_the_default(monkeypatch):
+    # A corrupted row must neither crash the read nor widen the budget past
+    # the registry default: "lots" behaves exactly like an unset key.
+    default = int(SETTINGS["coordinator.voice_max_requested_agents"].default)
+    sess, coord, _ui = _make_session(
+        monkeypatch,
+        voice=True,
+        settings={"coordinator.voice_max_requested_agents": "lots"},
+    )
+    assert sess._voice_max_requested_agents() == default
+    coord.spawn.side_effect = lambda **kwargs: _spawn_result(f"child-{coord.spawn.call_count}")
+    _append_user_turn(sess, "spawn four agents")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(default, requested=True)))
+    assert "error" not in batch
+    sess._exec_spawn_batch(batch)
+    assert coord.spawn.call_count == default
+
+    denied = sess._prepare_tool(
+        _tc("spawn_workstream", {"initial_message": "more", "user_requested_count": True})
+    )
+    assert "error" in denied
+    assert f"at most {default} agents" in denied["error"]
+
+
 def test_voice_requested_ceiling_zero_refuses_a_wider_batch(monkeypatch):
     sess, coord, _ui = _make_session(
         monkeypatch,
