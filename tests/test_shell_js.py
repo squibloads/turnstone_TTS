@@ -11,6 +11,7 @@ temp ``.mjs`` first.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -291,6 +292,57 @@ def test_rail_conveys_state_and_kind() -> None:
     assert "ui-glyph-" in body, "rail must use ui-base .ui-glyph-* for state (shape+colour)"
     assert "bucketByParent" in body, "rail must nest children via the shared bucket helper"
     assert "COORD" in body and "INT" in body, "rail must tag sessions by kind"
+
+
+def test_rail_voice_persona_badge() -> None:
+    """A voice-persona coordinator wears a VOICE chip in the WORKSPACES list;
+    plain coordinators stay COORD and interactive rows stay INT.  The persona
+    rides the Tier-1 snapshot the rail already receives (sessionRow's hover
+    title / aria label read the same field), so the badge needs no new payload.
+    The chip reuses the coordinator colour — voice is a coordinator persona,
+    not a fourth kind — and the slug is pinned against the backend constant."""
+    from turnstone.core.voice_config import VOICE_PERSONA
+
+    body = _RAIL_JS.read_text(encoding="utf-8")
+    match = re.search(r'^const VOICE_PERSONA = "([^"]+)";', body, re.MULTILINE)
+    assert match is not None, "rail.js must name the voice persona slug once"
+    assert match.group(1) == VOICE_PERSONA, (
+        "rail.js and turnstone.core.voice_config must agree on the voice persona"
+    )
+    assert "btn.append(tagFor(ws));" in body, (
+        "the Workspaces row must hand the whole workstream to the badge renderer"
+    )
+
+    src = (
+        'const VOICE_PERSONA = "'
+        + VOICE_PERSONA
+        + '";\n'
+        + extract_braced(body, "function tagFor(ws) {")
+        + """
+const document = {
+  createElement: function () { return { className: "", textContent: "" }; },
+};
+function probe(ws) {
+  const tag = tagFor(ws);
+  return { text: tag.textContent, className: tag.className };
+}
+console.log(JSON.stringify({
+  voice: probe({ kind: "coordinator", persona: "voice" }),
+  voice_spaced: probe({ kind: "coordinator", persona: " Voice " }),
+  coord: probe({ kind: "coordinator", persona: "engineer" }),
+  unstamped: probe({ kind: "coordinator" }),
+  interactive: probe({ kind: "interactive", persona: "voice" }),
+}));
+"""
+    )
+    result = run_node_source(src)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout.strip().splitlines()[-1])
+    assert out["voice"] == {"text": "VOICE", "className": "tag coord"}
+    assert out["voice_spaced"] == {"text": "VOICE", "className": "tag coord"}
+    assert out["coord"] == {"text": "COORD", "className": "tag coord"}
+    assert out["unstamped"] == {"text": "COORD", "className": "tag coord"}
+    assert out["interactive"] == {"text": "INT", "className": "tag"}
 
 
 def test_console_launcher_routes_by_kind() -> None:
