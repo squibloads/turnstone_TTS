@@ -6976,6 +6976,12 @@ function createCoordinatorPane(root, wsId, opts) {
     voiceStatusEl.textContent = label;
     voiceStatusEl.hidden = !label;
     voiceStatusEl.setAttribute("data-state", state || "off");
+    // The strip's turn handoff lives exactly as long as the loop is waiting
+    // for a reply.  "speaking" means the first reply audio has begun;
+    // listening/off/muted mean the turn ended without one (empty reply,
+    // cancel, error), so the warm colour is cleared from the one place every
+    // loop transition passes through.
+    if (state !== "thinking") voiceViz.setPending(false);
   }
 
   function _voiceShow(on) {
@@ -7009,11 +7015,17 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function _sendVoiceText(text) {
     if (!composer.value || !composer.value.trim()) composer.value = text;
+    const wasBusy = busy;
     coordSend();
     // coordSend clears the composer and flips busy on acceptance; a refusal
-    // (attachment upload, blocked send) leaves both alone.  Do not strand the
-    // loop waiting for a reply nobody requested.
-    if (!busy && voiceLoop) {
+    // (attachment upload, blocked send) leaves both alone.  Only the idle ->
+    // busy edge is a heard turn whose reply the strip is now waiting on; a
+    // send queued behind a running turn is not this turn's handoff.
+    if (!wasBusy && busy) {
+      voiceViz.setPending(true);
+    } else if (!busy && voiceLoop) {
+      // Do not strand the loop waiting for a reply nobody requested.
+      voiceViz.setPending(false);
       voiceLoop.onPlaybackDone({ reason: "cancelled", heard: [] });
     }
   }
@@ -7043,6 +7055,9 @@ function createCoordinatorPane(root, wsId, opts) {
     voiceBtn.title = "Hands-free voice mode";
     voiceBtn.setAttribute("aria-label", "Enable hands-free voice mode");
     if (voiceLoop) voiceLoop.disable();
+    // The handoff belongs to a turn; with the mode off there is no reply to
+    // warm for, and the strip is about to leave.
+    voiceViz.setPending(false);
     // Drop any stream run the mode owned; with the mode off nothing should
     // keep auto-playing into the pane.
     _cancelTtsStream();

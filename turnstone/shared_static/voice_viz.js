@@ -107,6 +107,13 @@ const _COLOUR_MUTED = "--fg-dim";
 // instead of painting black; it is never the intended colour.
 const _COLOUR_FALLBACK = "currentColor";
 
+// The turn handoff: once a spoken turn has been sent, the bars warm from the
+// user's muted grey-blue to the AI's accent while the reply is being produced.
+// Half a second is long enough to read as a transition and short enough that
+// the reply usually starts after the accent has landed; a slower reply simply
+// holds the accent until its audio begins.  Reduced motion switches instead.
+export const VIZ_PENDING_FADE_MS = 500;
+
 // The computed values, or null when the element is not in a document yet (a
 // detached element has no computed custom properties) or the page has no
 // tokens.  Null is not cached: the next frame tries again.
@@ -122,6 +129,47 @@ function _resolveColours(el) {
   const accent = styles.getPropertyValue(_COLOUR_AI).trim();
   const muted = styles.getPropertyValue(_COLOUR_MUTED).trim();
   return accent && muted ? { accent, muted } : null;
+}
+
+// The RGB channels of a resolved token.  Both console tokens are hex in every
+// theme; rgb()/rgba() is accepted too because a computed custom property is
+// the browser's serialization, not necessarily the declaration.  A value this
+// parser cannot read is not interpolated; the caller falls back to one of the
+// two tokens rather than painting an invalid fill.
+function _parseRgb(value) {
+  const text = String(value || "").trim();
+  let m = /^#([0-9a-f]{3})$/i.exec(text);
+  if (m) {
+    const h = m[1];
+    return {
+      r: parseInt(h[0] + h[0], 16),
+      g: parseInt(h[1] + h[1], 16),
+      b: parseInt(h[2] + h[2], 16),
+    };
+  }
+  m = /^#([0-9a-f]{6})(?:[0-9a-f]{2})?$/i.exec(text);
+  if (m) {
+    return {
+      r: parseInt(m[1].slice(0, 2), 16),
+      g: parseInt(m[1].slice(2, 4), 16),
+      b: parseInt(m[1].slice(4, 6), 16),
+    };
+  }
+  m = /^rgba?\(\s*([\d.]+)\s*[, ]\s*([\d.]+)\s*[, ]\s*([\d.]+)/i.exec(text);
+  if (m) return { r: Math.round(+m[1]), g: Math.round(+m[2]), b: Math.round(+m[3]) };
+  return null;
+}
+
+// One frame of the handoff blend.  The endpoints return the resolved token
+// strings exactly, so "the accent" is never a rounded copy of itself.
+function _mixColour(from, to, t) {
+  if (t <= 0) return from;
+  if (t >= 1) return to;
+  const a = _parseRgb(from);
+  const b = _parseRgb(to);
+  if (!a || !b) return from;
+  const blend = (x, y) => Math.round(x + (y - x) * t);
+  return `rgb(${blend(a.r, b.r)}, ${blend(a.g, b.g)}, ${blend(a.b, b.b)})`;
 }
 
 // One AudioContext for the strip's life, created on first use and never before:
@@ -146,11 +194,20 @@ function _reducedMotion() {
   );
 }
 
+// The clock behind the handoff fade.  performance.now() is monotonic and
+// unaffected by a wall-clock adjustment mid-transition.
+function _now() {
+  if (typeof performance !== "undefined" && performance && typeof performance.now === "function") {
+    return performance.now();
+  }
+  return Date.now();
+}
+
 // The strip for one coordinator pane.  opts:
 //   host    the element the strip mounts into.
 //   before  the element it mounts ahead of (the CHILDREN section).
 // Returns { show, hide, attachStream, attachAudio, detach, setSpeaker,
-// colourFor, isActive, isReducedMotion, barCount, contextState,
+// setPending, colourFor, isActive, isReducedMotion, barCount, contextState,
 // resumeFromGesture, stop }.
 export function createSpectrumStrip(opts) {
   const host = opts.host;
@@ -183,6 +240,11 @@ export function createSpectrumStrip(opts) {
   let stateListener = null;
   let shown = false;
   let speaker = null;
+  // A sent spoken turn is waiting for its reply.  The colour walks from the
+  // user's token to the accent over VIZ_PENDING_FADE_MS; the start time is
+  // kept so a hidden or stalled frame resumes where the clock now is.
+  let pending = false;
+  let pendingStartedAt = 0;
   let frameId = null;
   let levels = new Array(barCount).fill(0);
   // The falling peak markers, one per bar, carried across frames.
@@ -334,8 +396,9 @@ export function createSpectrumStrip(opts) {
       sources.delete(key);
       if (sources.size === 0) {
         // A detach is not a freeze: the next frame is what carries the bars
-        // to the floor.  Only an already-resting strip may stop here.
-        if (_settled()) _cancelFrame();
+        // to the floor.  Only an already-resting strip may stop here, and a
+        // running colour handoff needs its frames too.
+        if (_settled() && !_fading()) _cancelFrame();
         else _scheduleFrame();
       }
     }
@@ -355,7 +418,37 @@ export function createSpectrumStrip(opts) {
 
   function _speakerColour(next) {
     const resolved = _colours();
+    const progress = _pendingProgress();
+    if (progress > 0) return _mixColour(resolved.muted, resolved.accent, progress);
     return next === "ai" ? resolved.accent : resolved.muted;
+  }
+
+  // How far the turn handoff has travelled, 0..1.  Reduced motion has no
+  // animation to run, so it reports the destination immediately.
+  function _pendingProgress() {
+    if (!pending) return 0;
+    if (reduced) return 1;
+    const elapsed = _now() - pendingStartedAt;
+    return elapsed <= 0 ? 0 : Math.min(1, elapsed / VIZ_PENDING_FADE_MS);
+  }
+
+  function _fading() {
+    return pending && !reduced && _pendingProgress() < 1;
+  }
+
+  // The turn handoff, driven by the coordinator's voice loop: true when a
+  // heard turn has been sent, false when its reply starts or the turn ends
+  // without audio (cancel, error, voice mode off).  The caller owns the turn
+  // boundaries; the strip owns the transition between their colours.
+  function setPending(on) {
+    const next = !!on;
+    if (next === pending) return;
+    pending = next;
+    if (next) pendingStartedAt = _now();
+    // Paint the first or last colour now, even if no source is attached to
+    // carry the next frame; a reply must never begin on the old colour.
+    if (shown) _draw();
+    _scheduleFrame();
   }
 
   // A theme switch changes what the tokens compute to; the canvas must repaint
@@ -406,9 +499,9 @@ export function createSpectrumStrip(opts) {
 
   function _scheduleFrame() {
     if (frameId !== null || !shown || !_visible()) return;
-    // With no source there is still work while the bars are falling; once they
-    // have settled there is nothing left to draw.
-    if (sources.size === 0 && _settled()) return;
+    // With no source there is still work while the bars are falling or the
+    // turn colour is fading; once both have settled there is nothing to draw.
+    if (sources.size === 0 && _settled() && !_fading()) return;
     frameId = requestAnimationFrame(_frame);
   }
 
@@ -421,7 +514,7 @@ export function createSpectrumStrip(opts) {
   function _frame() {
     frameId = null;
     if (!shown || !_visible()) return;
-    if (sources.size === 0 && _settled()) return;
+    if (sources.size === 0 && _settled() && !_fading()) return;
     _draw();
     _scheduleFrame();
   }
@@ -527,8 +620,10 @@ export function createSpectrumStrip(opts) {
     if (!shown) return;
     shown = false;
     _cancelFrame();
-    // A hidden strip has no frame to finish a fall, so reset the levels; the
-    // next show must start at the floor, not repaint a held frame.
+    // A hidden strip has no frame to finish a fall or a fade, so reset both
+    // states; the next show must start at the floor, not repaint a held frame.
+    pending = false;
+    pendingStartedAt = 0;
     levels = new Array(barCount).fill(0);
     peaks = new Array(barCount).fill(0);
     if (typeof document !== "undefined" && document.removeEventListener) {
@@ -562,6 +657,7 @@ export function createSpectrumStrip(opts) {
     attachAudio,
     detach,
     setSpeaker,
+    setPending,
     colourFor,
     isActive,
     isReducedMotion: () => reduced,

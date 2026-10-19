@@ -1147,6 +1147,12 @@ coordinator speaking, grey-blue bars are your microphone, and a flat grey line
 means nobody is. The bars cover the speech range from 80 Hz to 8 kHz on a log
 scale, so a low voice and a high one both move across the strip.
 
+When you finish a spoken turn, the strip hands off: from the moment the heard
+text is sent, while the coordinator is thinking, the bars cross-fade from your
+grey-blue to the reply's orange over about half a second. The reply's first
+audio starts with the bars already orange, so the colour does not jump when
+the voice begins; a cancel or an error returns them to grey-blue instead.
+
 The microphone is read through a branch that never reaches the speakers, so
 nothing is echoed back and the browser does not ask for the microphone a second
 time. A reply is read through its own audio element: the element is routed

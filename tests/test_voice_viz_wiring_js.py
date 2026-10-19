@@ -56,13 +56,14 @@ _COORD_FNS = "\n".join(
 # A recording strip: every call the pane makes is logged, so a test reads what
 # the shipped functions asked for.  `ctxResumes` counts resumeFromGesture calls.
 _FAKES = """
-const vizLog = { show: 0, hide: 0, streamsIn: [], audiosIn: [], resumes: 0, speakers: [] };
+const vizLog = { show: 0, hide: 0, streamsIn: [], audiosIn: [], resumes: 0, speakers: [], pending: [] };
 const voiceViz = {
   show() { vizLog.show++; },
   hide() { vizLog.hide++; },
   attachStream(s, key) { vizLog.streamsIn.push(key); },
   attachAudio(a, key) { vizLog.audiosIn.push(key); },
   setSpeaker(s) { vizLog.speakers.push(s); },
+  setPending(on) { vizLog.pending.push(on); },
   resumeFromGesture() { vizLog.resumes++; return Promise.resolve(); },
   stop() { vizLog.hide++; },
 };
@@ -126,6 +127,19 @@ console.log(JSON.stringify({ once, twice: vizLog.hide }));
 """
     )
     assert out["once"] == out["twice"]
+
+
+def test_turning_voice_mode_off_clears_a_pending_handoff() -> None:
+    # The handoff belongs to a live turn.  With the mode off there is no reply
+    # to warm for, and the strip is about to leave.
+    out = _run(
+        """
+_voiceTurnOn();
+_voiceTurnOff();
+console.log(JSON.stringify({ pending: vizLog.pending }));
+"""
+    )
+    assert out["pending"] == [False]
 
 
 def test_the_strip_is_never_shown_outside_a_voice_session() -> None:

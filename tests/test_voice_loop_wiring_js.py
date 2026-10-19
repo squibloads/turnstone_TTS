@@ -145,13 +145,15 @@ const ttsLog = { streams: [], plays: [], stops: 0 };
 const tick = async () => { for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r)); };
 function makeRun() {
   let resolve = null;
+  let reject = null;
   const run = {
     pushed: [], ended: false, cancelled: false, el: null, heard: [],
     push(text) { this.pushed.push(text); },
     end() { this.ended = true; },
     cancel() { this.cancelled = true; },
-    done: new Promise((r) => { resolve = r; }),
+    done: new Promise((res, rej) => { resolve = res; reject = rej; }),
     resolve: (value) => resolve(value),
+    reject: (value) => reject(value),
   };
   return run;
 }
@@ -207,8 +209,9 @@ function coordSend() {
   return false;
 }
 // The spectrum strip has its own suite (test_voice_viz_wiring_js); here it is a
-// no-op so the sliced voice-mode functions that show and hide it resolve.
-const voiceViz = { show() {}, hide() {}, detach() {}, attachStream() {}, attachAudio() {}, setSpeaker() {}, resumeFromGesture() { return Promise.resolve(); } };
+// no-op apart from the turn handoff, which is recorded for the pending tests.
+const vizLog = { pending: [] };
+const voiceViz = { show() {}, hide() {}, detach() {}, attachStream() {}, attachAudio() {}, setSpeaker() {}, setPending(on) { vizLog.pending.push(on); }, resumeFromGesture() { return Promise.resolve(); } };
 const ttsPlayer = {
   stream() { const r = makeRun(); ttsLog.streams.push(r); return r; },
   play(el, btn) { const r = makeRun(); r.el = el; r.btn = btn; ttsLog.plays.push(r); return r; },
@@ -554,6 +557,119 @@ console.log(JSON.stringify({ mode: voiceModeOn, state: voiceLoop.state }));
     assert out["state"] == "listening"
 
 
+# --- the spectrum strip's turn handoff -------------------------------------
+
+
+def test_a_sent_spoken_turn_starts_the_pending_handoff() -> None:
+    # The strip warms to the AI colour from the moment the heard text is
+    # submitted, before any reply audio exists to read.
+    out = _run(
+        """
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+composer.value = "hello";
+mic.opts.onTranscript("hello");
+console.log(JSON.stringify({
+  pending: vizLog.pending.slice(-1), state: voiceLoop.state, busy,
+}));
+"""
+    )
+    assert out["pending"] == [True]
+    assert out["state"] == "thinking"
+    assert out["busy"] is True
+
+
+def test_the_first_reply_audio_ends_the_pending_handoff() -> None:
+    # Reply playback starts the moment its run is created and told to speak;
+    # the strip must already be in the accent then, not fade behind the voice.
+    out = _run(
+        """
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+composer.value = "hello";
+mic.opts.onTranscript("hello");
+const beforeReply = vizLog.pending.slice(-1);
+_feedTtsStream("the reply ");
+console.log(JSON.stringify({
+  beforeReply, afterReply: vizLog.pending.slice(-1), state: voiceLoop.state,
+}));
+"""
+    )
+    assert out["beforeReply"] == [True]
+    assert out["afterReply"] == [False]
+    assert out["state"] == "speaking"
+
+
+def test_a_turn_that_ends_without_a_reply_clears_the_pending_handoff() -> None:
+    # A reply with nothing to say, a server error or a cancel before any audio
+    # is the end of the wait; the strip must not stay warmed for a reply that
+    # will never play.
+    out = _run(
+        """
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+composer.value = "hello";
+mic.opts.onTranscript("hello");
+const during = vizLog.pending.slice(-1);
+setBusy(false);                            // idle edge, no reply run was made
+console.log(JSON.stringify({ during, after: vizLog.pending.slice(-1), state: voiceLoop.state }));
+"""
+    )
+    assert out["during"] == [True]
+    assert out["after"] == [False]
+    assert out["state"] == "listening"
+
+
+def test_a_typed_turn_does_not_start_the_strip_handoff() -> None:
+    # Only a heard transcript is the voice loop's turn.  Busy edges from a
+    # typed message must not warm the strip.
+    out = _run(
+        """
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+const before = vizLog.pending.length;
+setBusy(true);
+const started = vizLog.pending.slice(before).includes(true);
+setBusy(false);
+console.log(JSON.stringify({ started, state: voiceLoop.state }));
+"""
+    )
+    assert out["started"] is False
+    assert out["state"] == "listening"
+
+
+def test_turning_voice_mode_off_clears_the_pending_handoff() -> None:
+    out = _run(
+        """
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+composer.value = "hello";
+mic.opts.onTranscript("hello");
+const during = vizLog.pending.slice(-1);
+voiceBtn.click();                          // voice mode off
+console.log(JSON.stringify({ during, after: vizLog.pending.slice(-1), state: voiceLoop.state }));
+"""
+    )
+    assert out["during"] == [True]
+    assert out["after"] == [False]
+    assert out["state"] == "off"
+
+
 def test_leaving_the_pane_disables_the_loop_and_closes_the_mic() -> None:
     out = _run(
         """
@@ -749,13 +865,10 @@ console.log(JSON.stringify({ first, afterRender: ttsLog.plays.length, awaiting: 
 
 
 def _voice_on() -> str:
-    return (
-        """
+    return """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
 _applyVoiceRoles({ stt: true, tts: true });
-"""
-        + _settle()
-    )
+""" + _settle()
 
 
 def test_the_mic_button_mutes_and_unmutes_without_leaving_voice_mode() -> None:

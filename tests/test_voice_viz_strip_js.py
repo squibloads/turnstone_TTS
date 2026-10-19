@@ -49,6 +49,10 @@ const themeColours = {
 };
 let themeName = "dark";
 let elementSourceThrows = false;
+// A controllable clock for the turn-handoff cross-fade.  The strip reads
+// performance.now() only while a fade runs, so no other test depends on timing.
+let nowMs = 0;
+performance.now = () => nowMs;
 Object.defineProperty(globalThis, "devicePixelRatio", { get: () => dprValue, configurable: true });
 // getComputedStyle resolves a custom property to its computed value, exactly
 // as the browser does.  A canvas that is handed the raw "var(--x)" instead
@@ -1028,4 +1032,150 @@ console.log(JSON.stringify({ loud, lastH, active: strip.isActive() }));
     )
     assert out["loud"] > 2
     assert out["lastH"] == 2
+    assert out["active"] is False
+
+
+def test_the_strip_cross_fades_from_the_user_colour_to_the_accent_while_pending() -> None:
+    # A sent spoken turn has no audio to read until the reply starts.  The
+    # strip must still show the handoff: warm from the user's grey-blue to the
+    # AI accent over the named fade window, then hold the accent.
+    out = _run(
+        """
+function rgb(s) {
+  if (s[0] === "#") {
+    return [parseInt(s.slice(1, 3), 16), parseInt(s.slice(3, 5), 16), parseInt(s.slice(5, 7), 16)];
+  }
+  return s.slice(4, -1).split(",").map((x) => parseInt(x, 10));
+}
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.setSpeaker("user");
+nowMs = 1000;
+strip.setPending(true);
+const start = strip.colourFor();
+nowMs = 1000 + VIZ_PENDING_FADE_MS * 0.25;
+const quarter = strip.colourFor();
+nowMs = 1000 + VIZ_PENDING_FADE_MS * 0.5;
+const half = strip.colourFor();
+nowMs = 1000 + VIZ_PENDING_FADE_MS;
+const end = strip.colourFor();
+console.log(JSON.stringify({
+  fade: VIZ_PENDING_FADE_MS,
+  start, quarter, half, end,
+  c0: rgb(start), c1: rgb(quarter), c2: rgb(half), c3: rgb(end),
+}));
+"""
+    )
+    assert 400 <= out["fade"] <= 600
+    assert out["start"] == "#8a93ad"
+    assert out["end"] == "#e5a042"
+    c0, c1, c2, c3 = out["c0"], out["c1"], out["c2"], out["c3"]
+    # Each channel moves from the user value toward the accent value and never
+    # turns back: the strip is blending the two resolved RGB colours.
+    for channel in range(3):
+        lo, hi = sorted((c0[channel], c3[channel]))
+        for sample in (c1[channel], c2[channel]):
+            assert lo <= sample <= hi
+        assert (c2[channel] - c1[channel]) * (c3[channel] - c0[channel]) >= 0
+    # The intermediate frames are genuinely between the two tokens, not a
+    # one-step switch dressed up as a fade.
+    assert c1 != c0 and c2 != c1 and c2 != c3
+
+
+def test_reply_audio_starts_on_the_accent_whatever_the_fade_progress() -> None:
+    # The reply begins when the player starts its first clip.  Whatever part of
+    # the fade that interrupts, the bars must already be the AI's exact accent,
+    # so the moving bars need no colour jump of their own.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.setSpeaker("user");
+nowMs = 1000;
+strip.setPending(true);
+nowMs = 1100;                              // the fade is still in progress
+const mid = strip.colourFor();
+await strip.resumeFromGesture();
+strip.attachAudio({ src: "", paused: false, play() {} }, "ai");
+strip.setPending(false);                   // the reply's first audio has started
+const started = strip.colourFor();
+console.log(JSON.stringify({ mid, started }));
+"""
+    )
+    assert out["mid"] != "#e5a042"
+    assert out["started"] == "#e5a042"
+
+
+def test_cancelling_the_pending_turn_returns_the_bars_to_the_user_colour() -> None:
+    # A send that fails, a cancelled run or an error ends the wait without any
+    # reply audio.  Clearing pending must put the strip back on the user colour
+    # rather than leaving it warmed toward an answer that is not coming.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.setSpeaker("user");
+nowMs = 1000;
+strip.setPending(true);
+nowMs = 1100;
+const during = strip.colourFor();
+strip.setPending(false);
+const after = strip.colourFor();
+console.log(JSON.stringify({ during, after }));
+"""
+    )
+    assert out["during"] != "#8a93ad"
+    assert out["after"] == "#8a93ad"
+
+
+def test_the_pending_fade_stops_its_frame_loop_once_it_reaches_the_accent() -> None:
+    # The fade needs frames even with no audio source attached.  When the fade
+    # lands, an otherwise resting strip must stop asking for more.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.setSpeaker("user");
+strip.setPending(true);
+const active = strip.isActive();
+for (let i = 0; i < 12; i++) {
+  nowMs += VIZ_PENDING_FADE_MS / 10;
+  log.frames[log.frames.length - 1]();
+}
+const framesAtRest = log.frames.length;
+for (let i = 0; i < 10; i++) log.frames[log.frames.length - 1]();
+console.log(JSON.stringify({
+  active, after: strip.isActive(), framesAtRest, framesAfter: log.frames.length,
+}));
+"""
+    )
+    assert out["active"] is True
+    assert out["after"] is False
+    assert out["framesAfter"] == out["framesAtRest"]
+
+
+def test_reduced_motion_switches_the_pending_colour_without_a_fade() -> None:
+    # Reduced motion has no cross-fade: the colour change is immediate, and
+    # with nothing else to draw there is no frame loop at all.
+    out = _run(
+        """
+fps = ["(prefers-reduced-motion: reduce)"];
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.setSpeaker("user");
+nowMs = 1000;
+strip.setPending(true);
+const immediately = strip.colourFor();
+nowMs = 1100;
+const later = strip.colourFor();
+console.log(JSON.stringify({ immediately, later, active: strip.isActive() }));
+"""
+    )
+    assert out["immediately"] == "#e5a042"
+    assert out["later"] == "#e5a042"
     assert out["active"] is False
