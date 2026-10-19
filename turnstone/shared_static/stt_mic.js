@@ -14,10 +14,17 @@
 //  proxies a node-hosted session.  Each pane owns its own controller, so a
 //  destroyed pane releases its own microphone.
 //
+//  Frame capture (audio.stt_frame_capture, default off) is speaker-gate
+//  groundwork: while the recorder runs, a second tap on the same stream sends
+//  raw 32 ms frames to the server.  It is strictly additive — the clip upload
+//  is untouched — and every capture failure is swallowed so a missing
+//  AudioWorklet or a refused batch can never cost a dictation.
+//
 //  ES module.  House style: programmatic DOM, NO innerHTML.
 // ===========================================================================
 
 import { authFetch } from "./auth.js";
+import { createFrameSession } from "./stt_frame_session.js";
 import { showToast } from "./toast.js";
 import { makeAnnouncer } from "./utils.js";
 
@@ -55,6 +62,9 @@ const _STT_CONFIG_DEFAULTS = {
   auto_stop: false,
   silence_ms: 900,
   vad_threshold: 0.5,
+  frame_capture: false,
+  segment_gap_ms: 250,
+  frame_capture_max_seconds: 300,
 };
 
 function _finite(value, fallback) {
@@ -67,6 +77,9 @@ function _defaultSttConfig() {
     auto_stop: _STT_CONFIG_DEFAULTS.auto_stop,
     silence_ms: _STT_CONFIG_DEFAULTS.silence_ms,
     vad_threshold: _STT_CONFIG_DEFAULTS.vad_threshold,
+    frame_capture: _STT_CONFIG_DEFAULTS.frame_capture,
+    segment_gap_ms: _STT_CONFIG_DEFAULTS.segment_gap_ms,
+    frame_capture_max_seconds: _STT_CONFIG_DEFAULTS.frame_capture_max_seconds,
   };
 }
 
@@ -130,6 +143,12 @@ export function getSttConfig(base) {
         cfg.auto_stop = body.auto_stop === true;
         cfg.silence_ms = _finite(body.silence_ms, cfg.silence_ms);
         cfg.vad_threshold = _finite(body.vad_threshold, cfg.vad_threshold);
+        cfg.frame_capture = body.frame_capture === true;
+        cfg.segment_gap_ms = _finite(body.segment_gap_ms, cfg.segment_gap_ms);
+        cfg.frame_capture_max_seconds = _finite(
+          body.frame_capture_max_seconds,
+          cfg.frame_capture_max_seconds,
+        );
         return cfg;
       })
       .catch(() => _defaultSttConfig());
@@ -187,6 +206,11 @@ export function loadVad() {
 //              null.  Defaults to the vendored build.
 //   sttConfig  optional dictation settings, object or () => object; defaults
 //              to the per-base GET /v1/api/stt/config probe.
+//   frameSession  optional (opts) => { start(stream), stop() } factory for the
+//              frame-capture session; defaults to stt_frame_session.js.  Tests
+//              and panes with their own transport replace it here.
+//   onSegment  optional (segment) => void; a closed short-gap segment.  Only
+//              runs when frame capture is on; the speaker gate will consume it.
 //
 // Returns { button, setAvailable, syncBusy, toggle, start, stop, isRecording,
 // isDenied, destroy }.  `button` is null when the composer has no action row.
@@ -230,6 +254,10 @@ export function createMicController(opts) {
   let vadToken = null;
   let vadHandle = null;
   let vadState = null;
+  // Frame capture state, on the same token pattern as auto-stop: a session
+  // still starting when the recording ends must be stopped, not adopted.
+  let frameToken = null;
+  let frameHandle = null;
 
   function setState(next) {
     if (next === state) return;
@@ -288,9 +316,10 @@ export function createMicController(opts) {
   }
 
   function teardownStream() {
-    // Releasing the microphone releases the detector with it: a handle left
-    // running would keep reading a stream it no longer owns (and could still
-    // call stop() on a finished recording).
+    // Releasing the microphone releases the detector and the frame tap with
+    // it: a handle left running would keep reading a stream it no longer owns
+    // (and could still call stop() on a finished recording).
+    stopFrameCapture();
     stopVad();
     if (stream) {
       stream.getTracks().forEach((t) => t.stop());
@@ -299,6 +328,24 @@ export function createMicController(opts) {
       if (typeof opts.onStream === "function") opts.onStream(null);
     }
     recorder = null;
+  }
+
+  function stopFrameCapture() {
+    frameToken = null;
+    if (frameHandle) {
+      const handle = frameHandle;
+      frameHandle = null;
+      try {
+        const flushing = handle.stop();
+        // The sender's last batch is a promise; a failed one was already
+        // reported by the session, so there is nothing to await here.
+        if (flushing && typeof flushing.catch === "function") {
+          flushing.catch(() => {});
+        }
+      } catch (e) {
+        /* the capture was already torn down */
+      }
+    }
   }
 
   function stopVad() {
@@ -356,6 +403,71 @@ export function createMicController(opts) {
           return;
         }
         vadHandle = handle;
+      })
+      .catch(() => {});
+  }
+
+  // Frame capture is speaker-gate groundwork and is off unless the deployment
+  // turns it on.  Like auto-stop it is best-effort: the settings probe runs
+  // first (so an off deployment never imports the capture modules), and any
+  // failure is logged and abandoned without touching the recorder or the clip
+  // upload.
+  function armFrameCapture(s) {
+    const token = {};
+    frameToken = token;
+    Promise.resolve(configOf())
+      .then((cfg) => {
+        if (
+          !cfg ||
+          !cfg.frame_capture ||
+          frameToken !== token ||
+          stream !== s ||
+          destroyed
+        ) {
+          return null;
+        }
+        const wsId = wsIdOf();
+        if (!wsId) return null;
+        const factory =
+          typeof opts.frameSession === "function"
+            ? opts.frameSession
+            : createFrameSession;
+        let handle = null;
+        try {
+          handle = factory({
+            base: baseOf(),
+            wsId: wsId,
+            segmentGapMs: cfg.segment_gap_ms,
+            maxSeconds: cfg.frame_capture_max_seconds,
+            onSegment:
+              typeof opts.onSegment === "function" ? opts.onSegment : null,
+            onError: (err) => {
+              if (typeof console !== "undefined" && typeof console.warn === "function") {
+                console.warn(
+                  "Voice frame capture:",
+                  err && err.message ? err.message : err,
+                );
+              }
+            },
+          });
+        } catch (err) {
+          return null;
+        }
+        if (!handle || typeof handle.start !== "function") return null;
+        return Promise.resolve(handle.start(s)).then(() => {
+          // The recording can end while the worklet module is still loading;
+          // do not adopt a graph nobody is listening to.
+          if (frameToken !== token || destroyed) {
+            try {
+              handle.stop();
+            } catch (e) {
+              /* already released */
+            }
+            return null;
+          }
+          frameHandle = handle;
+          return null;
+        });
       })
       .catch(() => {});
   }
@@ -555,6 +667,7 @@ export function createMicController(opts) {
         announce("Recording. Activate the microphone button again to stop.");
         rec.start();
         armAutoStop(s);
+        armFrameCapture(s);
       })
       .catch(() => {
         // Denied / hardware unavailable: leave a persistent disabled state with

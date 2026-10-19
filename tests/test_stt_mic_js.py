@@ -26,7 +26,10 @@ _PRELUDE = "\n".join((TREE_DOM, MIC_DOM, MIC_STUBS, _MODULE))
 
 
 def _run(body: str) -> Any:
-    src = _PRELUDE + f"\n(async () => {{\n{body}\n}})().catch((e) => {{ console.error(e); process.exit(1); }});"
+    src = (
+        _PRELUDE
+        + f"\n(async () => {{\n{body}\n}})().catch((e) => {{ console.error(e); process.exit(1); }});"
+    )
     r = run_node_source(src)
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout.strip().splitlines()[-1])
@@ -293,3 +296,105 @@ console.log(JSON.stringify({ seen, claimed, recording: m.isRecording() }));
     assert out["seen"] == 2
     assert out["claimed"] == [False, 0]
     assert out["recording"] is True
+
+
+def test_frame_capture_is_not_even_constructed_when_the_setting_is_off() -> None:
+    """The default is off, and off must mean today's path: no module load, no
+    factory call, no frame request, no change to the clip upload."""
+    out = _run(
+        """
+let built = 0;
+const composer = makeComposer();
+const m = createMicController({
+  composer, base: "", wsId: "w",
+  sttConfig: { auto_stop: false, silence_ms: 900, vad_threshold: 0.5 },
+  frameSession: () => { built++; return { start: async () => true, stop() {} }; },
+});
+m.button.click(); await tick();
+m.button.click(); await tick();
+console.log(JSON.stringify({ built, uploads: log.fetches.length, tracksStopped: log.tracks.map((t) => t.stopped) }));
+"""
+    )
+    assert out == {"built": 0, "uploads": 1, "tracksStopped": [True]}
+
+
+def test_frame_capture_rides_the_recording_and_stops_with_it() -> None:
+    out = _run(
+        """
+const calls = [];
+const sessions = [];
+const composer = makeComposer();
+const m = createMicController({
+  composer, base: "/node/n1", wsId: "ws 1",
+  sttConfig: { auto_stop: false, silence_ms: 900, vad_threshold: 0.5,
+    frame_capture: true, segment_gap_ms: 400, frame_capture_max_seconds: 600 },
+  onSegment: () => {},
+  frameSession: (opts) => {
+    const session = {
+      started: null, stopped: 0,
+      start(stream) { this.started = !!stream; return Promise.resolve(true); },
+      stop() { this.stopped++; },
+    };
+    calls.push(opts); sessions.push(session);
+    return session;
+  },
+});
+m.button.click(); await tick();
+const live = { start: sessions[0].started, stopped: sessions[0].stopped };
+m.button.click(); await tick();
+console.log(JSON.stringify({
+  calls: calls.map((c) => [c.base, c.wsId, c.segmentGapMs, c.maxSeconds, typeof c.onSegment, typeof c.onError]),
+  live, stopped: sessions[0].stopped, uploads: log.fetches.length,
+}));
+"""
+    )
+    assert out["calls"] == [["/node/n1", "ws 1", 400, 600, "function", "function"]]
+    assert out["live"] == {"start": True, "stopped": 0}
+    assert out["stopped"] == 1
+    assert out["uploads"] == 1  # the clip path is untouched
+
+
+def test_a_frame_capture_failure_never_costs_the_dictation() -> None:
+    out = _run(
+        """
+const composer = makeComposer();
+const m = createMicController({
+  composer, base: "", wsId: "w",
+  sttConfig: { auto_stop: false, silence_ms: 900, vad_threshold: 0.5,
+    frame_capture: true, segment_gap_ms: 250, frame_capture_max_seconds: 300 },
+  frameSession: () => ({
+    start: () => Promise.reject(new Error("AudioWorklet is not supported")),
+    stop() {},
+  }),
+});
+m.button.click(); await tick();
+m.button.click(); await tick();
+console.log(JSON.stringify({
+  uploads: log.fetches.length, value: composer.inputEl.value,
+  toasts: log.toasts, tracksStopped: log.tracks.map((t) => t.stopped),
+}));
+"""
+    )
+    assert out["uploads"] == 1
+    assert out["value"] == "hello world"
+    assert out["toasts"] == []  # groundwork failures are not a user problem
+    assert out["tracksStopped"] == [True]
+
+
+def test_frame_capture_needs_a_workstream_to_belong_to() -> None:
+    out = _run(
+        """
+let built = 0;
+const composer = makeComposer();
+const m = createMicController({
+  composer, base: "", wsId: () => "",
+  sttConfig: { auto_stop: false, silence_ms: 900, vad_threshold: 0.5,
+    frame_capture: true, segment_gap_ms: 250, frame_capture_max_seconds: 300 },
+  frameSession: () => { built++; return { start: async () => true, stop() {} }; },
+});
+m.button.click(); await tick();
+m.button.click(); await tick();
+console.log(JSON.stringify({ built, uploads: log.fetches.length }));
+"""
+    )
+    assert out == {"built": 0, "uploads": 0}

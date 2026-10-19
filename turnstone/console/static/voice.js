@@ -45,6 +45,18 @@ const VOICE_SETTING_GROUPS = [
     ],
   },
   {
+    // Speaker-gate groundwork, kept apart from dictation: these knobs do not
+    // change what the transcriber hears, they only shape the frame stream the
+    // future gate will score.  Off by default, so the group is easy to skip.
+    id: "speaker-gate",
+    label: "Speaker gate (preview)",
+    keys: [
+      "audio.stt_frame_capture",
+      "audio.stt_segment_gap_ms",
+      "audio.stt_frame_capture_max_seconds",
+    ],
+  },
+  {
     id: "read-aloud",
     label: "Read aloud",
     keys: [
