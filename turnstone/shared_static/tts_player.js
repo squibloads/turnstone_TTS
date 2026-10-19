@@ -1050,6 +1050,10 @@ const MAX_QUEUED_VOICE_RUNS = 10;
 //   announce        live-region announcer; defaults to a module-owned region.
 //   authGeneration  returns a token that changes on logout or account switch;
 //                   defaults to auth.js's.  A run holding an older token stops.
+//   onAudio         optional (audio | null) => void; the element a run speaks
+//                   through, reported when the run makes it and null when the
+//                   run releases it.  A listener such as the spectrum strip
+//                   reads the element; the player never waits on it.
 // Returns { play(el, btn), stream(opts), stop(), isPlaying(), activeButton(),
 // audio(), idle() }.  `stream({voice: true})` runs queue behind the voice run
 // already playing; `idle()` resolves when the last of them has finished.
@@ -1058,6 +1062,30 @@ export function createTtsPlayer(opts) {
   const baseOf = typeof opts.base === "function" ? opts.base : () => opts.base || "";
   const announce = opts.announce || _announcePlayback;
   const generationOf = opts.authGeneration || authGeneration;
+  // A listener's failure must never stop a reply from playing, so the report is
+  // made inside its own guard and the run never sees a thrown listener.
+  // The element last reported, so the release is paired with the report even
+  // when the run ends before any clip has loaded into it.
+  let reportedEl = null;
+  const reportAudio = (el) => {
+    if (typeof opts.onAudio !== "function") return;
+    reportedEl = el;
+    try {
+      opts.onAudio(el);
+    } catch (e) {
+      /* the listener is a visual; playback goes on without it */
+    }
+  };
+  const releaseAudio = () => {
+    if (!reportedEl) return;
+    reportedEl = null;
+    if (typeof opts.onAudio !== "function") return;
+    try {
+      opts.onAudio(null);
+    } catch (e) {
+      /* see reportAudio */
+    }
+  };
   // seq is the cancellation token: stop() bumps it, and a run that wakes up
   // holding an older one neither plays nor leaks a blob.
   let seq = 0;
@@ -1156,6 +1184,9 @@ export function createTtsPlayer(opts) {
       URL.revokeObjectURL(audioEl.src);
       audioEl = null;
     }
+    // Released here, not with audioEl: a run stopped before its first clip has
+    // loaded still reported an element, and the listener must hear it go.
+    releaseAudio();
     const btn = activeBtn;
     if (btn) {
       btn.classList.remove("is-busy", "is-playing");
@@ -1257,6 +1288,7 @@ export function createTtsPlayer(opts) {
     // later from an await or a timer, so each clip swaps its src rather than
     // constructing a new Audio.
     const audio = new Audio();
+    reportAudio(audio);
     // Many self-hosted backends synthesize one request at a time, so exactly
     // one fetch is ever in flight: clip i+1 is requested once clip i starts.
     const fetchClip = async (text, style) => {
@@ -1676,6 +1708,7 @@ export function createTtsPlayer(opts) {
       // gesture unlocked play later, and swapping src keeps that one element.
       audio = new Audio();
       audio.preservesPitch = true;
+      reportAudio(audio);
       streamRun = run;
       playLoop();
     };
