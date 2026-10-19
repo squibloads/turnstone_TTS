@@ -104,6 +104,25 @@ console.log(JSON.stringify({ seen }));
     assert out["seen"] == ["element", "null"]
 
 
+def test_the_listener_can_be_attached_after_construction_and_is_then_reported_to() -> None:
+    # The coordinator builds its player with a fixed constructor call, so the
+    # strip's listener is attached afterwards.  It must receive reports from the
+    # next run on, exactly as one passed to the constructor would.
+    out = _run(
+        """
+const seen = [];
+const p = createTtsPlayer({ base: "" });
+p.setAudioListener((a) => seen.push(a === null ? "null" : "element"));
+const btn = new El("button");
+p.play(reply("Attached after construction."), btn);
+await tick();
+p.stop();
+console.log(JSON.stringify({ seen }));
+"""
+    )
+    assert out["seen"] == ["element", "null"]
+
+
 def test_a_player_without_the_hook_plays_exactly_as_before() -> None:
     # The hook is optional: a player built without onAudio must still play.
     out = _run(

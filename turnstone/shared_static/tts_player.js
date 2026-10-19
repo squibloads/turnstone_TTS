@@ -1067,11 +1067,14 @@ export function createTtsPlayer(opts) {
   // The element last reported, so the release is paired with the report even
   // when the run ends before any clip has loaded into it.
   let reportedEl = null;
+  // The listener starts as the option and can be replaced after construction,
+  // so a caller whose constructor call is fixed can still attach one.
+  let audioListener = typeof opts.onAudio === "function" ? opts.onAudio : null;
   const reportAudio = (el) => {
-    if (typeof opts.onAudio !== "function") return;
+    if (!audioListener) return;
     reportedEl = el;
     try {
-      opts.onAudio(el);
+      audioListener(el);
     } catch (e) {
       /* the listener is a visual; playback goes on without it */
     }
@@ -1079,9 +1082,9 @@ export function createTtsPlayer(opts) {
   const releaseAudio = () => {
     if (!reportedEl) return;
     reportedEl = null;
-    if (typeof opts.onAudio !== "function") return;
+    if (!audioListener) return;
     try {
-      opts.onAudio(null);
+      audioListener(null);
     } catch (e) {
       /* see reportAudio */
     }
@@ -1798,5 +1801,11 @@ export function createTtsPlayer(opts) {
     isPlaying: () => activeBtn !== null,
     activeButton: () => activeBtn,
     audio: () => audioEl,
+    // Replaces the onAudio listener for every run from here on.  Passing null
+    // detaches it.  A run already reporting keeps its element; its release then
+    // goes to whichever listener is attached at that point.
+    setAudioListener: (fn) => {
+      audioListener = typeof fn === "function" ? fn : null;
+    },
   };
 }
