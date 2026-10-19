@@ -4,9 +4,9 @@ A voice session is a coordinator created with the ``voice`` persona.  The
 settings registry points the voice-persona settings at
 ``docs/voice.md#voice-persona``, so that heading is a public anchor: renaming
 it turns every "learn more" link in Admin › Settings into a dead link.  The
-admin Memories scope filter is a fixed list in the console HTML, so it has to
-offer the new scope as well; the console admin API itself accepts any scope
-string and needs no matching list.
+admin Memories scope filter is a fixed list in the console HTML, so it must
+not keep offering the retired ``voice`` scope; the console admin API itself
+accepts any scope string and needs no matching list.
 """
 
 from __future__ import annotations
@@ -48,17 +48,24 @@ def test_voice_doc_names_the_persona_settings() -> None:
         assert key in text, f"docs/voice.md must name {key}"
 
 
-def test_memory_doc_lists_the_voice_scope_and_links_to_the_voice_doc() -> None:
+def test_memory_doc_says_voice_sessions_use_the_interactive_scopes() -> None:
     text = _MEMORY_DOC.read_text(encoding="utf-8")
-    assert re.search(r"^\|\s*`voice`\s*\|", text, re.MULTILINE), (
-        "docs/memory.md's scope table must list the voice scope"
+    # Positive control: the scope table still exists and lists a shared scope.
+    assert re.search(r"^\|\s*`global`\s*\|", text, re.MULTILINE), (
+        "positive control: docs/memory.md's scope table exists"
+    )
+    assert not re.search(r"^\|\s*`voice`\s*\|", text, re.MULTILINE), (
+        "docs/memory.md must not list the retired voice scope"
+    )
+    assert "same scopes as an interactive session" in text, (
+        "docs/memory.md must say a voice coordinator uses the interactive scopes"
     )
     assert re.search(r"\]\(voice\.md#voice-persona\)", text), (
         "docs/memory.md must point at the voice persona section"
     )
 
 
-def test_admin_memories_scope_filter_offers_voice() -> None:
+def test_admin_memories_scope_filter_omits_the_retired_voice_scope() -> None:
     """The Memories tab's scope select is a fixed list in index.html."""
     html = _CONSOLE_INDEX.read_text(encoding="utf-8")
     select = re.search(
@@ -67,6 +74,9 @@ def test_admin_memories_scope_filter_offers_voice() -> None:
         re.DOTALL,
     )
     assert select, "positive control: the admin Memories scope filter exists"
-    assert re.search(r'<option value="voice">Voice</option>', select.group(0)), (
-        "the admin Memories scope filter must offer the voice scope"
+    assert re.search(r'<option value="global">global</option>', select.group(0)), (
+        "positive control: the admin Memories scope filter lists a live scope"
+    )
+    assert not re.search(r'<option value="voice">', select.group(0)), (
+        "the admin Memories scope filter must not offer the retired voice scope"
     )

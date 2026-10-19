@@ -755,9 +755,9 @@ pass `persona` on `POST /v1/api/workstreams/new`:
 {"persona": "voice", "initial_message": "What needs my attention today?"}
 ```
 
-The persona changes the session's instructions and its memory namespace, not
-the speech pipeline. Dictation, read-aloud, cleanup and pacing behave exactly
-as described above.
+The persona changes the session's instructions and which memory scopes it may
+use, not the speech pipeline. Dictation, read-aloud, cleanup and pacing behave
+exactly as described above.
 
 ### Spoken replies
 
@@ -775,21 +775,29 @@ like "I wonder whether the tests pass" should not turn into a fan-out.
 
 ### Voice memories
 
-A voice session keeps its memories in the `voice` scope, keyed by the acting
-user. Every voice session that user opens shares the namespace; text
-coordinators keep using `coordinator`, and the two do not mix. The split is
-deliberate: a coordinator's memory accumulates working habits — "always
-research first", "read the whole file before editing", "run the narrowed test
-file" — that make text work reliable and a spoken conversation exhausting. A
-voice session should remember how you like to be talked to and what you asked
-it to keep, not a playbook for changing a repository. Separating the scopes
-also means a terse correction spoken out loud cannot silently reprogram the
-coordinator you use for code review.
+A voice session does not have a memory scope of its own. It uses the same
+scopes as an interactive session: `global`, its own `workstream`, `user`, and
+the attached `project`. A voice conversation is for spitballing and setting
+work up for an orchestrator, so the point is that what you say is visible where
+the work continues — an orchestrator or interactive session can read a memory
+saved by voice, and every voice session that user opens sees the same
+`global`/`user` rows. An unscoped save follows the interactive rule too: it
+lands in the attached `project` when there is one, otherwise in `global`.
 
-The scope is durable and per user, not per session: closing and reopening the
-voice session does not lose it. It uses the same body-free metadata index and
-`memory(action='get', ...)` read path as any other scope; see
-[Structured Memory](memory.md#memory-scopes) for the mechanics.
+A voice coordinator is still a coordinator by kind, but it can never read or
+write the `coordinator` scope. That private namespace accumulates working
+habits — "always research first", "read the whole file before editing", "run
+the narrowed test file" — which are useful for text work and exhausting in a
+spoken conversation. Keeping the gate on both kind and persona means a spoken
+aside can neither see those rows nor plant one for the text coordinator to
+read later.
+
+Voice memories use the same body-free metadata index and
+`memory(action='get', ...)` read path as every other scope; the initial index
+lists exactly the rows an interactive session for the same user would see. See
+[Structured Memory](memory.md#memory-scopes) for the mechanics. Rows written
+under the retired `voice` scope during earlier releases were migrated into the
+`global` scope.
 
 ### Starting agents
 

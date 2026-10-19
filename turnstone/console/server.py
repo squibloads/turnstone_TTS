@@ -140,7 +140,6 @@ from turnstone.core.storage import (
     WorkstreamLeaseLostError,
 )
 from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
-from turnstone.core.voice_config import VOICE_MEMORY_SCOPE
 from turnstone.core.web_helpers import (
     RevalidatingStaticFiles,
     is_safe_static_asset_path,
@@ -10147,9 +10146,9 @@ def _memory_scope_label(
     scope: str, scope_id: str, storage: Any, cache: dict[tuple[str, str], str]
 ) -> str:
     """Resolve a memory's ``scope_id`` to a human label — username for user /
-    coordinator / voice scope, workstream title for workstream scope, project
-    name for project scope.  Cached per (scope, scope_id) so a list of 200
-    memories costs one lookup per distinct target; falls back to the raw id on
+    coordinator scope, workstream title for workstream scope, project name for
+    project scope.  Cached per (scope, scope_id) so a list of 200 memories
+    costs one lookup per distinct target; falls back to the raw id on
     miss/error."""
     if not scope_id:
         return ""
@@ -10158,7 +10157,7 @@ def _memory_scope_label(
         return cache[key]
     label = scope_id
     try:
-        if scope in ("user", "coordinator", VOICE_MEMORY_SCOPE):
+        if scope in ("user", "coordinator"):
             user = storage.get_user(scope_id)
             label = (user or {}).get("username") or scope_id
         elif scope == "workstream":

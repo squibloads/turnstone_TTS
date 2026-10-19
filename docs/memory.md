@@ -33,14 +33,14 @@ Each memory has four index dimensions:
 | `workstream`  | Visible only within the originating workstream                  |
 | `user`        | Follows the authenticated user across workstreams               |
 | `coordinator` | Coordinator sessions only; follows the acting user              |
-| `voice`       | Voice sessions only; follows the acting user                    |
 | `project`     | Shared by workstreams attached to one active project             |
 
 A memory's identity is the tuple `(name, scope, scope_id)`. Saving a memory
 with the same identity upserts -- updating content while preserving the ID.
-The `voice` scope is the voice persona's per-user namespace; see
-[Voice persona](voice.md#voice-persona) for why it is kept separate from
-`coordinator`.
+A voice-persona coordinator uses the same scopes as an interactive session; it
+has no separate memory scope and can never reach `coordinator`. See
+[Voice persona](voice.md#voice-persona) for why a spoken session shares the
+interactive namespace.
 
 ### Name normalization and legacy rows
 
@@ -73,7 +73,9 @@ Name-based operations use one inherited target when `scope` is omitted:
 - Authorized read-only project access permits `get`, but `save` and `delete`
   fail. Authorized project reactivation restores eligibility.
 - Only when no project attachment is stored do interactive sessions select
-  `global` and coordinator sessions select `coordinator`.
+  `global` and text coordinator sessions select `coordinator`. A voice
+  coordinator follows the interactive rule and selects `global`; it never
+  inherits `coordinator`.
 
 A valid explicit scope selects exactly that scope. `search` and `list` are the
 only actions that span every visible scope when `scope` is omitted.
@@ -83,15 +85,20 @@ user's `user_id`. It is durable -- every coordinator session that user runs
 (including concurrent ones) shares one orchestration namespace, so procedures
 and lessons survive close/reopen.
 
-Isolation is bidirectional and enforced by session kind, not by secrecy of
-the scope id:
+Isolation is bidirectional and enforced by session kind (and, for a
+coordinator, by persona), not by secrecy of the scope id:
 
-- A coordinator session sees its acting user's `coordinator` scope and, when
-  attached, the shared `project` scope. It never sees
+- A text coordinator session sees its acting user's `coordinator` scope and,
+  when attached, the shared `project` scope. It never sees
   `global`/`workstream`/`user` memories.
+- A voice-persona coordinator is a coordinator by kind but uses the
+  interactive envelope: `global`, its own `workstream`, `user`, and the
+  attached `project`. It never sees the `coordinator` scope, so a spoken aside
+  cannot read or pollute the text coordinator's orchestration memory.
 - Interactive sessions -- including a coordinator's own children, which share
   its `user_id` -- are rejected from the `coordinator` scope on every memory
-  action. Children cannot plant rows the parent coordinator would read.
+  action. Children cannot plant rows the parent coordinator would read. The
+  same holds for a voice coordinator's children.
 - The REST memory API (`/v1/api/memories`) does not accept the `coordinator`
   scope at all; the scope is written exclusively through a coordinator
   session's own memory tool.

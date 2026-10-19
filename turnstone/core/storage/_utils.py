@@ -62,7 +62,7 @@ from turnstone.core.trajectory import (
     sanitize_client_send_ids,
     turn_to_dict,
 )
-from turnstone.core.voice_config import VOICE_MEMORY_SCOPE, VOICE_REPORT_STATES
+from turnstone.core.voice_config import VOICE_REPORT_STATES
 
 log = get_logger(__name__)
 
@@ -397,11 +397,12 @@ def acquire_memory_index_snapshot_on_connection(
     snapshot belongs to the current durable row; transactional hard-delete and
     registration cleanup prevent a later same-ID row from inheriting it.
 
-    ``voice`` selects the private namespace of a COORDINATOR-kind row: the row
-    records kind only, while the persona is an immutable session stamp, so the
-    live session must say that a voice coordinator captures ``voice`` rather
-    than ``coordinator`` rows.  The project half of the envelope is resolved
-    here from the live ACL either way.
+    ``voice`` tells the capture that a COORDINATOR-kind row belongs to a voice
+    session: the row records kind only, while the persona is an immutable
+    session stamp, so the live session must say.  A voice coordinator captures
+    the same envelope as an interactive session (global + workstream + user,
+    plus the project resolved here from the live ACL) and never the
+    ``coordinator`` namespace.
     """
     from turnstone.core.memory_index import (
         MEMORY_INDEX_FORMAT_VERSION,
@@ -449,9 +450,8 @@ def acquire_memory_index_snapshot_on_connection(
         str(workstream[2] or ""),
         permissions=permissions,
     )
-    if kind == "coordinator":
-        private_scope = VOICE_MEMORY_SCOPE if voice else "coordinator"
-        scopes = [(private_scope, principal_id)] if principal_id else []
+    if kind == "coordinator" and not voice:
+        scopes = [("coordinator", principal_id)] if principal_id else []
     else:
         scopes = [("global", ""), ("workstream", ws_id)]
         if principal_id:

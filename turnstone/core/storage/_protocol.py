@@ -1202,10 +1202,11 @@ class StorageBackend(Protocol):
         deterministic publication — an exception there cannot roll back the
         already-committed snapshot.
 
-        ``voice`` selects the private namespace captured for a
-        COORDINATOR-kind row: ``voice`` instead of ``coordinator``. The row
-        stores only the kind, so the caller supplies the immutable persona
-        fact. A later capture on the same row always returns the first
+        ``voice`` tells the capture that a COORDINATOR-kind row belongs to a
+        voice session, which uses the interactive envelope (global,
+        workstream, user, project) and never the ``coordinator`` namespace.
+        The row stores only the kind, so the caller supplies the immutable
+        persona fact. A later capture on the same row always returns the first
         snapshot; the flag cannot rewrite visibility after the fact.
         """
         ...
