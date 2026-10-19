@@ -949,3 +949,83 @@ console.log(JSON.stringify({ toDestination: log.connects.filter((c) => c[1] === 
 """
     )
     assert out["toDestination"] == 0
+
+
+def test_the_bars_keep_falling_to_the_floor_after_the_mic_detaches() -> None:
+    # Stopping the recording detaches the mic at once.  The last frame must not
+    # be held on screen: the strip keeps animating by itself until the bars and
+    # their peak markers have settled, then stops asking for frames.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+const analyser = log.analyserList[log.analyserList.length - 1];
+analyser.bins = new Uint8Array(4096).fill(255);
+log.frames[log.frames.length - 1]();          // one loud frame raises the bars
+draws.rectsGeom = [];
+strip.detach("user");
+const activeOnDetach = strip.isActive();
+const heights = [];
+for (let i = 0; i < 80; i++) {
+  draws.rectsGeom = [];
+  log.frames[log.frames.length - 1]();
+  const bar = draws.rectsGeom.filter((r) => r.x === 0 && r.h > 2)[0];
+  heights.push(bar ? bar.h : 0);
+}
+const framesAtRest = log.frames.length;
+for (let i = 0; i < 10; i++) log.frames[log.frames.length - 1]();
+console.log(JSON.stringify({
+  activeOnDetach,
+  aboveFloor: heights.filter((h) => h > 2).length,
+  first: heights[0],
+  last: heights[heights.length - 1],
+  monotonic: heights.every((h, i) => i === 0 || h <= heights[i - 1] + 1e-9),
+  activeAfter: strip.isActive(),
+  framesAtRest,
+  framesAfter: log.frames.length,
+}));
+"""
+    )
+    # Still animating on the detach edge, so this is not the frozen last frame.
+    assert out["activeOnDetach"] is True
+    # Several frames above the floor: the bars fell, they did not snap in one.
+    assert out["aboveFloor"] >= 3
+    assert out["first"] > 2
+    assert out["monotonic"] is True
+    # Once settled the loop stops on its own; a stale callback is a no-op.
+    assert out["last"] == 0
+    assert out["activeAfter"] is False
+    assert out["framesAfter"] == out["framesAtRest"]
+
+
+def test_reduced_motion_meter_falls_to_the_floor_after_the_mic_detaches() -> None:
+    # Reduced motion has no bars to animate, but its level meter is still a
+    # live reading and must fall to the floor when the mic closes rather than
+    # freezing at the last level.
+    out = _run(
+        """
+fps = ["(prefers-reduced-motion: reduce)"];
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+const analyser = log.analyserList[log.analyserList.length - 1];
+analyser.bins = new Uint8Array(4096).fill(255);
+draws.rectsGeom = [];
+log.frames[log.frames.length - 1]();
+const loud = draws.rectsGeom[0].h;
+strip.detach("user");
+let lastH = null;
+for (let i = 0; i < 80; i++) {
+  draws.rectsGeom = [];
+  log.frames[log.frames.length - 1]();
+  if (draws.rectsGeom[0]) lastH = draws.rectsGeom[0].h;
+}
+console.log(JSON.stringify({ loud, lastH, active: strip.isActive() }));
+"""
+    )
+    assert out["loud"] > 2
+    assert out["lastH"] == 2
+    assert out["active"] is False

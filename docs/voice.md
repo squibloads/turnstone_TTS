@@ -1157,10 +1157,13 @@ not let the page start audio yet, the element keeps its native playback path
 until it has, so a reply is never muted to draw a strip.
 
 The bar colour is read from the console's own tokens rather than hard-coded,
-and a theme switch repaints the strip in the new theme. The strip only does
-work while something is speaking and the tab is visible, and it is removed when
-voice mode ends. With reduced motion turned on in your system settings, the
-bars give way to a single level meter.
+and a theme switch repaints the strip in the new theme. When the microphone
+closes or the reply stops, the bars fall back to the resting line instead of
+holding the last frame, and the strip stops animating once they have settled.
+The strip only does work while something is speaking or settling and the tab
+is visible, and it is removed when voice mode ends. With reduced motion
+turned on in your system settings, the bars give way to a single level meter
+that still falls when the audio stops.
 
 ### The setting
 

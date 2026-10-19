@@ -84,6 +84,13 @@ export function barLevels(bins, ranges) {
 const VIZ_BAR_FALL = 0.18;
 const VIZ_PEAK_FALL = 0.02;
 
+// The level at which a falling bar is treated as resting.  A bar falls by a
+// fraction of its remaining height each frame, so it approaches zero without
+// ever reaching it; at the strip's 48px height this is under a tenth of a
+// pixel.  Snapping the last invisible sliver to zero lets the frame loop stop
+// instead of drawing convergence forever.
+const VIZ_SETTLE_EPSILON = 0.002;
+
 // Colour follows who is speaking.  Both are console tokens from base.css: the
 // AI is the accent, the user the muted grey-blue, and silence settles to the
 // same muted token as a flat line.  No palette of its own.
@@ -325,7 +332,12 @@ export function createSpectrumStrip(opts) {
         }
       }
       sources.delete(key);
-      if (sources.size === 0) _cancelFrame();
+      if (sources.size === 0) {
+        // A detach is not a freeze: the next frame is what carries the bars
+        // to the floor.  Only an already-resting strip may stop here.
+        if (_settled()) _cancelFrame();
+        else _scheduleFrame();
+      }
     }
     if (speaker === key) speaker = null;
   }
@@ -382,8 +394,21 @@ export function createSpectrumStrip(opts) {
     return typeof document === "undefined" || document.visibilityState !== "hidden";
   }
 
+  // Whether every bar and peak marker has reached the resting floor.  A
+  // detached source leaves the loop with nothing to read, but it must keep
+  // drawing until this is true or the last live frame stays frozen on screen.
+  function _settled() {
+    for (let i = 0; i < barCount; i++) {
+      if (levels[i] > VIZ_SETTLE_EPSILON || peaks[i] > VIZ_SETTLE_EPSILON) return false;
+    }
+    return true;
+  }
+
   function _scheduleFrame() {
-    if (frameId !== null || !shown || sources.size === 0 || !_visible()) return;
+    if (frameId !== null || !shown || !_visible()) return;
+    // With no source there is still work while the bars are falling; once they
+    // have settled there is nothing left to draw.
+    if (sources.size === 0 && _settled()) return;
     frameId = requestAnimationFrame(_frame);
   }
 
@@ -395,7 +420,8 @@ export function createSpectrumStrip(opts) {
 
   function _frame() {
     frameId = null;
-    if (!shown || sources.size === 0 || !_visible()) return;
+    if (!shown || !_visible()) return;
+    if (sources.size === 0 && _settled()) return;
     _draw();
     _scheduleFrame();
   }
@@ -439,6 +465,9 @@ export function createSpectrumStrip(opts) {
       const t = target[i] || 0;
       // A bar rises with the sound and falls toward it, so it settles.
       levels[i] = t >= levels[i] ? t : levels[i] - (levels[i] - t) * VIZ_BAR_FALL;
+      // The exponential fall never reaches zero on its own; stop it at the
+      // point where the remaining sliver cannot be seen.
+      if (levels[i] < VIZ_SETTLE_EPSILON) levels[i] = 0;
       // The marker jumps to any new height and otherwise falls more slowly.
       // Never below the bar it marks: a fixed fall step that crosses zero
       // while the bar still stands would drop the marker to the floor for one
@@ -498,6 +527,10 @@ export function createSpectrumStrip(opts) {
     if (!shown) return;
     shown = false;
     _cancelFrame();
+    // A hidden strip has no frame to finish a fall, so reset the levels; the
+    // next show must start at the floor, not repaint a held frame.
+    levels = new Array(barCount).fill(0);
+    peaks = new Array(barCount).fill(0);
     if (typeof document !== "undefined" && document.removeEventListener) {
       document.removeEventListener("visibilitychange", _onVisibility);
     }
