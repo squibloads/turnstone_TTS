@@ -1134,8 +1134,9 @@ export function createTtsPlayer(opts) {
   // Ends everything this player is doing.  A caller-initiated stop is the
   // user taking the voice slot back, so it also empties the voice queue;
   // keepQueue is the internal natural-finish path, which hands the slot to
-  // the next queued run instead.
-  function stop(keepQueue) {
+  // the next queued run instead.  This is private so no caller can borrow
+  // the keep-queue behaviour by accident; ``stop`` below is the public one.
+  function _stop(keepQueue) {
     _activeTtsRuns.delete(stop);
     seq++; // invalidate any run in progress
     const finish = playSettle;
@@ -1170,6 +1171,13 @@ export function createTtsPlayer(opts) {
     }
     if (!keepQueue) _clearVoiceQueue();
     _notifyIdle();
+  }
+
+  // Public stop: a caller taking the voice slot back.  It takes no argument —
+  // a listener invoked with an Event must not keep the queue — and always
+  // empties it.
+  function stop() {
+    _stop(false);
   }
 
   // A finished reply's run handle: the run's own promise (as play() always
@@ -1490,7 +1498,7 @@ export function createTtsPlayer(opts) {
     const finishIfSilent = () => {
       finish("finished");
       if (streamRun === run) {
-        stop(true);
+        _stop(true);
         _startNextVoiceRun();
       }
     };
@@ -1633,7 +1641,7 @@ export function createTtsPlayer(opts) {
         // every cancelled path's exit.  keepQueue hands the voice slot to the
         // next queued reply; a plain stop() would drop it.
         finish("finished");
-        stop(true);
+        _stop(true);
         _startNextVoiceRun();
       } catch (err) {
         if (token !== seq) return; // aborted by a stop or a newer run

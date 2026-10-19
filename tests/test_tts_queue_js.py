@@ -319,6 +319,38 @@ console.log(JSON.stringify(result));
     assert out["idle"] == "idle"
 
 
+def test_a_truthy_argument_to_stop_still_empties_the_queue() -> None:
+    # stop() is public, so a caller can hand it anything — a DOM event handler
+    # passes the Event itself.  Only the player's own natural-finish path may
+    # keep the queue; the public entry point must ignore whatever it is given.
+    out = _run(
+        """
+stubStream = true;
+const player = createTtsPlayer({ base: "" });
+const first = player.stream({ voice: true });
+first.push("First voice sentence one. First voice sentence two.");
+first.end();
+await tick();
+const queued = player.stream({ voice: true });
+queued.push("Queued voice sentence one. Queued voice sentence two.");
+queued.end();
+await tick();
+player.stop({});                                 // event-shaped truthy argument
+const result = {
+  first: await first.done,
+  queued: await settled(queued.done),
+  paused: log.audios[0].paused,
+  idle: await settled(player.idle().then(() => "idle")),
+};
+console.log(JSON.stringify(result));
+"""
+    )
+    assert out["first"] == {"reason": "cancelled", "heard": []}
+    assert out["queued"] == {"reason": "cancelled", "heard": []}
+    assert out["paused"] is True
+    assert out["idle"] == "idle"
+
+
 def test_a_voice_run_with_no_audio_does_not_block_the_runs_behind_it() -> None:
     # audio.tts_stream is off on this deployment, so every voice stream settles
     # "finished" without speaking (the pane falls back to the finished-reply
