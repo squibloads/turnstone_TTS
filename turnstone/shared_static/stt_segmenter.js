@@ -6,7 +6,7 @@
 //  no timer — frames in, callbacks out — so the detector and both clocks
 //  can be exercised from synthesized audio.  It is not wired into a page yet.
 //
-//  Two clocks, deliberately:
+//  Two clocks and a span bound, deliberately:
 //
 //    - opts.segmentGapMs (250 ms) closes a segment.  A segment is one
 //      speaker-sized stretch, short enough that when somebody else starts
@@ -18,6 +18,12 @@
 //      short gap here would submit every sentence as its own turn; using the
 //      long silence for the segment clock would leave a segment open long
 //      after the speaker changed.
+//    - opts.maxSegmentMs (15000 ms) bounds a segment's span.  Both clocks
+//      above are driven by silence, so a steady loud stream (a fan, a stuck
+//      mic) would keep one segment open forever: frames accumulate without
+//      bound and no verdict or turn decision is ever reached.  The open
+//      segment closes at the bound and the next frame opens a new one; the
+//      turn keeps running, exactly as if a gap had closed the segment.
 //
 //  Backend VAD re-segmentation has to be off when the gate is wired.  These
 //  boundaries are the units a verdict is attached to; if the speech-to-text
@@ -40,6 +46,7 @@ const _DEFAULTS = {
   segmentGapMs: 250,
   turnSilenceMs: 1000,
   minSegmentMs: 200,
+  maxSegmentMs: 15000,
 };
 
 // Voice-mode frames are 512 samples of 16 kHz mono (32 ms).  The sample rate
@@ -117,6 +124,8 @@ function _normalizeVerdict(value) {
  * @param {number} [opts.segmentGapMs=250] non-speech run that closes a segment
  * @param {number} [opts.turnSilenceMs=1000] non-speech run that closes a turn
  * @param {number} [opts.minSegmentMs=200] shortest active speech run kept
+ * @param {number} [opts.maxSegmentMs=15000] longest span an open segment may
+ *        reach before it is closed
  * @param {(segment: object) => (string | Promise<string>)} [opts.verdict]
  * @param {(segment: object) => void} [opts.onSegment] accepted / abstained
  * @param {(turn: { segments: object[] }) => void} [opts.onTurnEnd] non-empty
@@ -139,6 +148,10 @@ export function createSegmenter(opts = {}) {
   const minSegmentMs = Math.max(
     0,
     _finite(opts.minSegmentMs, _DEFAULTS.minSegmentMs),
+  );
+  const maxSegmentMs = Math.max(
+    0,
+    _finite(opts.maxSegmentMs, _DEFAULTS.maxSegmentMs),
   );
   const verdict = typeof opts.verdict === "function" ? opts.verdict : null;
   const onSegment =
@@ -338,6 +351,14 @@ export function createSegmenter(opts = {}) {
     // from the detector's release: a 300 ms pause is 300 ms even while
     // hangover is still calling the first frames speech.
     if (segment && t0 - segment.lastActiveEndMs >= segmentGapMs) {
+      _closeSegment();
+    }
+
+    // Neither clock above can fire while the speaker never pauses.  Cut the
+    // open segment once the next frame would take it past its maximum span;
+    // that frame then opens the next segment, the same way a gap would have.
+    // _closeSegment refreshed turnSpeechEndMs, so the turn itself keeps going.
+    if (segment && t0 + duration - segment.entries[0].frame.t0Ms > maxSegmentMs) {
       _closeSegment();
     }
 

@@ -476,6 +476,64 @@ console.log(JSON.stringify({ before, after, twice }));
     assert out["twice"] == {"segments": 1, "turns": 1}
 
 
+def test_a_steady_loud_stream_is_cut_into_segments_of_bounded_length() -> None:
+    """A fan or a stuck mic never produces the silence either clock needs.
+
+    Without a span bound the open segment would accumulate frames forever and
+    never reach a verdict or a turn decision.  ``maxSegmentMs`` closes it at
+    the frame where the next one would exceed the bound; that frame starts the
+    next segment and the turn keeps going, exactly as if a gap had closed it.
+    """
+    out = _run(
+        """
+const frames = makeFrames([[0, 61000]], 63000);   // 61 s loud, then 2 s quiet
+const segments = [];
+const turns = [];
+const seg = createSegmenter({
+  maxSegmentMs: 15000,
+  onSegment: (s) => segments.push(s),
+  onTurnEnd: (t) => turns.push(t),
+});
+for (const f of frames) seg.push(f);
+const lengths = segments.map((s) => s.endMs - s.startMs);
+console.log(JSON.stringify({
+  count: segments.length,
+  lengths,
+  maxLength: Math.max(...lengths),
+  firstStart: segments[0] && segments[0].startMs,
+  contiguous: segments.every((s, i) => i === 0 || s.startMs === segments[i - 1].endMs),
+  framesBounded: segments.every((s) => s.frames.length * 32 <= 15000),
+  turns: turns.length,
+  turnSegments: turns[0] ? turns[0].segments.length : -1,
+}));
+"""
+    )
+    assert out["count"] == 5  # four full 15 s spans plus the clipped tail
+    assert out["maxLength"] <= 15000
+    assert out["framesBounded"] is True
+    assert out["firstStart"] == 0
+    assert out["contiguous"] is True
+    # The cut is a segment boundary, not a turn boundary: one turn still
+    # collects every segment and ends only on the silence after the stream.
+    assert out["turns"] == 1
+    assert out["turnSegments"] == 5
+
+
+def test_the_segment_span_bound_defaults_to_fifteen_seconds() -> None:
+    out = _run(
+        """
+const frames = makeFrames([[0, 20000]], 21000);
+const segments = [];
+const seg = createSegmenter({ onSegment: (s) => segments.push(s) });
+for (const f of frames) seg.push(f);
+const lengths = segments.map((s) => s.endMs - s.startMs);
+console.log(JSON.stringify({ count: segments.length, maxLength: Math.max(...lengths) }));
+"""
+    )
+    assert out["count"] == 2  # 14976 ms + the remainder
+    assert out["maxLength"] <= 15000
+
+
 def test_frames_must_arrive_in_clock_order_and_flush_restarts_the_baseline() -> None:
     out = _run(
         """
