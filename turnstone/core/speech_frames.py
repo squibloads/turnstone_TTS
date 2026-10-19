@@ -14,8 +14,9 @@ to the transcriber.
 Caps are hard by construction.  A capture has a fixed audio-byte budget (the
 configured duration at 32,000 bytes/second) and a wall-clock lifetime; crossing
 either closes it, and later batches are refused rather than silently dropped.
-A capture also expires after its cap plus a grace period so a crashed tab
-cannot pin memory forever.
+The wall-clock check carries a few seconds of grace so the last live batch can
+land after a recording reaches its audio cap, then a longer grace expires the
+buffer so a crashed tab cannot pin memory forever.
 """
 
 from __future__ import annotations
@@ -45,6 +46,10 @@ MAX_BATCH_BYTES = 256 * 1024
 # lifetime.  The extra grace lets the last batch land after the cap edge.
 MAX_CAPTURES = 8
 IDLE_GRACE_SECONDS = 30.0
+# A live 300-second recording sends its last batch at about the same moment the
+# audio cap is reached; a small wall-clock grace keeps that batch from losing a
+# race with the transport.  The byte cap still bounds the audio exactly.
+WALL_GRACE_SECONDS = 5.0
 
 _CAPTURE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
@@ -154,7 +159,7 @@ class FrameCaptureStore:
         if narrowed < capture.max_seconds:
             capture.max_seconds = narrowed
             capture.max_bytes = narrowed * BYTES_PER_SECOND
-        if moment - capture.started_at > capture.max_seconds:
+        if moment - capture.started_at > capture.max_seconds + WALL_GRACE_SECONDS:
             capture.closed = True
             capture.capped = True
             raise FrameCaptureError(

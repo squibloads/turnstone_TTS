@@ -148,8 +148,11 @@ def test_the_audio_byte_cap_closes_the_capture_and_later_batches_are_gone() -> N
 def test_the_wall_clock_cap_closes_a_capture_that_keeps_dribbling() -> None:
     store = FrameCaptureStore()
     _append(store, frames=1, max_seconds=1, now=100.0)
+    # The check carries a few seconds of grace for the final live batch, so a
+    # capture is still accepted just past its audio cap and closed after it.
+    _append(store, seq=1, t0=32, frames=1, max_seconds=1, now=105.0)
     with pytest.raises(FrameCaptureError) as exc:
-        _append(store, seq=1, t0=32, frames=1, max_seconds=1, now=102.0)
+        _append(store, seq=2, t0=64, frames=1, max_seconds=1, now=107.0)
     assert exc.value.status_code == 413
     assert "second" in str(exc.value)
 
