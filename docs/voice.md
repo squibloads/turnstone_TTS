@@ -1138,6 +1138,24 @@ Pressing **Voice** again turns the mode off immediately. A recording in flight
 is discarded rather than transcribed, playback stops, and nothing else fires.
 Closing the pane does the same.
 
+### The spectrum strip
+
+While voice mode is on, a thin strip sits at the top of the right panel, above
+**Children**. Its bars are the live frequency content of whoever is talking,
+read from the audio itself rather than animated: orange bars are the
+coordinator speaking, grey-blue bars are your microphone, and a flat grey line
+means nobody is. The bars cover the speech range from 80 Hz to 8 kHz on a log
+scale, so a low voice and a high one both move across the strip.
+
+The microphone is read through a branch that never reaches the speakers, so
+nothing is echoed back and the browser does not ask for the microphone a second
+time. A reply is read through a copy of its own audio where the browser allows
+that, which leaves playback untouched; where it does not, the reply passes
+through the page and still plays. The strip only does work while something is
+speaking and the tab is visible, and it is removed when voice mode ends. With
+reduced motion turned on in your system settings, the bars give way to a single
+level meter.
+
 ### The setting
 
 `audio.voice_mode_enabled` · default on · boolean
