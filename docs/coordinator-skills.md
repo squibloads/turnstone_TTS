@@ -88,6 +88,7 @@ Explicitly **not** in the coordinator set:
 - `web_fetch` / `web_search` — no direct web access.
 - `task_agent` — sub-agent tool is zeroed on coord sessions.
 - `recall` / `watch` / `read_resource` / `use_prompt` — UX / persistence tools that belong to interactive sessions.  The dual-kind `memory` / `skills` / `notify` tools are available on both kinds (see the table above).
+- `open_preview` — display tool for interactive sessions and the **voice** surface only.  Voice sits between coordinator and interactive; the text coordinator does not get a preview pane.
 
 If your skill needs a coordinator to "run a command" or "read a
 file", write the delegate pattern instead: spawn a child with an
