@@ -490,7 +490,8 @@ function handleClusterEvent(data) {
   if (data.type === "models_changed") {
     // Server emits this when a model definition or a role-assignment
     // setting (model.default_alias, judge.model, coordinator.model_alias,
-    // coordinator.reasoning_effort) changes.  Refresh anything that
+    // coordinator.reasoning_effort, coordinator.voice_model_alias,
+    // coordinator.voice_reasoning_effort) changes.  Refresh anything that
     // renders model aliases so labels stay accurate without a reload.  Pass
     // {force:true} so a burst of changes converges to the latest (the coalesced
     // open/startup path stays plain — see _refreshAndPopulateModels).
@@ -1144,13 +1145,14 @@ function _createCoordinator(opts) {
 }
 
 // ---------------------------------------------------------------------------
-// Voice session launcher — a one-click coordinator with the `voice` persona.
+// Voice tab create — a coordinator with the `voice` persona.
 // ---------------------------------------------------------------------------
 //
 // A voice session is not a fourth workstream kind: it is an ordinary
 // coordinator whose persona is `voice`, so it uses the same create endpoint
-// and opens the same pane as the composer's Coordinator kind.  The action
-// lives outside the kind radiogroup and never reads the composer's task text.
+// and opens the same pane as the composer's Coordinator kind.  The tab forces
+// the persona instead of exposing a picker; its optional opening line is the
+// only per-session input beyond the ordinary options.
 const _VOICE_PERSONA = "voice";
 
 // The audio.voice_mode_enabled switch, once an admin-settings read answers.
@@ -1167,7 +1169,7 @@ let _voiceModeReading = false;
 // Is the voice persona on this user's coordinator shelf?  Reads the SAME
 // kind-filtered list the launcher's Persona picker renders
 // (window.TurnstonePersonas), so a persona the picker cannot offer is never
-// launchable from the one-click action.
+// launchable from the Voice tab.
 function _voicePersonaAvailable() {
   const TP = window.TurnstonePersonas;
   if (!TP) return false;
@@ -1913,8 +1915,8 @@ function _populateHomePersonaDropdown() {
     const dflt = TP.defaultPersona(_launcherPersonaKind());
     if (dflt) _homeCoordComposer.setOptionValue("persona", dflt.name);
   }
-  // The voice shortcut keys off the same shelf: a refresh can add or remove
-  // the persona after the launcher painted.
+  // The Voice tab keys off the same shelf: a refresh can add or remove the
+  // persona after the launcher painted.
   _refreshVoiceLauncher();
 }
 
@@ -2328,9 +2330,9 @@ function submitHomeCoord(textFromComposer) {
     },
   };
   if (kind === "voice") {
-    // Voice IS the persona, so use the same create the one-click action used:
-    // force `voice` and carry only the optional opening line.  Anything the
-    // hidden persona picker still holds is deliberately not sent.
+    // Voice IS the persona, so use the same create the one-click action this
+    // tab replaced: force `voice` and carry only the optional opening line.
+    // Anything the hidden persona picker still holds is deliberately not sent.
     startVoiceSession({
       task: task,
       errEl: shared.errEl,
