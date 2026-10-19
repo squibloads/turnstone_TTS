@@ -1210,33 +1210,50 @@ function _readVoiceModeSetting() {
     });
 }
 
-// Reveal/hide the voice action.  `readSetting === false` is the read's own
-// settle path: it must repaint the result without immediately starting another
-// read (a failed read would otherwise retry forever in one call stack).
-// Called from every place the answer can change — permissions settling, the
-// persona cache refreshing, and the switch read landing.
-function _refreshVoiceLauncher(readSetting) {
-  const btn = document.getElementById("start-voice-session");
-  if (!btn) return;
-  // A voice session is a coordinator, so it needs the same create permission
-  // as the Coordinator kind: the panel can be visible for Interactive or
-  // Scheduled alone.
-  const show =
+// Can the Voice tab launch?  A voice session is a coordinator with the `voice`
+// persona, so it needs the same create permission as the Coordinator tab, the
+// persona on this user's shelf, and the switch not definitively off.
+function _voiceLauncherAvailable() {
+  return (
     _hasCoordPermission() &&
     _voicePersonaAvailable() &&
-    _voiceModeEnabled !== false;
-  btn.style.display = show ? "" : "none";
+    _voiceModeEnabled !== false
+  );
+}
+
+// Reveal/hide the Voice tab.  `readSetting === false` is the read's own settle
+// path: it must repaint the result without immediately starting another read
+// (a failed read would otherwise retry forever in one call stack).  Called
+// from every place the answer can change — permissions settling, the persona
+// cache refreshing, and the switch read landing.
+function _refreshVoiceLauncher(readSetting) {
+  const btn = document.getElementById("kind-voice");
+  const show = _voiceLauncherAvailable();
+  if (btn) btn.style.display = show ? "" : "none";
+  // The answer can change while Voice is selected (a persona removed, the
+  // switch turned off).  Move to a kind this user can still create before the
+  // composer is painted against a tab that just disappeared.
+  if (!show && _launcherKind === "voice") {
+    const fallback = _LAUNCHER_KINDS.find(function (k) {
+      return k.kind !== "voice" && k.can();
+    });
+    if (fallback) _setLauncherKind(fallback.kind);
+  }
   if (show && readSetting !== false) _readVoiceModeSetting();
+  _paintLauncherVisibility();
 }
 
 // Create the voice coordinator and open it exactly like a normal create.  No
 // open-time pane hint is passed: the coordinator pane factory does not accept
 // one (shell.js drops openPane's `extra`), so the persona IS the handshake —
-// a voice-persona coordinator starts in voice mode inside the pane.
-function startVoiceSession() {
-  // The button is hidden when the persona is gone, but a shelf refresh can
-  // land between the paint and the click; refuse with the reason instead of
-  // posting a persona the server would reject.
+// a voice-persona coordinator starts in voice mode inside the pane.  `opts`
+// carries the Voice tab's optional opening line plus the composer's busy/error
+// hooks; the one-click empty submit stays valid.
+function startVoiceSession(opts) {
+  opts = opts || {};
+  // The tab is hidden when the persona is gone, but a shelf refresh can land
+  // between the paint and the click; refuse with the reason instead of posting
+  // a persona the server would reject.
   if (!_voicePersonaAvailable()) {
     showToast("The voice persona is not available");
     return;
@@ -1244,18 +1261,20 @@ function startVoiceSession() {
   _homeShowError("");
   _createCoordinator({
     persona: _VOICE_PERSONA,
-    errEl: document.getElementById("home-coord-error"),
-    setBusy: function (busy) {
-      const btn = document.getElementById("start-voice-session");
-      if (btn) btn.disabled = !!busy;
-    },
+    task: (opts.task || "").trim(),
+    errEl: opts.errEl || document.getElementById("home-coord-error"),
+    setBusy: opts.setBusy || function () {},
+    onSuccess: opts.onSuccess,
   });
 }
 
 // Which workstream KIND the launcher creates: "coordinator" (console-local),
-// "interactive" (proxied to a compute node), or "scheduled" (an interactive
-// session the console's scheduler starts later, on a timer).  The composer
-// is shared; only the field set, the submit endpoint and what follows differ.
+// "voice" (a coordinator with the `voice` persona), "interactive" (proxied to a
+// compute node), or "scheduled" (an interactive session the console's
+// scheduler starts later, on a timer).  The composer is shared; only the field
+// set, the submit endpoint and what follows differ.  Voice is a persona rather
+// than a kind on the wire, but it earns a tab because starting a spoken
+// session is the one create that should not require opening Options first.
 let _launcherKind = "coordinator";
 
 // The kinds in toggle order, each with its radio id and the ONE place its
@@ -1263,15 +1282,25 @@ let _launcherKind = "coordinator";
 // _hasCoordPermission, for its other caller), so the refusal toast can never
 // name a permission the gate stopped checking.  The click wiring, the
 // arrow-key cycle, the availability fallback and the submit gate all walk
-// this list.
+// this list.  Voice supplies its own `can` because a permission alone does not
+// make it launchable — the persona must be on the shelf and voice mode must
+// not be switched off.
 const _LAUNCHER_KINDS = [
   { kind: "coordinator", id: "kind-coordinator", perm: "admin.coordinator" },
+  {
+    kind: "voice",
+    id: "kind-voice",
+    perm: "admin.coordinator",
+    can: _voiceLauncherAvailable,
+  },
   { kind: "interactive", id: "kind-interactive", perm: "workstreams.create" },
   { kind: "scheduled", id: "kind-scheduled", perm: "admin.schedules" },
 ].map(function (k) {
-  k.can = function () {
-    return _consoleHasPermission(k.perm);
-  };
+  if (!k.can) {
+    k.can = function () {
+      return _consoleHasPermission(k.perm);
+    };
+  }
   return k;
 });
 
@@ -1293,8 +1322,11 @@ function _nextLauncherKind(current, avail, back) {
 }
 
 // A schedule dispatches an interactive workstream, so the Scheduled kind
-// draws its personas from the interactive shelf.
+// draws its personas from the interactive shelf.  Voice is a coordinator
+// persona, so it reads the coordinator shelf even though it is not the
+// Coordinator tab.
 function _launcherPersonaKind() {
+  if (_launcherKind === "voice") return "coordinator";
   return _launcherKind === "scheduled" ? "interactive" : _launcherKind;
 }
 
@@ -1309,6 +1341,12 @@ let _launcherWhen = null;
 const _SCHEDULE_NO_FILES_MSG =
   "A schedule can't carry attachments; remove them first.";
 const _SCHEDULE_NO_DROP_MSG = "A schedule can't carry attachments.";
+// Voice hides the paperclip (a spoken session starts from an opening line),
+// but a file staged under another tab can survive the switch.  Refuse it
+// rather than silently dropping or orphaning the upload.
+const _VOICE_NO_FILES_MSG =
+  "A voice session can't carry attachments; remove them first.";
+const _VOICE_NO_DROP_MSG = "A voice session can't carry attachments.";
 
 // No try/catch around the constructor on purpose: the template, this mount
 // and the builder script ship in the one index.html, served no-cache with
@@ -1329,6 +1367,7 @@ function _mountLauncherWhen() {
 const _PROJECT_NEW = "__new__";
 
 function _setLauncherKind(kind, focus) {
+  const leavingVoice = _launcherKind === "voice" && kind !== "voice";
   _launcherKind = kind;
   _homeShowError(""); // a message about the previous kind no longer applies
   _LAUNCHER_KINDS.forEach(function (k) {
@@ -1344,25 +1383,42 @@ function _setLauncherKind(kind, focus) {
   // The persona shelves are disjoint per kind — swap the picker's choices
   // (and default preselect) whenever the kind toggles.
   _populateHomePersonaDropdown();
+  if (!_homeCoordComposer) return;
+  // Voice IS the persona pick: pin it while the Voice tab is active so a pick
+  // carried over from another tab can never start a text persona instead.
+  // Leaving Voice drops the pin, otherwise the next Coordinator create would
+  // silently launch spoken.
+  if (kind === "voice") {
+    _homeCoordComposer.setOptionValue("persona", _VOICE_PERSONA);
+  } else if (leavingVoice) {
+    const TP = window.TurnstonePersonas;
+    const dflt = TP && TP.defaultPersona(_launcherPersonaKind());
+    if (dflt) _homeCoordComposer.setOptionValue("persona", dflt.name);
+  }
 }
 
 // Reflect the active kind in the shared launcher composer: the task-prompt
 // hint, the send label, and which option fields are relevant.  Node
 // placement applies to every kind that runs on a compute node (interactive
-// and scheduled; coordinators run in the console); its node list appears
-// only under the "Specific node" strategy.  The Scheduled kind drops the
-// judge model and attachments (a schedule carries neither) and reveals the
-// When builder beneath the composer.
+// and scheduled; coordinators and voice run in the console); its node list
+// appears only under the "Specific node" strategy.  The Scheduled kind drops
+// the judge model and attachments (a schedule carries neither) and reveals
+// the When builder beneath the composer.  Voice drops attachments and the
+// persona picker: the tab IS the persona, and a spoken session starts from
+// an opening line rather than a file.
 function _applyLauncherFields() {
   if (!_homeCoordComposer) return;
   const scheduled = _launcherKind === "scheduled";
-  const onNode = _launcherKind !== "coordinator";
+  const voice = _launcherKind === "voice";
+  const onNode = _launcherKind === "interactive" || scheduled;
   _homeCoordComposer.setPlaceholder(
     scheduled
       ? "What should run on this schedule?"
-      : onNode
-        ? "What do you want to work on?"
-        : "What should this coordinator orchestrate?",
+      : voice
+        ? "What should this voice session start with? (optional)"
+        : onNode
+          ? "What do you want to work on?"
+          : "What should this coordinator orchestrate?",
   );
   _homeCoordComposer.setSendLabel(
     scheduled ? "Schedule" : "Start",
@@ -1374,7 +1430,8 @@ function _applyLauncherFields() {
   _homeCoordComposer.setOptionFieldVisible("node_id", specific);
   if (specific) _populateLauncherNodes();
   _homeCoordComposer.setOptionFieldVisible("judge_model", !scheduled);
-  _homeCoordComposer.setAttachVisible(!scheduled);
+  _homeCoordComposer.setOptionFieldVisible("persona", !voice);
+  _homeCoordComposer.setAttachVisible(!scheduled && !voice);
   // A schedule's name is derived client-side (the Name option stays
   // optional); the other kinds get a server-generated name.
   _homeCoordComposer.setOptionPlaceholder(
@@ -1724,13 +1781,16 @@ function _homeRenderChips() {
 function _homeStageFile(file) {
   if (!file) return false;
   const paste = window.TurnstonePasteText;
-  if (_launcherKind === "scheduled") {
-    // No paperclip in this kind; this catches drops and pasted files.  A
+  if (_launcherKind === "scheduled" || _launcherKind === "voice") {
+    // No paperclip in either kind; this catches drops and pasted files.  A
     // false return keeps a large pasted text inline — that is the right
-    // outcome for a schedule's task, so the paste case says nothing; only
-    // a real drop gets the refusal.
-    if (!(paste && paste.isPastedTextFile && paste.isPastedTextFile(file)))
-      _homeShowError(_SCHEDULE_NO_DROP_MSG);
+    // outcome for the task/opening line, so the paste case says nothing;
+    // only a real drop gets the refusal.
+    if (!(paste && paste.isPastedTextFile && paste.isPastedTextFile(file))) {
+      _homeShowError(
+        _launcherKind === "voice" ? _VOICE_NO_DROP_MSG : _SCHEDULE_NO_DROP_MSG,
+      );
+    }
     return false;
   }
   if (
@@ -1783,10 +1843,6 @@ function _ensureHomeComposerInit() {
   _mountHomeCoordComposer();
   _mountLauncherWhen();
   _wireLauncherToggle();
-  // The voice action is static markup; wire its one handler with the rest of
-  // the launcher's controls.
-  const voiceBtn = document.getElementById("start-voice-session");
-  if (voiceBtn) voiceBtn.addEventListener("click", startVoiceSession);
   _refreshAndPopulateSkills();
   _refreshAndPopulateModels();
   _refreshAndPopulateProjects();
@@ -1957,8 +2013,9 @@ function _mountHomeCoordComposer() {
       summary: function (v) {
         const bits = [];
         // Persona surfaces only when it's a non-default pick — the kind
-        // default is the zero-touch state and needs no summary line.
-        if (v.persona && window.TurnstonePersonas) {
+        // default is the zero-touch state and needs no summary line.  The
+        // Voice tab's persona is the tab itself, so it stays quiet too.
+        if (_launcherKind !== "voice" && v.persona && window.TurnstonePersonas) {
           const dflt = window.TurnstonePersonas.defaultPersona(
             _launcherPersonaKind(),
           );
@@ -1981,7 +2038,7 @@ function _mountHomeCoordComposer() {
         // scheduled); surface it only when a specific node is pinned (the
         // "Least loaded" default needs no summary line).
         if (
-          _launcherKind !== "coordinator" &&
+          (_launcherKind === "interactive" || _launcherKind === "scheduled") &&
           v.node_strategy === "node" &&
           v.node_id
         )
@@ -2176,7 +2233,17 @@ function _populateHomeModelDropdowns() {
   _restorePick("judge_model", prevJudge, choices);
 }
 
+// Permissions settling (and re-login) also decide whether the Voice tab may
+// show: it creates a coordinator, not the selected kind.  The voice refresh
+// owns the switch read and repaints the launcher from its result.
 function _refreshHomeComposerVisibility() {
+  _refreshVoiceLauncher();
+}
+
+// Paint the launcher from the CURRENT kind answers.  Deliberately does not
+// start the voice-settings read — `_refreshVoiceLauncher` calls this once the
+// answer lands, and reading here would recurse through the same path.
+function _paintLauncherVisibility() {
   const panel = document.getElementById("coord-composer-panel");
   if (!panel) return;
   const avail = _LAUNCHER_KINDS.filter(function (k) {
@@ -2195,9 +2262,6 @@ function _refreshHomeComposerVisibility() {
     return k.kind === _launcherKind;
   });
   if (!allowed && avail.length) _setLauncherKind(avail[0].kind);
-  // Permissions settling (and re-login) also decide whether the voice
-  // shortcut may show: it creates a coordinator, not the selected kind.
-  _refreshVoiceLauncher();
 }
 
 function submitHomeCoord(textFromComposer) {
@@ -2225,6 +2289,12 @@ function submitHomeCoord(textFromComposer) {
   // guard below, whose "add a message" advice could never resolve this.
   if (kind === "scheduled" && files.length > 0) {
     _homeShowError(_SCHEDULE_NO_FILES_MSG);
+    return;
+  }
+  // Voice hides the paperclip, but a file staged under another tab can survive
+  // the switch.  Refuse it rather than launching a session that ignores it.
+  if (kind === "voice" && files.length > 0) {
+    _homeShowError(_VOICE_NO_FILES_MSG);
     return;
   }
   // Files-without-text would upload pending attachment rows but the
@@ -2257,7 +2327,17 @@ function submitHomeCoord(textFromComposer) {
       _homeClearStagedFiles();
     },
   };
-  if (kind === "interactive") {
+  if (kind === "voice") {
+    // Voice IS the persona, so use the same create the one-click action used:
+    // force `voice` and carry only the optional opening line.  Anything the
+    // hidden persona picker still holds is deliberately not sent.
+    startVoiceSession({
+      task: task,
+      errEl: shared.errEl,
+      setBusy: shared.setBusy,
+      onSuccess: shared.onSuccess,
+    });
+  } else if (kind === "interactive") {
     // Create-with-attachments rides multipart through the cluster proxy to the
     // node (see _createInteractive); the files-need-a-task guard above already
     // ensures an initial turn to dispatch them on.

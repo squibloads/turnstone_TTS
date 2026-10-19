@@ -546,15 +546,15 @@ def test_console_launcher_scheduled_kind() -> None:
     assert "function _scheduleNameFromTask" in app, "an empty Name derives from the task"
     assert 'setOptionFieldVisible("judge_model", !scheduled)' in app
     fields = slice_braced_block(app, app.index("function _applyLauncherFields("))
-    assert fields and "setAttachVisible(!scheduled)" in fields, (
-        "the paperclip must be hidden through the composer's API"
+    assert fields and "setAttachVisible(!scheduled && !voice)" in fields, (
+        "the paperclip must be hidden through the composer's API (schedule + voice)"
     )
     assert "attachBtn.hidden" not in fields, (
         "the kind switch must not poke the composer's attach button directly"
     )
     stage = slice_braced_block(app, app.index("function _homeStageFile("))
-    assert stage and 'if (_launcherKind === "scheduled") {' in stage, (
-        "_homeStageFile must refuse attachments in the Scheduled kind"
+    assert stage and '_launcherKind === "scheduled" || _launcherKind === "voice"' in stage, (
+        "_homeStageFile must refuse attachments in the Scheduled and Voice kinds"
     )
     # A large paste is synthesized into a File by the composer; refusing it
     # keeps the text inline, which is right for a schedule's task — so that

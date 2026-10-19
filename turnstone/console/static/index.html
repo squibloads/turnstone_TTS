@@ -108,11 +108,16 @@
           style="display: none"
           aria-label="Start a new session"
         >
-          <!-- Kind toggle — start a coordinator (console-local), an
-           interactive session (proxied to a node), or a scheduled task (an
-           interactive session the scheduler starts later, on a timer).
-           app.js gates each option by scope and hides the toggle when only
-           one is available. -->
+          <!-- Kind toggle — start a coordinator (console-local), a voice
+           coordinator (the `voice` persona, created through the ordinary
+           coordinator path), an interactive session (proxied to a node), or
+           a scheduled task (an interactive session the scheduler starts
+           later, on a timer).  Voice is a persona, not a fourth workstream
+           kind, but it earns a tab: starting a spoken session should not
+           require opening Options to pick a persona first.  app.js gates each
+           option by scope (the Voice tab also by persona availability and
+           audio.voice_mode_enabled) and hides the toggle when only one is
+           available. -->
           <div
             id="launcher-kinds"
             class="launcher-kinds"
@@ -129,6 +134,17 @@
             >
               <span class="kind-led" aria-hidden="true"></span>
               Coordinator
+            </button>
+            <button
+              type="button"
+              id="kind-voice"
+              class="kind-btn kind-btn--coord"
+              role="radio"
+              aria-checked="false"
+              tabindex="-1"
+            >
+              <span class="kind-led" aria-hidden="true"></span>
+              Voice
             </button>
             <button
               type="button"
@@ -154,22 +170,6 @@
               Scheduled
             </button>
           </div>
-          <!-- One-click voice session: a coordinator created with the voice
-           persona and opened like any other create.  Not a fourth kind —
-           persona, not kind, is what makes the pane a voice session — so it
-           sits outside the kind radiogroup and never submits the composer's
-           task text.  app.js reveals it only when the voice persona is on
-           this user's coordinator shelf and audio.voice_mode_enabled is not
-           off; the `align-self` keeps it a compact action. -->
-          <button
-            type="button"
-            id="start-voice-session"
-            class="sh-btn"
-            style="display: none; align-self: flex-start"
-            title="Hands-free coordinator: the mic listens, the reply is read aloud, then the mic listens again"
-          >
-            <span aria-hidden="true">&#127908;</span> Start voice session
-          </button>
           <!-- Composer DOM is built by shared_static/composer.js into this
            mount — stacked layout (textarea above, options toggle +
            Start button below) with Name + Skill in an Options
