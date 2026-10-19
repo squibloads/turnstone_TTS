@@ -8,9 +8,12 @@ the reduced-motion meter are part of the same contract.
 
 The shipped module runs in node against a fake canvas, a fake analyser and a
 fake AudioContext, so the tests assert what the code asks the browser for, not
-what a browser happens to draw.  Audible playback is pinned separately: the
-captureStream path must not reroute the element, and the fallback must keep
-it audible.
+what a browser happens to draw.  The fakes model the parts of the browser the
+strip got wrong: captureStream() on a fresh element yields no audio track,
+getComputedStyle() resolves the colour tokens, and an AudioContext starts
+suspended.  Audible playback is pinned with those: an attached element must
+reach the destination, and an element must not be rerouted while the context
+cannot run.
 """
 
 from __future__ import annotations
@@ -32,9 +35,27 @@ _MODULE = (
 # Fakes for the browser surface the strip touches.  `log` records what the
 # module asked for, so each test can assert on requests rather than pixels.
 _FAKES = r"""
-const log = { frames: [], cancelled: [], contexts: 0, analysers: 0, analyserList: [], connects: [], sourcesMade: 0, liveBranches: 0, gets: 0 };
+const log = { frames: [], cancelled: [], contexts: 0, analysers: 0, analyserList: [], connects: [], sourcesMade: 0, streamSourcesMade: 0, liveBranches: 0, gets: 0, invalidFills: [], transforms: [], observers: [], stateChanges: 0 };
 const dest = { kind: "destination" };
 let fps = [];
+// The browser surface the tests vary: the device pixel ratio the canvas must
+// honour, the CSS box the stylesheet gives it, and the tokens the theme
+// resolves to.  The canvas reads these per frame, so they stay getters.
+let dprValue = 1;
+let canvasCss = { w: 240, h: 48 };
+const themeColours = {
+  dark: { "--accent": "#e5a042", "--fg-dim": "#8a93ad" },
+  light: { "--accent": "#745415", "--fg-dim": "#576275" },
+};
+let themeName = "dark";
+let elementSourceThrows = false;
+Object.defineProperty(globalThis, "devicePixelRatio", { get: () => dprValue, configurable: true });
+// getComputedStyle resolves a custom property to its computed value, exactly
+// as the browser does.  A canvas that is handed the raw "var(--x)" instead
+// paints black, which is the failure this fake exists to catch.
+globalThis.getComputedStyle = () => ({
+  getPropertyValue: (name) => (themeColours[themeName] || {})[name] || "",
+});
 globalThis.requestAnimationFrame = (fn) => { log.frames.push(fn); return log.frames.length; };
 globalThis.cancelAnimationFrame = (id) => { log.cancelled.push(id); };
 globalThis.matchMedia = (q) => ({ matches: fps.includes(q) || fps.includes("*"), media: q });
@@ -51,10 +72,21 @@ class FakeAnalyser {
   getByteFrequencyData(out) { log.gets++; out.set(this.bins.subarray(0, out.length)); }
 }
 class FakeContext {
-  constructor() { log.contexts++; this.sampleRate = 48000; this.state = "suspended"; this.destination = dest; }
+  constructor() { log.contexts++; this.sampleRate = 48000; this.state = "suspended"; this.destination = dest; this.listeners = {}; }
   createAnalyser() { return new FakeAnalyser(); }
-  createMediaStreamSource(s) { const n = { kind: "stream-source", stream: s, connect(t) { log.connects.push(["stream-source", t === dest ? "destination" : "other"]); }, disconnect() {} }; return n; }
+  createMediaStreamSource(s) {
+    // Chromium refuses a stream with no audio tracks.  That is exactly what a
+    // captureStream() taken from a fresh Audio element hands back, so the fake
+    // must refuse it too or the suite cannot see the real failure.
+    if (typeof s.getAudioTracks === "function" && s.getAudioTracks().length === 0) {
+      throw new Error("Failed to execute 'createMediaStreamSource' on 'AudioContext': MediaStream has no audio track.");
+    }
+    log.streamSourcesMade++;
+    const n = { kind: "stream-source", stream: s, connect(t) { log.connects.push(["stream-source", t === dest ? "destination" : "other"]); }, disconnect() {} };
+    return n;
+  }
   createMediaElementSource(el) {
+    if (elementSourceThrows) throw new Error("InvalidStateError: the element already has a media-element source");
     log.sourcesMade++;
     const n = {
       kind: "element-source", el, branches: new Set(),
@@ -69,25 +101,47 @@ class FakeContext {
     };
     return n;
   }
-  resume() { this.state = "running"; return Promise.resolve(); }
+  addEventListener(name, fn) { (this.listeners[name] ||= []).push(fn); }
+  removeEventListener(name, fn) { this.listeners[name] = (this.listeners[name] || []).filter((x) => x !== fn); }
+  resume() {
+    this.state = "running";
+    log.stateChanges++;
+    for (const fn of [...(this.listeners.statechange || [])]) fn({ type: "statechange" });
+    return Promise.resolve();
+  }
   close() { this.state = "closed"; return Promise.resolve(); }
 }
 globalThis.AudioContext = FakeContext;
 globalThis.webkitAudioContext = undefined;
-// A canvas with the 2D surface the strip draws on.  Each draw is counted.
+// A canvas with the 2D surface the strip draws on.  The fill setter validates
+// like a real canvas: an unresolved custom property or an empty string is
+// ignored and the previous fill survives.  `setTransform` is recorded so the
+// drawing units can be checked against the CSS box and the backing store.
 const draws = { rects: 0, fills: [], clears: 0, rectsGeom: [] };
-function fakeCanvas() {
+function canvasSurface() {
+  let fill = "#000000";
   const ctx = {
-    fillStyle: "", clearRect() { draws.clears++; }, fillRect(x, y, w, h) { draws.rects++; draws.fills.push(ctx.fillStyle); draws.rectsGeom.push({ x, y, w, h, fill: ctx.fillStyle }); },
+    get fillStyle() { return fill; },
+    set fillStyle(value) {
+      if (typeof value !== "string" || value === "" || /^var\(/.test(value)) { log.invalidFills.push(String(value)); return; }
+      fill = value;
+    },
+    clearRect() { draws.clears++; },
+    fillRect(x, y, w, h) { draws.rects++; draws.fills.push(fill); draws.rectsGeom.push({ x, y, w, h, fill }); },
     beginPath() {}, moveTo() {}, lineTo() {}, fill() {}, stroke() {}, arc() {}, rect() {}, fillText() {},
-    save() {}, restore() {}, scale() {}, setTransform() {},
+    save() {}, restore() {}, scale() {}, setTransform(a, b, c, d, e, f) { log.transforms.push([a, b, c, d, e, f]); },
   };
-  return { width: 0, height: 0, clientWidth: 240, clientHeight: 48, getContext: () => ctx, style: {} };
+  let width = 300, height = 150;
+  return {
+    get width() { return width; }, set width(v) { width = v; },
+    get height() { return height; }, set height(v) { height = v; },
+    getContext: () => ctx,
+  };
 }
 // Minimal host: a `div` with children and a classList, enough for the strip to
 // mount, query and remove itself.  Visibility is a document-level flag.
 class FakeEl {
-  constructor(tag) { this.tagName = String(tag).toUpperCase(); this.children = []; this.parentNode = null; this.className = ""; this.attrs = {}; this.style = {}; this.textContent = ""; this.hidden = false; this.listeners = {}; this.isConnected = false; }
+  constructor(tag) { this.tagName = String(tag).toUpperCase(); this.children = []; this.parentNode = null; this.className = ""; this.attrs = {}; this.dataset = {}; this.style = {}; this.textContent = ""; this.hidden = false; this.listeners = {}; this.isConnected = false; }
   get classList() { const self = this; return { add: (...c) => { const s = new Set(self.className.split(/\s+/).filter(Boolean)); c.forEach((x) => s.add(x)); self.className = [...s].join(" "); }, remove: (...c) => { self.className = self.className.split(/\s+/).filter((x) => x && !c.includes(x)).join(" "); }, contains: (c) => self.className.split(/\s+/).includes(c), toggle: (c, on) => { on ? this.add(c) : this.remove(c); } }; }
   add(c) { this.classList.add(c); }
   appendChild(c) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.children.push(c); c._attach(this.isConnected); return c; }
@@ -105,7 +159,18 @@ const docListeners = {};
 globalThis.document = {
   visibilityState: "visible",
   hidden: false,
-  createElement: (t) => { const e = new FakeEl(t); if (t === "canvas") Object.assign(e, fakeCanvas()); return e; },
+  createElement: (t) => {
+    const e = new FakeEl(t);
+    if (t === "canvas") {
+      const c = canvasSurface();
+      e.width = c.width;
+      e.height = c.height;
+      e.getContext = c.getContext;
+      Object.defineProperty(e, "clientWidth", { get: () => canvasCss.w });
+      Object.defineProperty(e, "clientHeight", { get: () => canvasCss.h });
+    }
+    return e;
+  },
   addEventListener: (n, f) => { (docListeners[n] ||= []).push(f); },
   removeEventListener: (n, f) => { docListeners[n] = (docListeners[n] || []).filter((x) => x !== f); },
   body: new FakeEl("body"),
@@ -114,6 +179,21 @@ globalThis.document = {
 document.body.isConnected = true;
 document.documentElement.isConnected = true;
 function fireDoc(name) { for (const f of [...(docListeners[name] || [])]) f({ type: name }); }
+// A theme change is an attribute mutation on the document root (that is what
+// theme.js toggles).  The fake delivers it the way the browser would, so the
+// strip's refresh path is exercised rather than assumed.
+class FakeMutationObserver {
+  constructor(cb) { this.cb = cb; this.active = false; log.observers.push(this); }
+  observe(target, opts) { this.active = true; this.target = target; this.opts = opts; }
+  disconnect() { this.active = false; }
+  takeRecords() { return []; }
+}
+globalThis.MutationObserver = FakeMutationObserver;
+function setTheme(name) {
+  themeName = name;
+  document.documentElement.dataset.theme = name === "dark" ? "" : name;
+  for (const o of log.observers) if (o.active) o.cb([{ type: "attributes" }], o);
+}
 const tick = async () => { for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r)); };
 """
 
@@ -289,38 +369,55 @@ const silent = strip.colourFor();
 console.log(JSON.stringify({ userColour, aiColour, silent }));
 """
     )
-    assert out["aiColour"] == "var(--accent)"
-    assert out["userColour"] == "var(--fg-dim)"
+    # Tokens resolved to the values the canvas can actually paint.  A raw
+    # "var(--accent)" is not a colour a canvas accepts and renders black.
+    assert out["aiColour"] == "#e5a042"
+    assert out["userColour"] == "#8a93ad"
     # Silence settles to a flat muted line, drawn with the muted token.
-    assert out["silent"] == "var(--fg-dim)"
+    assert out["silent"] == "#8a93ad"
 
 
-def test_the_captured_stream_path_does_not_reroute_playback() -> None:
-    # captureStream gives the analyser its own copy of the element's output;
-    # the element keeps playing to the speakers with no node in between.
+def test_a_reply_is_read_through_its_element_not_an_empty_capture_stream() -> None:
+    # Chromium's captureStream() on a fresh Audio element returns a stream with
+    # no audio tracks until a src has loaded, and createMediaStreamSource throws
+    # on it.  The player reports the element before its first clip exists, so
+    # that path can never work: the element itself must be routed through a
+    # media-element source, which reads every clip the element plays.
     out = _run(
         """
 const host = document.createElement("div");
 const strip = createSpectrumStrip({ host });
 strip.show();
-const el = { captureStream: () => ({ id: "cap" }), src: "", paused: false };
+await strip.resumeFromGesture();
+const el = {
+  src: "", paused: false, play() {},
+  captureStream: () => ({ getAudioTracks: () => [] }),
+};
 strip.attachAudio(el, "ai");
-console.log(JSON.stringify({ connects: log.connects, sourcesMade: log.connects.filter((c) => c[0] === "element-source").length }));
+console.log(JSON.stringify({
+  sourcesMade: log.sourcesMade,
+  streamSources: log.streamSourcesMade,
+  toDestination: log.connects.filter((c) => c[0] === "element-source" && c[1] === "destination").length,
+  speaker: strip.colourFor(),
+}));
 """
     )
-    assert out["sourcesMade"] == 0
-    assert all(dest != "destination" or name != "element-source" for name, dest in out["connects"])
+    assert out["sourcesMade"] == 1
+    assert out["streamSources"] == 0
+    assert out["toDestination"] == 1
+    assert out["speaker"] == "#e5a042"
 
 
-def test_the_fallback_routes_the_element_to_the_speakers_exactly_once() -> None:
-    # No captureStream: the element has to go through a media-element source
-    # to be read.  That source must reach the destination or playback goes
-    # silent, and it must be made once per element, never per clip.
+def test_the_element_source_reaches_the_speakers_exactly_once() -> None:
+    # The element is routed through the audio graph to be read, so that route
+    # must reach the destination or playback goes silent.  It must be made once
+    # per element, never per clip.
     out = _run(
         """
 const host = document.createElement("div");
 const strip = createSpectrumStrip({ host });
 strip.show();
+await strip.resumeFromGesture();
 const el = { src: "", paused: false, play() {} };
 strip.attachAudio(el, "ai");
 strip.attachAudio(el, "ai");     // a second clip on the same element
@@ -343,12 +440,77 @@ def test_re_attaching_a_clip_leaves_no_stale_analyser_branch_on_the_element() ->
 const host = document.createElement("div");
 const strip = createSpectrumStrip({ host });
 strip.show();
+await strip.resumeFromGesture();
 const el = { src: "", paused: false, play() {} };
 for (let i = 0; i < 5; i++) strip.attachAudio(el, "ai");
 console.log(JSON.stringify({ live: log.liveBranches }));
 """
     )
     assert out["live"] == 1
+
+
+def test_a_reply_keeps_its_native_path_while_the_audio_context_cannot_run() -> None:
+    # Routing an element into a suspended AudioContext would send its audio to
+    # a graph that never reaches the speakers, muting the reply.  Until the
+    # coordinator's gesture resumes the context, the element must be left on
+    # its native path; it is tapped once the context starts.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+const el = { src: "", paused: false, play() {} };
+strip.attachAudio(el, "ai");
+const suspended = {
+  sources: log.sourcesMade,
+  connects: log.connects.length,
+  speaker: strip.colourFor(),
+  active: strip.isActive(),
+};
+await strip.resumeFromGesture();       // the Voice click
+const running = {
+  sources: log.sourcesMade,
+  toDestination: log.connects.filter((c) => c[0] === "element-source" && c[1] === "destination").length,
+  active: strip.isActive(),
+};
+console.log(JSON.stringify({ suspended, running }));
+"""
+    )
+    assert out["suspended"] == {
+        "sources": 0,
+        "connects": 0,
+        "speaker": "#e5a042",
+        "active": False,
+    }
+    assert out["running"]["sources"] == 1
+    assert out["running"]["toDestination"] == 1
+    assert out["running"]["active"] is True
+
+
+def test_a_broken_audio_graph_never_breaks_the_reply_or_loses_the_speaker() -> None:
+    # The strip is a visual.  If the browser refuses the element source (for
+    # example the element is already owned by another context), the attach must
+    # not throw into the player, and the answer must still be painted in the
+    # AI's colour rather than the mic's grey.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+await strip.resumeFromGesture();
+elementSourceThrows = true;
+let threw = false;
+try {
+  strip.attachAudio({ src: "", paused: false, play() {} }, "ai");
+} catch (e) {
+  threw = true;
+}
+console.log(JSON.stringify({ threw, speaker: strip.colourFor(), active: strip.isActive() }));
+"""
+    )
+    assert out["threw"] is False
+    assert out["speaker"] == "#e5a042"
+    assert out["active"] is False
 
 
 def test_the_audio_context_is_resumed_only_from_a_gesture() -> None:
@@ -384,12 +546,147 @@ strip.setSpeaker("ai");
 // Run the frame the strip already queued on attach: that is the live frame.
 const pending = log.frames.slice();
 for (const f of pending) f();
-console.log(JSON.stringify({ rects: draws.rects, fills: [...new Set(draws.fills)] }));
+console.log(JSON.stringify({ rects: draws.rects, fills: [...new Set(draws.fills)], invalidFills: log.invalidFills }));
 """
     )
-    # 32 bars, each with a falling peak marker: 64 rects per frame.
+    # 32 bars, each with a falling peak marker: 64 rects per frame, all in the
+    # accent resolved to a value the canvas can paint.
     assert out["rects"] == 64
-    assert out["fills"] == ["var(--accent)"]
+    assert out["fills"] == ["#e5a042"]
+    assert out["invalidFills"] == []
+
+
+def test_stop_releases_the_theme_observer() -> None:
+    # The observer watches the document root, so it must not outlive the strip
+    # any more than the visibility listener does.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+const watching = log.observers.filter((o) => o.active).length;
+strip.stop();
+console.log(JSON.stringify({ watching, after: log.observers.filter((o) => o.active).length }));
+"""
+    )
+    assert out["watching"] == 1
+    assert out["after"] == 0
+
+
+def test_a_theme_change_repaints_with_the_newly_resolved_tokens() -> None:
+    # The tokens are resolved once per theme, not once per page: switching to
+    # light must repaint the strip in the light accents.  The observer is what
+    # theme.js's data-theme toggle reaches.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+strip.setSpeaker("ai");
+draws.fills = [];
+for (const f of log.frames.slice()) f();
+const dark = [...new Set(draws.fills)];
+setTheme("light");
+const light = [...new Set(draws.fills.slice(-64))];
+console.log(JSON.stringify({ dark, light, invalidFills: log.invalidFills }));
+"""
+    )
+    assert out["dark"] == ["#e5a042"]
+    assert out["light"] == ["#745415"]
+    assert out["invalidFills"] == []
+
+
+def test_the_canvas_backing_store_matches_the_css_box_times_the_pixel_ratio() -> None:
+    # A canvas starts at 300x150 backing pixels.  Drawing a 48px-tall box in
+    # that space squeezes the bars into the top third of the strip and leaves
+    # dead space below, so the backing store must follow the CSS box and the
+    # device pixel ratio, and the drawing transform must map CSS pixels to it.
+    out = _run(
+        """
+dprValue = 2;
+canvasCss = { w: 320, h: 48 };
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+for (const f of log.frames.slice()) f();
+const canvas = strip.el.children[0];
+console.log(JSON.stringify({
+  width: canvas.width,
+  height: canvas.height,
+  transform: log.transforms[log.transforms.length - 1],
+}));
+"""
+    )
+    assert out["width"] == 640
+    assert out["height"] == 96
+    assert out["transform"] == [2, 0, 0, 2, 0, 0]
+
+
+def test_the_bars_rise_from_the_bottom_edge_and_fill_the_strip() -> None:
+    # The approved strip has a bottom baseline: a loud band reaches the top and
+    # every bar's base sits on the floor, with no vertical offset from the
+    # canvas' default 300x150 drawing space.
+    out = _run(
+        """
+canvasCss = { w: 240, h: 48 };
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+const analyser = log.analyserList[log.analyserList.length - 1];
+analyser.bins = new Uint8Array(4096).fill(255);
+draws.rectsGeom = [];
+for (const f of log.frames.slice()) f();
+const bars = draws.rectsGeom.filter((r) => r.h > 2);
+console.log(JSON.stringify({
+  bottoms: [...new Set(bars.map((r) => r.y + r.h))],
+  tallest: Math.max(...bars.map((r) => r.h)),
+  left: Math.min(...bars.map((r) => r.x)),
+  right: Math.max(...bars.map((r) => r.x + r.w)),
+}));
+"""
+    )
+    assert out["bottoms"] == [48]
+    assert out["tallest"] == 48
+    assert out["left"] == 0
+    assert out["right"] < 240
+
+
+def test_the_peak_marker_never_dips_to_the_floor_for_one_frame() -> None:
+    # The marker falls by a fixed step.  Once that step crosses zero while the
+    # bar still stands, an unclamped peak is re-seeded from the bar on the next
+    # frame: the marker drops to the floor for exactly one frame and pops back,
+    # every other frame.  Measured at ten times the strip height because at 48px
+    # the dip is sub-pixel; the algorithm's geometry is scale-independent.
+    out = _run(
+        """
+canvasCss = { w: 240, h: 480 };
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+const analyser = log.analyserList[log.analyserList.length - 1];
+analyser.bins = new Uint8Array(4096).fill(255);
+for (const f of log.frames.slice()) f();      // a loud frame seeds the peak
+analyser.bins = new Uint8Array(4096).fill(5); // a quiet band keeps the bar up
+let below = 0, floorDips = 0;
+for (let i = 0; i < 80; i++) {
+  draws.rectsGeom = [];
+  log.frames[log.frames.length - 1]();
+  const column = draws.rectsGeom.filter((r) => r.x === 0);
+  const bar = column.filter((r) => r.h > 2)[0];
+  const marker = column.filter((r) => r.h === 2)[0];
+  if (!bar || !marker) continue;
+  if (marker.y > bar.y) below++;
+  if (marker.y === 476 && bar.y < 470) floorDips++;
+}
+console.log(JSON.stringify({ below, floorDips }));
+"""
+    )
+    assert out["below"] == 0
+    assert out["floorDips"] == 0
 
 
 def test_a_peak_marker_holds_the_recent_maximum_and_falls_slower_than_the_bar() -> None:
@@ -532,7 +829,7 @@ console.log(JSON.stringify({ rects: draws.rects, fills: [...new Set(draws.fills)
     )
     # Silence still paints every bar and its marker: 64 rects, all muted.
     assert out["rects"] == 64
-    assert out["fills"] == ["var(--fg-dim)"]
+    assert out["fills"] == ["#8a93ad"]
 
 
 def test_reduced_motion_draws_a_single_level_meter_not_the_bars() -> None:
