@@ -984,13 +984,16 @@ has arrived. It holds the trailing partial sentence back — a delta that stops
 in the middle of a word, or on a full stop that might still become "3.14" or
 "Dr." — and hands each completed sentence to the speech backend immediately.
 At the end of the turn the remainder is flushed, so a reply that trails off is
-still spoken in full. A cancel, a stop, or a new reply drops every clip that
-was queued but not yet played.
+still spoken in full. A cancel or a stop drops every clip that was queued but
+not yet played; a new reply arriving in voice mode queues instead (see
+[Queued replies](#queued-replies)).
 
 Streaming and finished-reply playback share the same voice, style, playback
 rate and pacing profile, and the same one-request-at-a-time rule: the next
 sentence is synthesized while the current one plays. Only one reading plays at
-a time on a page, so starting a new reply stops anything still speaking. The
+a time on a page. Outside voice mode, starting a new streamed reply stops
+anything still speaking; in voice mode the new reply waits its turn, and a
+speaker-button press — not a later reply — is what stops the one playing. The
 speaker button on finished replies is unchanged; it reads the whole reply again
 from the beginning.
 
@@ -1003,6 +1006,20 @@ browser with the rest of the read-aloud configuration, so a saved change
 applies after a page reload. The browser may refuse to start audio that no
 click preceded — a page that has had no interaction yet — in which case the
 speaker on the finished reply still works.
+
+### Queued replies
+
+In a voice session, a reply that arrives while another is being read aloud
+waits its turn instead of cutting in. Replies are spoken in arrival order, and
+each keeps accumulating its text while it waits, so a burst of worker reports
+is heard in full. Up to three replies wait; a fourth arrival drops the oldest
+waiting one, so the queue stays current instead of becoming a backlog.
+
+A speaker-button press is you taking over, so it still supersedes: the reply
+being spoken stops, every waiting reply is dropped, and the chosen reply
+speaks immediately. Leaving voice mode or closing the pane stops playback
+through the same path. Text panes that read every message aloud keep the old
+behaviour, where a new message stops the one playing.
 
 ## Voice mode
 
