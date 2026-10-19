@@ -206,6 +206,9 @@ function coordSend() {
   setBusy(true, "optimistic");
   return false;
 }
+// The spectrum strip has its own suite (test_voice_viz_wiring_js); here it is a
+// no-op so the sliced voice-mode functions that show and hide it resolve.
+const voiceViz = { show() {}, hide() {}, detach() {}, attachStream() {}, attachAudio() {}, setSpeaker() {}, resumeFromGesture() { return Promise.resolve(); } };
 const ttsPlayer = {
   stream() { const r = makeRun(); ttsLog.streams.push(r); return r; },
   play(el, btn) { const r = makeRun(); r.el = el; r.btn = btn; ttsLog.plays.push(r); return r; },

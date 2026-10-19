@@ -69,6 +69,7 @@ import {
   getVoiceRoles,
 } from "/shared/tts_player.js";
 import { createMicController } from "/shared/stt_mic.js";
+import { createSpectrumStrip } from "/shared/voice_viz.js";
 import { createVoiceLoop } from "./voice_loop.js";
 import {
   acceptUserTurnEvent,
@@ -599,6 +600,12 @@ function createCoordinatorPane(root, wsId, opts) {
     onState: (state) => {
       if (voiceLoop) voiceLoop.onMicState(state);
     },
+    // The strip analyses the live mic as the user's voice.  A null release is
+    // the mic closing, which leaves the strip with no source to draw.
+    onStream: (s) => {
+      if (s) voiceViz.attachStream(s, "user");
+      else voiceViz.detach("user");
+    },
     onToggle: () => _voiceMicToggle(),
   });
   // The Voice button joins the mic in the composer action row; the status
@@ -620,6 +627,13 @@ function createCoordinatorPane(root, wsId, opts) {
   const statusEl = root.querySelector("#coord-status");
   const sseEl = root.querySelector("#coord-sse-status");
   const nameEl = root.querySelector("#coord-name");
+  // The live spectrum strip for voice mode.  It mounts in the right panel just
+  // above the CHILDREN section and exists only while voice mode is on, so a
+  // text session never shows it.
+  const voiceViz = createSpectrumStrip({
+    host: root.querySelector("#coord-sidebar"),
+    before: root.querySelector("#coord-children-wrap"),
+  });
   const childrenTreeEl = root.querySelector("#coord-children-tree");
   const childrenCountEl = root.querySelector("#coord-children-count");
   const childrenPendingEl = root.querySelector("#coord-children-pending");
@@ -6680,6 +6694,13 @@ function createCoordinatorPane(root, wsId, opts) {
   // /v1/api/models reports a tts role (see init).
   let voiceRoles = { stt: false, tts: false };
   const ttsPlayer = createTtsPlayer({ base: "" });
+  // The strip reads the element of the reply that is speaking, so it hears each
+  // run's element as the player makes it.  Attached after construction to leave
+  // the player's constructor call untouched.
+  ttsPlayer.setAudioListener((a) => {
+    if (a) voiceViz.attachAudio(a, "ai");
+    else voiceViz.detach("ai");
+  });
   // The live streaming-read-aloud run for the reply being written, if any
   // (created on the first content delta and flushed at stream_end).  Only
   // Voice mode starts one: a streaming run auto-plays, and a text pane that
@@ -7007,6 +7028,11 @@ function createCoordinatorPane(root, wsId, opts) {
     if (!voiceLoop) _voiceCreateLoop();
     voiceLoop.enable();
     _voicePaintMute();
+    // Shown here, after the mode is live, so a strip never appears for a mode
+    // that did not start.  The resume is a best-effort: a refused resume only
+    // leaves the strip flat, never the mode broken.
+    voiceViz.show();
+    voiceViz.resumeFromGesture().catch(() => {});
   }
 
   function _voiceTurnOff() {
@@ -7020,6 +7046,9 @@ function createCoordinatorPane(root, wsId, opts) {
     // Drop any stream run the mode owned; with the mode off nothing should
     // keep auto-playing into the pane.
     _cancelTtsStream();
+    // The strip leaves with the mode: hidden after the stream is cancelled, so
+    // no reply is still feeding a strip that has gone.
+    voiceViz.hide();
     _voiceSetStatus("off");
     _voicePaintMute();
   }
@@ -7769,6 +7798,9 @@ function createCoordinatorPane(root, wsId, opts) {
     if (voiceStatusEl.parentNode)
       voiceStatusEl.parentNode.removeChild(voiceStatusEl);
     mic.destroy(); // release the microphone and abort a transcription in flight
+    // destroy() clears voiceModeOn directly, so the strip is hidden here rather
+    // than by _voiceTurnOff.  Its document listener must not outlive the pane.
+    voiceViz.hide();
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
     // truncated resync).
     closeStreamTransport();

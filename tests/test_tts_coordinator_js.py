@@ -261,6 +261,9 @@ const scrollFollow = { destroy() {} };
 let voiceModeOn = false;
 let voiceLoop = null;
 const voiceBtn = new El("button"), voiceStatusEl = new El("div");
+// The spectrum strip has its own suite (test_voice_viz_wiring_js); here it is a
+// no-op so the sliced pane functions that reach it resolve.
+const voiceViz = { show() {}, hide() {}, detach() {}, attachStream() {}, attachAudio() {}, setSpeaker() {}, resumeFromGesture() { return Promise.resolve(); } };
 """
 
 
