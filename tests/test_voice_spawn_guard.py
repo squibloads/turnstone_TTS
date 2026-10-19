@@ -202,7 +202,9 @@ def test_voice_second_spawn_in_same_turn_is_denied(monkeypatch):
     assert coord.spawn.call_count == 1
 
 
-def test_voice_unbacked_flag_keeps_the_confirmation_denial(monkeypatch):
+def test_voice_unbacked_flag_keeps_the_confirmation_denial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The flag was set, but the user's words did not name the count, so the
     refusal still asks for that confirmation."""
     sess, coord, _ui = _make_session(monkeypatch, voice=True)
@@ -588,7 +590,7 @@ def test_voice_four_agent_batch_without_the_flag_is_refused(monkeypatch):
     assert coord.spawn.call_count == 0
 
 
-def test_voice_spawn_four_agents_batch_is_allowed(monkeypatch):
+def test_voice_spawn_four_agents_batch_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     # "spawn four agents" is the count directly governing the cue; the batch
     # of four the model asks for is exactly what the user requested.
     sess, coord, _ui = _make_session(monkeypatch, voice=True)
@@ -602,7 +604,9 @@ def test_voice_spawn_four_agents_batch_is_allowed(monkeypatch):
     assert coord.spawn.call_count == 4
 
 
-def test_voice_one_agent_request_caps_every_spawn_in_the_turn(monkeypatch):
+def test_voice_one_agent_request_caps_every_spawn_in_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # "one agent is enough" licenses one agent for the whole turn.  The flag
     # repeated on later spawn_workstream calls must not reopen the ceiling.
     sess, coord, _ui = _make_session(monkeypatch, voice=True)
@@ -627,7 +631,7 @@ def test_voice_one_agent_request_caps_every_spawn_in_the_turn(monkeypatch):
     assert coord.spawn.call_count == 1
 
 
-def test_voice_four_kids_each_is_not_a_request(monkeypatch):
+def test_voice_four_kids_each_is_not_a_request(monkeypatch: pytest.MonkeyPatch) -> None:
     # "each" alone no longer ties the number to agents: the four children are
     # the subject of the sentence, not the fan-out the user asked for.
     sess, coord, _ui = _make_session(monkeypatch, voice=True)
@@ -640,7 +644,9 @@ def test_voice_four_kids_each_is_not_a_request(monkeypatch):
     assert coord.spawn.call_count == 0
 
 
-def test_voice_three_agents_with_a_five_minute_budget_is_three(monkeypatch):
+def test_voice_three_agents_with_a_five_minute_budget_is_three(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # The five minutes belong to the budget, not to the agent count: three is
     # the request, and the turn's budget is that count, not the ceiling.
     sess, coord, _ui = _make_session(monkeypatch, voice=True)
@@ -737,7 +743,9 @@ def test_voice_cap_zero_still_refuses_everything(monkeypatch):
     assert coord.spawn.call_count == 0
 
 
-def test_voice_non_numeric_requested_ceiling_falls_back_to_the_default(monkeypatch):
+def test_voice_non_numeric_requested_ceiling_falls_back_to_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # A corrupted row must neither crash the read nor widen the budget past
     # the registry default: "lots" behaves exactly like an unset key.
     default = int(SETTINGS["coordinator.voice_max_requested_agents"].default)
