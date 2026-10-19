@@ -262,6 +262,7 @@ class TestConsoleSpec:
             "/v1/api/workstreams/{ws_id}",
             "/v1/api/workstreams/{ws_id}/open",
             "/v1/api/workstreams/{ws_id}/send",
+            "/v1/api/workstreams/{ws_id}/command",
             "/v1/api/workstreams/{ws_id}/approve",
             "/v1/api/workstreams/{ws_id}/cancel",
             "/v1/api/workstreams/{ws_id}/rewind",

@@ -187,6 +187,24 @@ the in-progress turn).  On the SSE stream you'll see `state_change`
 events, finishing with `state_change → idle` or an
 `approve_request` when the model invokes a gated tool.
 
+A `message` that begins with `/` is a slash command, not chat.  The
+send route dispatches it through the same registry as an interactive
+session (nothing reaches the model), and the pane normally posts it to
+the path-keyed route instead:
+
+```http
+POST /v1/api/workstreams/{ws_id}/command
+Content-Type: application/json
+
+{"command": "/model deepseek-flash-high"}
+```
+
+The response is `{"status": "ok"}` / `{"status": "running"}` / a loud
+`{"status": "busy"}` (409).  Command results arrive as `info` / `error`
+SSE events; `/model <alias>` switches and persists the session model.
+See `POST /v1/api/workstreams/{ws_id}/command` in the API reference for
+the refusal set (`/rewind`, `/retry`, the local-CLI lifecycle helpers).
+
 ---
 
 ## 4. Inspect direct children

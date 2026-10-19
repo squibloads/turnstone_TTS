@@ -1746,6 +1746,20 @@ class CoordinatorSendRequest(BaseModel):
     )
 
 
+class CoordinatorCommandRequest(BaseModel):
+    """Body for POST /v1/api/workstreams/{ws_id}/command (coordinator)."""
+
+    command: str = Field(
+        description=(
+            "Workstream-local slash command (for example /model, /clear or "
+            "/instructions), including its arguments. It must begin with '/'. "
+            "Lifecycle commands such as /new and /resume are local-CLI-only; "
+            "the coordinator pane's /rewind and /retry use their path-keyed "
+            "endpoints."
+        )
+    )
+
+
 class CoordinatorSendResponse(BaseModel):
     """Response shape for POST /v1/api/workstreams/{ws_id}/send (coord)."""
 
