@@ -1149,12 +1149,18 @@ scale, so a low voice and a high one both move across the strip.
 
 The microphone is read through a branch that never reaches the speakers, so
 nothing is echoed back and the browser does not ask for the microphone a second
-time. A reply is read through a copy of its own audio where the browser allows
-that, which leaves playback untouched; where it does not, the reply passes
-through the page and still plays. The strip only does work while something is
-speaking and the tab is visible, and it is removed when voice mode ends. With
-reduced motion turned on in your system settings, the bars give way to a single
-level meter.
+time. A reply is read through its own audio element: the element is routed
+through the page's audio graph, which reaches the speakers, so the strip reads
+exactly what you hear. The tap is made once per element, not once per sentence,
+so a segmented reply is read continuously across its clips. If the browser has
+not let the page start audio yet, the element keeps its native playback path
+until it has, so a reply is never muted to draw a strip.
+
+The bar colour is read from the console's own tokens rather than hard-coded,
+and a theme switch repaints the strip in the new theme. The strip only does
+work while something is speaking and the tab is visible, and it is removed when
+voice mode ends. With reduced motion turned on in your system settings, the
+bars give way to a single level meter.
 
 ### The setting
 
