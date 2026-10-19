@@ -1033,6 +1033,15 @@ async function _requestStyle(base) {
 // every way of ending a run goes through.
 const _activeTtsRuns = new Set();
 
+// Voice mode can hand the player another reply before the one it is speaking
+// has finished.  A short backlog keeps a burst of replies audible without
+// turning the player into an endless reading queue: past three waiting runs
+// the OLDEST is dropped, so the user hears the latest replies rather than a
+// stale backlog.  It is deliberately not a setting — the useful range is
+// small, and an operator cannot predict a session's reply burst better than
+// the player can.
+const MAX_QUEUED_VOICE_RUNS = 3;
+
 // One pane's read-aloud player.  Options:
 //   base            transport prefix ("" or "/node/{id}"), or a function
 //                   returning it when the pane's base can change after
@@ -1040,8 +1049,9 @@ const _activeTtsRuns = new Set();
 //   announce        live-region announcer; defaults to a module-owned region.
 //   authGeneration  returns a token that changes on logout or account switch;
 //                   defaults to auth.js's.  A run holding an older token stops.
-// Returns { play(el, btn), stream(), stop(), isPlaying(), activeButton(),
-// audio() }.
+// Returns { play(el, btn), stream(opts), stop(), isPlaying(), activeButton(),
+// audio(), idle() }.  `stream({voice: true})` runs queue behind the voice run
+// already playing; `idle()` resolves when the last of them has finished.
 export function createTtsPlayer(opts) {
   opts = opts || {};
   const baseOf = typeof opts.base === "function" ? opts.base : () => opts.base || "";
@@ -1057,12 +1067,74 @@ export function createTtsPlayer(opts) {
   // The live streaming run, if any.  It has no button, but it owns the same
   // one-voice-per-page slot and the same stop().
   let streamRun = null;
+  // Voice-mode streaming runs waiting for that slot, oldest first.  A queued
+  // run keeps receiving its deltas and shaping clips; only playback is
+  // deferred, so nothing it was told while waiting is lost.
+  let voiceQueue = [];
+  // Voice-mode callers waiting for the queue to go quiet.  The hands-free loop
+  // uses this so the mic reopens after the last queued reply, not the first.
+  let idleWaiters = [];
   // Settles the finished-reply run in progress, if any.  stop() is the one
   // exit every way of ending a run goes through, but a stopped clip never
   // fires "ended", so a run parked on one would otherwise wait forever.
   let playSettle = null;
+  // True only during playRun's synchronous supersession window.  A press
+  // stops the current stream before its own run is registered, and idle() must
+  // not mistake that instant for "nothing left to speak" and reopen the mic
+  // under the reply the user just chose.
+  let playStarting = false;
 
-  function stop() {
+  // Anything the player still owes the listener: a playing run, a waiting
+  // voice run or a clicked finished reply.  idle() waits for all three.
+  function _busy() {
+    return !!(streamRun || voiceQueue.length || playSettle || playStarting);
+  }
+
+  function _notifyIdle() {
+    if (_busy() || !idleWaiters.length) return;
+    const waiters = idleWaiters;
+    idleWaiters = [];
+    for (const resolve of waiters) resolve();
+  }
+
+  // Resolves once nothing is left to speak, immediately when already quiet.
+  // The hands-free loop awaits this before reopening the mic: a voice reply's
+  // own `done` settles at its last clip, but a queued reply may be about to
+  // start, and opening the mic then would record the player's own voice.
+  function idle() {
+    if (!_busy()) return Promise.resolve();
+    return new Promise((resolve) => idleWaiters.push(resolve));
+  }
+
+  function _clearVoiceQueue() {
+    if (!voiceQueue.length) return;
+    const waiting = voiceQueue;
+    voiceQueue = [];
+    // Each drop settles its run "cancelled"; a run that already settled keeps
+    // its value.  Done after the array swap so finish() cannot splice what it
+    // is iterating.
+    for (const run of waiting) run._drop();
+  }
+
+  // The active voice run ended on its own: start the oldest waiting run, or
+  // report the player idle when the queue is empty.  Runs that settled while
+  // waiting (nothing speakable) are skipped rather than handed the slot.
+  function _startNextVoiceRun() {
+    while (voiceQueue.length) {
+      const next = voiceQueue.shift();
+      if (!next._settled) {
+        next._start();
+        return;
+      }
+    }
+    _notifyIdle();
+  }
+
+  // Ends everything this player is doing.  A caller-initiated stop is the
+  // user taking the voice slot back, so it also empties the voice queue;
+  // keepQueue is the internal natural-finish path, which hands the slot to
+  // the next queued run instead.
+  function stop(keepQueue) {
     _activeTtsRuns.delete(stop);
     seq++; // invalidate any run in progress
     const finish = playSettle;
@@ -1095,6 +1167,8 @@ export function createTtsPlayer(opts) {
       streamRun = null;
       stream._drop();
     }
+    if (!keepQueue) _clearVoiceQueue();
+    _notifyIdle();
   }
 
   // A finished reply's run handle: the run's own promise (as play() always
@@ -1135,18 +1209,31 @@ export function createTtsPlayer(opts) {
   }
 
   async function playRun(el, btn, heard, finish) {
-    // An explicit click supersedes a pending or playing streaming run.  It is
-    // not necessarily in _activeTtsRuns yet — a run that has not reached its
-    // first clip is still waiting on the config probe — so stop it by hand or
-    // its first sentence would silence the reply the user just chose.
-    if (streamRun) streamRun.cancel();
-    // One voice per page: another pane's run ends before this one starts.
-    for (const other of [..._activeTtsRuns]) other();
-    _activeTtsRuns.add(stop);
-    // Only now, after the supersession calls above (a stream cancel runs this
-    // player's own stop()), so our own teardown cannot settle the run it is
-    // starting.  From here on stop() ends this run, so it settles it.
-    playSettle = finish;
+    // Hold idle() across the supersession window.  cancel()/stop() below run
+    // while this run is not registered yet; without the flag the player looks
+    // quiet for an instant and the voice loop could reopen the mic before the
+    // chosen reply starts.
+    playStarting = true;
+    try {
+      // An explicit click supersedes a pending or playing streaming run.  It
+      // is not necessarily in _activeTtsRuns yet — a run that has not reached
+      // its first clip is still waiting on the config probe — so stop it by
+      // hand or its first sentence would silence the reply the user just
+      // chose.
+      if (streamRun) streamRun.cancel();
+      // A manual press is the user taking over: the queued voice replies are
+      // dropped rather than spoken after the reply they chose.
+      _clearVoiceQueue();
+      // One voice per page: another pane's run ends before this one starts.
+      for (const other of [..._activeTtsRuns]) other();
+      _activeTtsRuns.add(stop);
+      // Only now, after the supersession calls above (a stream cancel runs
+      // this player's own stop()), so our own teardown cannot settle the run
+      // it is starting.  From here on stop() ends this run, so it settles it.
+      playSettle = finish;
+    } finally {
+      playStarting = false;
+    }
     // Serialize: stop() bumps the token, so a superseded run notices at its
     // next await and neither plays nor leaks a blob.  Taken before the try so
     // the catch can tell a failure of this run from one a stop already ended.
@@ -1335,15 +1422,27 @@ export function createTtsPlayer(opts) {
   // whose audio actually fired "ended" (a fetched or prefetched clip is not
   // heard).
   //
+  // `{voice: true}` is the hands-free pane's reply: it queues behind a voice
+  // run that is already playing or waiting, because a second worker report
+  // arriving mid-sentence must not cut the first one off.  A queued run keeps
+  // taking deltas and shaping clips while it waits; its `done` still reports
+  // only its own clips.  Every other stream (the interactive pane's "read every
+  // message") keeps the old one-run-per-player supersede behaviour.
+  //
   // audio.tts_stream is resolved once per run from the memoized styles probe.
   // Off, a run holds its text, resolves to nothing and never fetches a clip,
   // so the panes can feed deltas unconditionally and a deployment that has
   // not enabled streaming behaves exactly as it did before this existed.
-  function stream() {
-    // One streaming run per player: a new reply ends the old run and drops the
-    // clips it had queued but not yet spoken.
-    if (streamRun) streamRun.cancel();
-    const run = { heard: [] };
+  function stream(opts) {
+    const voice = !!(opts && opts.voice);
+    const queued =
+      voice && (voiceQueue.length > 0 || !!(streamRun && streamRun.voice));
+    if (!queued && streamRun) {
+      // One streaming run per player: a new reply ends the old run and drops
+      // the clips it had queued but not yet spoken.
+      streamRun.cancel();
+    }
+    const run = { heard: [], voice };
     // The hands-free loop waits on this: one settlement per run, first value
     // wins, so a teardown that follows a natural finish cannot relabel it.
     let settled = false;
@@ -1354,7 +1453,15 @@ export function createTtsPlayer(opts) {
     const finish = (reason) => {
       if (settled) return;
       settled = true;
+      run._settled = true;
+      // A run that ended with nothing to say can settle while it is still
+      // waiting; it must leave the queue rather than occupy a slot.
+      const at = voiceQueue.indexOf(run);
+      if (at >= 0) voiceQueue.splice(at, 1);
       settleDone({ reason, heard: run.heard.slice() });
+      // Natural finishes release idle() only after stop() has handed the slot
+      // on; every other settle path leaves the queue as it found it.
+      _notifyIdle();
     };
     let inbox = ""; // deltas held until the config probe resolves
     let feeder = null;
@@ -1374,6 +1481,18 @@ export function createTtsPlayer(opts) {
     let token = 0;
     let abort = null;
     let audio = null;
+
+    // Nothing speakable will ever play (the setting is off, or the text shaped
+    // to no clip): settle the run and, when it holds the one voice slot, hand
+    // that slot to the queue.  A queued run with no audio just leaves the
+    // queue; finish() removes it.
+    const finishIfSilent = () => {
+      finish("finished");
+      if (streamRun === run) {
+        stop(true);
+        _startNextVoiceRun();
+      }
+    };
 
     const wakeLoop = () => {
       const resolve = wake;
@@ -1413,7 +1532,9 @@ export function createTtsPlayer(opts) {
       emitted++;
       queue.push(clip);
       if (started) wakeLoop();
-      else start();
+      // A queued voice run holds its clips until the run ahead of it finishes;
+      // start() is called from the queue's turn, not from the first clip.
+      else if (!queued) start();
     };
     const fetchClip = async (text) => {
       const r = await authFetch(baseOf() + "/v1/api/tts", {
@@ -1508,9 +1629,11 @@ export function createTtsPlayer(opts) {
         }
         // The reply's text ended and its last queued clip's audio ended: this
         // is a completed run, settled BEFORE stop(), whose teardown is also
-        // every cancelled path's exit.
+        // every cancelled path's exit.  keepQueue hands the voice slot to the
+        // next queued reply; a plain stop() would drop it.
         finish("finished");
-        stop();
+        stop(true);
+        _startNextVoiceRun();
       } catch (err) {
         if (token !== seq) return; // aborted by a stop or a newer run
         if (err && (err.message === "auth" || err.message === "auth changed")) {
@@ -1559,15 +1682,24 @@ export function createTtsPlayer(opts) {
       // No audio will ever play — the setting is off, or the text shaped to
       // nothing — so the run is over the moment its text is, and the voice
       // loop must not wait for an "ended" that cannot come.  A started run is
-      // settled by playLoop once its queue drains.
-      if (ready && !started) finish("finished");
+      // settled by playLoop once its queue drains, and a run still waiting in
+      // the voice queue keeps its clips for its turn.
+      if (ready && !started && !queue.length) finishIfSilent();
     };
     run.cancel = () => {
       if (streamRun === run) stop(); // clears the player and drops the queue
       else drop();
     };
     run._drop = drop;
-    streamRun = run;
+    run._start = start;
+    if (queued) {
+      // Keep the newest replies: past the cap the oldest WAITING run goes
+      // (the one playing is never displaced by a late arrival).
+      if (voiceQueue.length >= MAX_QUEUED_VOICE_RUNS) voiceQueue.shift()._drop();
+      voiceQueue.push(run);
+    } else {
+      streamRun = run;
+    }
     // All four ride the one memoized styles probe.  A failed probe, a server
     // that predates a field and an unusable value each read as the defaults —
     // the same degradation a finished reply gets.
@@ -1585,7 +1717,7 @@ export function createTtsPlayer(opts) {
       ready = true;
       if (!enabled) {
         inbox = ""; // streaming is off: nothing was fetched and nothing plays
-        if (ended) finish("finished");
+        if (ended) finishIfSilent();
         return;
       }
       feeder = createStreamFeeder({
@@ -1601,8 +1733,9 @@ export function createTtsPlayer(opts) {
       if (text) feeder.push(text);
       if (ended) feeder.end();
       // end() landed while the probe was still out; if it shaped to no clip at
-      // all, nothing above started a loop to settle this run.
-      if (ended && !started) finish("finished");
+      // all, nothing above started a loop to settle this run.  A queued run
+      // with clips waits for its turn instead.
+      if (ended && !started && !queue.length) finishIfSilent();
     }).catch(() => {
       // A run that cannot even start (a throwing base() or Audio constructor)
       // is a cancelled run: settle it rather than leave the voice loop waiting.
@@ -1615,6 +1748,7 @@ export function createTtsPlayer(opts) {
     play,
     stop,
     stream,
+    idle,
     isPlaying: () => activeBtn !== null,
     activeButton: () => activeBtn,
     audio: () => audioEl,
