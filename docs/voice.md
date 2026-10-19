@@ -800,7 +800,7 @@ them.
 | Setting | Default | Range | Effect |
 |---------|---------|-------|--------|
 | `coordinator.voice_max_agents_per_turn` | `1` | 0–10 | Child agents one spoken turn may start. A further spawn call is refused with a note telling the model to ask you first. `0` stops voice sessions starting agents at all. |
-| `coordinator.voice_max_requested_agents` | `4` | 0–10 | Ceiling for a turn in which you explicitly named a number of agents and the model set `user_requested_count`. |
+| `coordinator.voice_max_requested_agents` | `4` | 0–10 | Ceiling on the agent count a turn may name; the turn's budget is that count, never more than this and never less than `coordinator.voice_max_agents_per_turn`. |
 | `coordinator.voice_child_model` | `deepseek-flash-high` | any model alias; empty means the normal default | Model an agent starts on when the voice coordinator names none. |
 
 The default cap is one because spoken asides are easy to mistake for
@@ -813,16 +813,19 @@ such as while driving.
 
 `coordinator.voice_max_requested_agents` keeps the per-turn cap from
 overruling a request you actually made. When a spawn call sets
-`user_requested_count`, the turn's budget becomes the larger of this ceiling
-and the normal cap, so "chunk it up to four different agents" can start four
-in one turn instead of needing three more. The guard does not take the model's
-word for it: the latest genuine user message must itself name the count — a
-digit or a spoken number up to ten, near "agents" or "each". A flag without
-that evidence falls back to the normal cap. A refusal tells the model to ask
-you to confirm the number and then retry once with the flag, so an ambiguous
-request costs one spoken sentence rather than a silent fan-out. Set this
-ceiling to `0` to refuse explicitly requested wider turns; a normal cap of `0`
-is still a hard stop.
+`user_requested_count` and you named a count, the turn's budget becomes that
+count — never more than this ceiling and never less than the normal cap — so
+"chunk it up to four different agents" can start four in one turn instead of
+needing three more. The guard does not take the model's word for it: the
+latest genuine user message must itself name the count, as a digit or a
+spoken number up to ten directly before "agent" or "agents" (one adjective,
+as in "four different agents", is allowed). A number elsewhere in the
+sentence, a standalone "each" and two different counts in one message all
+fall back to the normal cap, so "one agent is enough" cannot be stretched into
+a larger fan-out. A refusal tells the model to ask you to confirm the number
+and then retry once with the flag, so an ambiguous request costs one spoken
+sentence rather than a silent fan-out. Set this ceiling to `0` to refuse
+explicitly requested wider turns; a normal cap of `0` is still a hard stop.
 
 `coordinator.voice_child_model` keeps a spoken spawn from waiting on a model
 that is not loaded. The default is a fast model suited to background work.

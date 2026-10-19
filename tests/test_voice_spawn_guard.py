@@ -508,18 +508,31 @@ def test_plain_coordinator_is_unaffected_by_the_voice_guard(monkeypatch):
         ("chunk it up to four different agents", 4),
         ("start 4 agents", 4),
         ("please start four agents", 4),
+        ("spawn four agents", 4),
+        ("three separate agents", 3),
         ("one agent each", 1),
         ("hand one to each of the 3 agents", 3),
         ("spawn 10 agents", 10),
+        ("one agent is enough for that", 1),
+        ("my four kids, each one wants a snack", 0),
+        ("use three agents each with five minute budget", 3),
+        ("two agents and three agents", 0),
+        ("four agents, then four agents", 4),
         ("back in five minutes", 0),
         ("start some agents", 0),
         ("do eleven agents", 0),
         ("four different researchers", 0),
+        ("four kids want an agent", 0),
         ("", 0),
     ],
 )
 def test_voice_explicit_agent_count(message: str, expected: int) -> None:
-    """Only a count tied to agents/each licenses the requested ceiling."""
+    """Only a count directly before "agent(s)" licenses the requested ceiling.
+
+    A number elsewhere in the sentence ("my four kids"), a standalone "each"
+    and a second, different qualifying count (ambiguous) all read as no
+    request rather than guessing which noun the speaker meant.
+    """
     assert _voice_explicit_agent_count(message) == expected
 
 
@@ -546,6 +559,77 @@ def test_voice_four_agent_batch_without_the_flag_is_refused(monkeypatch):
     assert "at most 1 agent" in batch["error"]
     assert "whole batch" in batch["error"]
     assert coord.spawn.call_count == 0
+
+
+def test_voice_spawn_four_agents_batch_is_allowed(monkeypatch):
+    # "spawn four agents" is the count directly governing the cue; the batch
+    # of four the model asks for is exactly what the user requested.
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.side_effect = lambda **kwargs: _spawn_result(f"child-{coord.spawn.call_count}")
+    _append_user_turn(sess, "spawn four agents")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True)))
+
+    assert "error" not in batch
+    sess._exec_spawn_batch(batch)
+    assert coord.spawn.call_count == 4
+
+
+def test_voice_one_agent_request_caps_every_spawn_in_the_turn(monkeypatch):
+    # "one agent is enough" licenses one agent for the whole turn.  The flag
+    # repeated on later spawn_workstream calls must not reopen the ceiling.
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.side_effect = lambda **kwargs: _spawn_result(f"child-{coord.spawn.call_count}")
+    _append_user_turn(sess, "one agent is enough for that")
+
+    for idx in range(4):
+        item = sess._prepare_tool(
+            _tc(
+                "spawn_workstream",
+                {"initial_message": f"task {idx}", "user_requested_count": True},
+                f"call-{idx}",
+            )
+        )
+        if idx == 0:
+            assert "error" not in item
+            sess._exec_spawn_workstream(item)
+        else:
+            assert "error" in item
+            assert "at most 1 agent" in item["error"]
+
+    assert coord.spawn.call_count == 1
+
+
+def test_voice_four_kids_each_is_not_a_request(monkeypatch):
+    # "each" alone no longer ties the number to agents: the four children are
+    # the subject of the sentence, not the fan-out the user asked for.
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    _append_user_turn(sess, "my four kids, each one wants a snack")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(4, requested=True)))
+
+    assert "error" in batch
+    assert "at most 1 agent" in batch["error"]
+    assert coord.spawn.call_count == 0
+
+
+def test_voice_three_agents_with_a_five_minute_budget_is_three(monkeypatch):
+    # The five minutes belong to the budget, not to the agent count: three is
+    # the request, and the turn's budget is that count, not the ceiling.
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.side_effect = lambda **kwargs: _spawn_result(f"child-{coord.spawn.call_count}")
+    _append_user_turn(sess, "use three agents each with five minute budget")
+
+    batch = sess._prepare_tool(_tc("spawn_batch", _batch_args(3, requested=True)))
+    assert "error" not in batch
+    sess._exec_spawn_batch(batch)
+    assert coord.spawn.call_count == 3
+
+    denied = sess._prepare_tool(
+        _tc("spawn_workstream", {"initial_message": "another", "user_requested_count": True})
+    )
+    assert "error" in denied
+    assert "at most 3 agents" in denied["error"]
 
 
 def test_voice_flag_without_a_count_in_the_user_message_is_refused(monkeypatch):

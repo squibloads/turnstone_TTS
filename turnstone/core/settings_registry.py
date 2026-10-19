@@ -1360,8 +1360,9 @@ def _build_registry() -> dict[str, SettingDef]:
             max_value=10,
             help="Applies only to coordinators created with the voice persona. When the "
             "user's latest message explicitly names a number of agents and the spawn call "
-            "sets user_requested_count, the turn's budget becomes the larger of this and "
-            "coordinator.voice_max_agents_per_turn. The number in the user's message must "
+            "sets user_requested_count, the turn's budget becomes that named count, capped "
+            "by this setting and never below coordinator.voice_max_agents_per_turn. The "
+            "number must sit directly before 'agent' or 'agents' in the user's message and "
             "be at least the batch size, so the model cannot widen the cap on its own; a "
             "claim the message does not support falls back to the normal cap. A "
             "coordinator.voice_max_agents_per_turn of 0 stays a hard stop. Set this to 0 "

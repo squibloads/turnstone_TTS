@@ -1949,9 +1949,11 @@ def _is_truthy_flag(value: Any) -> bool:
 
 
 # An explicit request widens the voice spawn budget only when the user's own
-# words name the count.  The parser needs its number vocabulary and the words
-# that tie a number to agents in one place; the span is wide enough for
-# "four different agents" but not for a number elsewhere in the sentence.
+# words name the count, directly before the noun it governs.  Keeping the
+# vocabulary in one place makes the rule easy to read: a number, at most one
+# adjective, then "agent(s)".  "each" is deliberately not a cue — it appears
+# in phrases whose number belongs to something else ("my four kids, each one
+# wants a snack").
 _VOICE_COUNT_WORDS: dict[str, int] = {
     "one": 1,
     "two": 2,
@@ -1964,31 +1966,55 @@ _VOICE_COUNT_WORDS: dict[str, int] = {
     "nine": 9,
     "ten": 10,
 }
-_VOICE_AGENT_COUNT_CUES: frozenset[str] = frozenset({"agent", "agents", "each"})
-_VOICE_COUNT_CUE_SPAN: int = 3
+_VOICE_AGENT_NOUNS: frozenset[str] = frozenset({"agent", "agents"})
+_VOICE_AGENT_COUNT_ADJECTIVES: frozenset[str] = frozenset(
+    {
+        "additional",
+        "concurrent",
+        "dedicated",
+        "different",
+        "distinct",
+        "extra",
+        "individual",
+        "more",
+        "new",
+        "own",
+        "parallel",
+        "separate",
+        "total",
+    }
+)
 
 
 def _voice_explicit_agent_count(message: str) -> int:
-    """Largest agent count *message* names, or 0 when it names none.
+    """Agent count *message* names directly before "agent(s)", or 0.
 
     ``user_requested_count`` is model-authored, so the flag alone cannot be
     trusted: the session checks it against the latest genuine user turn.  A
     bare number is not enough — "back in five minutes" must not license a
-    five-agent fan-out — so a count only qualifies within
-    :data:`_VOICE_COUNT_CUE_SPAN` tokens of "agent(s)" or "each".  Spoken
-    words stop at ten because ``spawn_batch`` cannot start more than ten
-    children in one call.
+    five-agent fan-out — so the number has to govern the noun it counts:
+    "four agents" or "four separate agents", never a number elsewhere in the
+    sentence.  "each" is not a cue ("my four kids, each one wants a snack" is
+    not a request).  Two different qualifying counts are ambiguous, and an
+    ambiguous request falls back to the normal cap.  Spoken words stop at ten
+    because ``spawn_batch`` cannot start more than ten children in one call.
     """
     tokens = re.findall(r"[a-z]+|\d+", message.lower())
-    best = 0
+    counts: set[int] = set()
     for idx, token in enumerate(tokens):
         value = int(token) if token.isdigit() else _VOICE_COUNT_WORDS.get(token, 0)
         if not 1 <= value <= 10:
             continue
-        nearby = tokens[max(0, idx - _VOICE_COUNT_CUE_SPAN) : idx + _VOICE_COUNT_CUE_SPAN + 1]
-        if any(word in _VOICE_AGENT_COUNT_CUES for word in nearby):
-            best = max(best, value)
-    return best
+        following = tokens[idx + 1 : idx + 3]
+        if not following:
+            continue
+        if following[0] in _VOICE_AGENT_NOUNS or (
+            following[0] in _VOICE_AGENT_COUNT_ADJECTIVES
+            and len(following) > 1
+            and following[1] in _VOICE_AGENT_NOUNS
+        ):
+            counts.add(value)
+    return counts.pop() if len(counts) == 1 else 0
 
 
 # Cap on the *content portion* (text after ``path:lineno:``) of an
@@ -3310,11 +3336,11 @@ class ChatSession:
         # one assistant message execute on a thread pool, so a slot is reserved
         # before its spawn attempt and released if the child never starts.
         self._voice_spawns_this_turn: int = 0
-        # The latest genuine user text is the only evidence that can back the
-        # model's ``user_requested_count`` hint.  Written by the same admission
-        # that reopens the budget, so the count and its evidence cannot
-        # disagree about which turn they belong to.
-        self._voice_last_user_text: str = ""
+        # The agent count the latest genuine user turn names is the only
+        # evidence that can back the model's ``user_requested_count`` hint.
+        # Written by the same admission that reopens the budget, so the count
+        # and its evidence cannot disagree about which turn they belong to.
+        self._voice_named_agent_count: int = 0
         self._voice_spawn_lock = threading.Lock()
         # The session owns ONE immutable binding snapshot.  Registry-backed
         # construction resolves provider/client/model/config/generation under
@@ -21424,7 +21450,7 @@ class ChatSession:
         # here, not in ``_plan_genuine_user_turn``, means a plan that loses
         # generation admission never spends the budget it did not open.
         self._voice_reset_spawn_budget()
-        self._voice_last_user_text = plan.content
+        self._voice_named_agent_count = _voice_explicit_agent_count(plan.content)
         self._append_user_turn(
             plan.content,
             attachments,
@@ -22157,24 +22183,26 @@ class ChatSession:
     def _voice_requested_count_honoured(self, flag: bool, count: int) -> bool:
         """Whether the latest user turn backs the model's explicit-request flag.
 
-        The flag is a hint the model writes; the count has to appear in the
-        user's own words or the normal cap applies.  A mismatch is not an
-        error — a batch that fits the normal cap still runs — but a denied one
-        gets the confirmation prompt from :meth:`_voice_batch_spawn_denial`.
+        The flag is a hint the model writes; the turn has to have named at
+        least *count* agents of its own accord or the normal cap applies.  A
+        mismatch is not an error — a batch that fits the normal cap still
+        runs — but a denied one gets the confirmation prompt from
+        :meth:`_voice_spawn_denial`.
         """
-        return bool(flag) and _voice_explicit_agent_count(self._voice_last_user_text) >= count
+        return bool(flag) and self._voice_named_agent_count >= count
 
     def _voice_spawn_cap(self, *, requested: bool) -> int:
         """Effective per-turn cap, widened by a backed explicit request.
 
         ``voice_max_agents_per_turn == 0`` remains the operator's off switch:
-        an explicit request never reopens it.  Otherwise the two caps combine
-        by the larger, so the requested ceiling can raise the budget for one
-        turn without lowering a higher normal cap.
+        an explicit request never reopens it.  Otherwise a backed request
+        raises the budget to the count the user actually named, once the
+        operator's ceiling has clipped it, and never below the normal cap:
+        "one agent is enough" buys one agent, not the whole ceiling.
         """
         cap = self._voice_max_agents_per_turn()
         if requested and cap > 0:
-            cap = max(cap, self._voice_max_requested_agents())
+            cap = max(cap, min(self._voice_named_agent_count, self._voice_max_requested_agents()))
         return cap
 
     def _voice_child_model_alias(self) -> str:
