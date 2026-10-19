@@ -149,6 +149,73 @@ console.log(JSON.stringify({{ queued, between, firstResult, afterFirst, secondRe
     assert out["idleAfter"] == "idle"
 
 
+def test_a_failed_reply_does_not_drop_the_replies_queued_behind_it() -> None:
+    # A clip that fails to synthesize ends only its own reply.  The reply
+    # waiting behind it is a separate answer the user already received, so it
+    # must advance exactly as it would after a natural finish.
+    out = _run(
+        f"""
+stubStream = true;
+const realFetch = authFetch;
+let clipPosts = 0;
+authFetch = (url, opts) => {{
+  if (opts && opts.method === "POST" && url.endsWith("/v1/api/tts")) {{
+    clipPosts++;
+    if (clipPosts === 1) return Promise.reject(new Error("synthesis failed"));
+  }}
+  return realFetch(url, opts);
+}};
+const player = createTtsPlayer({{ base: "" }});
+const order = [];
+const first = player.stream({{ voice: true }});
+first.done.then((r) => order.push("first:" + r.reason));
+first.push("First reply sentence one. First reply sentence two.");
+first.end();
+const second = player.stream({{ voice: true }});
+second.done.then((r) => order.push("second:" + r.reason));
+second.push("Second reply sentence one. Second reply sentence two.");
+second.end();
+await tick();
+const afterError = {{
+  first: await settled(first.done),
+  second: await settled(second.done),
+  audios: log.audios.length,
+  toasts: log.toasts,
+  clipPosts,
+  posts: {_posts()},
+}};
+// audio[0] is the failed reply's unused element; audio[1] is the queued
+// reply, which has already started its first clip.
+log.audios[1].fire("ended");
+await tick();
+log.audios[1].fire("ended");
+await tick();
+const secondResult = await second.done;
+console.log(JSON.stringify({{ afterError, secondResult, order,
+  idle: await settled(player.idle().then(() => "idle")) }}));
+"""
+    )
+    # The failing reply is cancelled; its waiting sibling is untouched and has
+    # already started speaking.
+    assert out["afterError"]["first"] == {"reason": "cancelled", "heard": []}
+    assert out["afterError"]["second"] is None
+    assert out["afterError"]["audios"] == 2
+    assert out["afterError"]["toasts"] == [["synthesis failed", "error"]]
+    # The failed call never reached the stub's log; these are the queued
+    # reply's own two clips.
+    assert out["afterError"]["clipPosts"] == 3
+    assert out["afterError"]["posts"] == [
+        "Second reply sentence one.",
+        "Second reply sentence two.",
+    ]
+    assert out["secondResult"] == {
+        "reason": "finished",
+        "heard": ["Second reply sentence one.", "Second reply sentence two."],
+    }
+    assert out["order"] == ["first:cancelled", "second:finished"]
+    assert out["idle"] == "idle"
+
+
 MAX_QUEUED = 10  # MAX_QUEUED_VOICE_RUNS in tts_player.js
 
 

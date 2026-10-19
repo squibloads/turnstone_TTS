@@ -1653,7 +1653,11 @@ export function createTtsPlayer(opts) {
           err && err.message ? err.message : "Speech synthesis failed",
           "error",
         );
-        stop();
+        // Only this reply failed.  Keep the queue and hand the voice slot to
+        // the next waiting reply, exactly as a natural finish does: a bare
+        // stop() would silently drop answers the user has already received.
+        _stop(true);
+        _startNextVoiceRun();
       }
     };
     const start = () => {
