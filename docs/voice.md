@@ -822,9 +822,9 @@ spoken number up to ten directly before "agent" or "agents" (one adjective,
 as in "four different agents", is allowed). A number elsewhere in the
 sentence, a standalone "each" and two different counts in one message all
 fall back to the normal cap, so "one agent is enough" cannot be stretched into
-a larger fan-out. A refusal tells the model to ask you to confirm the number
-and then retry once with the flag, so an ambiguous request costs one spoken
-sentence rather than a silent fan-out. Set this ceiling to `0` to refuse
+a larger fan-out. A refusal that follows the flag tells the model to ask you
+to confirm the number and then retry once with the flag; without the flag it
+just asks whether to start another. Set this ceiling to `0` to refuse
 explicitly requested wider turns; a normal cap of `0` is still a hard stop.
 
 `coordinator.voice_child_model` keeps a spoken spawn from waiting on a model

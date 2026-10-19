@@ -22222,11 +22222,21 @@ class ChatSession:
         return value.strip() if isinstance(value, str) else ""
 
     @staticmethod
-    def _voice_spawn_denial(cap: int) -> str:
-        """Model-readable refusal for a voice spawn over the turn budget."""
+    def _voice_spawn_denial(cap: int, *, flagged: bool = False) -> str:
+        """Model-readable refusal for a voice spawn over the turn budget.
+
+        Only a call that set ``user_requested_count`` is told to ask for a
+        number: without the flag there is no number for the user to confirm,
+        and the base ask is simply whether to start another.
+        """
         if cap <= 0:
             return "Voice mode is set to start no agents."
         noun = "agent" if cap == 1 else "agents"
+        if not flagged:
+            return (
+                f"Voice mode starts at most {cap} {noun} per turn. "
+                "Ask the user before starting another."
+            )
         return (
             f"Voice mode starts at most {cap} {noun} per turn. "
             "Ask the user to confirm the number; when they name it, call "
@@ -22234,12 +22244,18 @@ class ChatSession:
         )
 
     @staticmethod
-    def _voice_batch_spawn_denial(count: int, cap: int) -> str:
+    def _voice_batch_spawn_denial(count: int, cap: int, *, flagged: bool = False) -> str:
         """Refusal for a whole batch — partial spawns would split one request
         into children the user never got to approve as a set."""
         if cap <= 0:
             return "Voice mode is set to start no agents; this batch was not started."
         noun = "agent" if cap == 1 else "agents"
+        if not flagged:
+            return (
+                f"Voice mode starts at most {cap} {noun} per turn; this batch would "
+                f"start {count}, so the whole batch was not started. Ask the user "
+                "before starting another."
+            )
         return (
             f"Voice mode starts at most {cap} {noun} per turn; this batch would "
             f"start {count}, so the whole batch was not started. Ask the user to "
@@ -22248,17 +22264,29 @@ class ChatSession:
         )
 
     def _voice_spawn_denial_locked(
-        self, count: int, *, batch: bool, requested: bool = False
+        self,
+        count: int,
+        *,
+        batch: bool,
+        requested: bool = False,
+        flagged: bool = False,
     ) -> str:
         """Denial text for *count* spawns; caller holds ``_voice_spawn_lock``."""
         cap = self._voice_spawn_cap(requested=requested)
         if self._voice_spawns_this_turn + count <= cap:
             return ""
         if batch:
-            return self._voice_batch_spawn_denial(count, cap)
-        return self._voice_spawn_denial(cap)
+            return self._voice_batch_spawn_denial(count, cap, flagged=flagged)
+        return self._voice_spawn_denial(cap, flagged=flagged)
 
-    def _voice_spawn_peek(self, count: int, *, batch: bool = False, requested: bool = False) -> str:
+    def _voice_spawn_peek(
+        self,
+        count: int,
+        *,
+        batch: bool = False,
+        requested: bool = False,
+        flagged: bool = False,
+    ) -> str:
         """Prepare-time check: would *count* spawns exceed the budget now?
 
         Deliberately non-reserving.  A prepared call may still be denied at
@@ -22267,10 +22295,17 @@ class ChatSession:
         :meth:`_voice_reserve_spawns` at exec time.
         """
         with self._voice_spawn_lock:
-            return self._voice_spawn_denial_locked(count, batch=batch, requested=requested)
+            return self._voice_spawn_denial_locked(
+                count, batch=batch, requested=requested, flagged=flagged
+            )
 
     def _voice_reserve_spawns(
-        self, count: int, *, batch: bool = False, requested: bool = False
+        self,
+        count: int,
+        *,
+        batch: bool = False,
+        requested: bool = False,
+        flagged: bool = False,
     ) -> str:
         """Reserve *count* per-turn spawn slots, or return the denial text.
 
@@ -22280,7 +22315,9 @@ class ChatSession:
         up reflecting children that actually exist.
         """
         with self._voice_spawn_lock:
-            denial = self._voice_spawn_denial_locked(count, batch=batch, requested=requested)
+            denial = self._voice_spawn_denial_locked(
+                count, batch=batch, requested=requested, flagged=flagged
+            )
             if not denial:
                 self._voice_spawns_this_turn += count
             return denial
@@ -22319,13 +22356,13 @@ class ChatSession:
         # storage lookup: a spawn over the cap must cost the model one clear
         # refusal, not a persona round trip and an approval card first.
         requested = False
+        flagged = False
         if self._voice_spawn_guard_active():
             # ``user_requested_count`` is only a hint from the model; the
             # guard checks the latest user turn before widening the budget.
-            requested = self._voice_requested_count_honoured(
-                self._coord_bool_arg(args, "user_requested_count"), 1
-            )
-            denial = self._voice_spawn_peek(1, requested=requested)
+            flagged = self._coord_bool_arg(args, "user_requested_count")
+            requested = self._voice_requested_count_honoured(flagged, 1)
+            denial = self._voice_spawn_peek(1, requested=requested, flagged=flagged)
             if denial:
                 return self._coord_tool_error(call_id, "spawn_workstream", denial)
             if not model:
@@ -22385,6 +22422,9 @@ class ChatSession:
             # Validated at prepare time; exec must not re-read the user turn,
             # which a queued send could have replaced mid-approval.
             "user_requested_count": requested,
+            # The raw flag survives for the refusal wording, which distinguishes
+            # "you never asked for a count" from "the count was not backed".
+            "user_requested_count_flagged": flagged,
         }
 
     def _validate_child_persona(self, persona: str) -> tuple[str, str]:
@@ -22420,7 +22460,11 @@ class ChatSession:
         # below, so a failed spawn does not cost the turn an agent.
         voice = self._voice_spawn_guard_active()
         if voice:
-            denial = self._voice_reserve_spawns(1, requested=bool(item.get("user_requested_count")))
+            denial = self._voice_reserve_spawns(
+                1,
+                requested=bool(item.get("user_requested_count")),
+                flagged=bool(item.get("user_requested_count_flagged")),
+            )
             if denial:
                 return self._voice_spawn_failure(call_id, "spawn_workstream", denial)
         try:
@@ -22612,11 +22656,13 @@ class ChatSession:
         # reaches the spawn call.  ``user_requested_count`` widens the budget
         # only when the latest user turn names a count at least this large.
         requested = False
+        flagged = False
         if voice:
-            requested = self._voice_requested_count_honoured(
-                self._coord_bool_arg(args, "user_requested_count"), valid_count
+            flagged = self._coord_bool_arg(args, "user_requested_count")
+            requested = self._voice_requested_count_honoured(flagged, valid_count)
+            denial = self._voice_spawn_peek(
+                valid_count, batch=True, requested=requested, flagged=flagged
             )
-            denial = self._voice_spawn_peek(valid_count, batch=True, requested=requested)
             if denial:
                 return self._coord_tool_error(call_id, "spawn_batch", denial)
 
@@ -22634,6 +22680,7 @@ class ChatSession:
             # Validated against the prepare-time user turn; see the matching
             # note on spawn_workstream's item.
             "user_requested_count": requested,
+            "user_requested_count_flagged": flagged,
         }
 
     def _exec_spawn_batch(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -22650,7 +22697,10 @@ class ChatSession:
         planned = sum(1 for spec in children if "_error" not in spec)
         if voice:
             denial = self._voice_reserve_spawns(
-                planned, batch=True, requested=bool(item.get("user_requested_count"))
+                planned,
+                batch=True,
+                requested=bool(item.get("user_requested_count")),
+                flagged=bool(item.get("user_requested_count_flagged")),
             )
             if denial:
                 return self._voice_spawn_failure(call_id, "spawn_batch", denial)

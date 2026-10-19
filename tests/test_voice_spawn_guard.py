@@ -193,8 +193,32 @@ def test_voice_second_spawn_in_same_turn_is_denied(monkeypatch):
     assert "error" in second
     assert "at most 1 agent" in second["error"]
     assert "Ask the user" in second["error"]
+    # No user_requested_count on the call: ask the user, do not ask them to
+    # name a number the message never contained.
+    assert "Ask the user before starting another." in second["error"]
+    assert "user_requested_count" not in second["error"]
     assert second.get("needs_approval") is not True
     # Refused before any child was created.
+    assert coord.spawn.call_count == 1
+
+
+def test_voice_unbacked_flag_keeps_the_confirmation_denial(monkeypatch):
+    """The flag was set, but the user's words did not name the count, so the
+    refusal still asks for that confirmation."""
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.return_value = _spawn_result()
+    _append_user_turn(sess, "go ahead")
+
+    first = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "one"}))
+    assert "error" not in first
+    sess._exec_spawn_workstream(first)
+
+    second = sess._prepare_tool(
+        _tc("spawn_workstream", {"initial_message": "two", "user_requested_count": True})
+    )
+    assert "error" in second
+    assert "Ask the user to confirm the number" in second["error"]
+    assert "user_requested_count" in second["error"]
     assert coord.spawn.call_count == 1
 
 
@@ -558,6 +582,9 @@ def test_voice_four_agent_batch_without_the_flag_is_refused(monkeypatch):
     assert "error" in batch
     assert "at most 1 agent" in batch["error"]
     assert "whole batch" in batch["error"]
+    # No flag on the call, so the base wording applies here too.
+    assert "Ask the user before starting another." in batch["error"]
+    assert "user_requested_count" not in batch["error"]
     assert coord.spawn.call_count == 0
 
 
