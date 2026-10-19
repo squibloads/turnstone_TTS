@@ -149,7 +149,10 @@ console.log(JSON.stringify({{ queued, between, firstResult, afterFirst, secondRe
     assert out["idleAfter"] == "idle"
 
 
-def test_the_queue_keeps_three_waiting_runs_and_drops_the_oldest() -> None:
+MAX_QUEUED = 10  # MAX_QUEUED_VOICE_RUNS in tts_player.js
+
+
+def test_the_queue_keeps_ten_waiting_runs_and_drops_the_oldest() -> None:
     out = _run(
         f"""
 stubStream = true;
@@ -159,7 +162,7 @@ active.push("Active reply sentence one. Active reply sentence two.");
 active.end();
 await tick();
 const waiting = [];
-for (let n = 1; n <= 4; n++) {{
+for (let n = 1; n <= {MAX_QUEUED + 1}; n++) {{
   const run = player.stream({{ voice: true }});
   run.push("Queued reply " + n + " sentence one. Queued reply " + n + " sentence two.");
   run.end();
@@ -170,7 +173,7 @@ const dropped = await waiting[0].done;
 const stillWaiting = [];
 for (let i = 1; i < waiting.length; i++) stillWaiting.push(await settled(waiting[i].done));
 // Drain the active run and then each survivor, in order.
-for (let i = 0; i <= 3; i++) {{
+for (let i = 0; i <= {MAX_QUEUED}; i++) {{
   log.audios[i].fire("ended");
   await tick();
   log.audios[i].fire("ended");
@@ -185,27 +188,19 @@ console.log(JSON.stringify({{ dropped, stillWaiting, results,
     # The oldest WAITING run is the one dropped when the cap is reached; the
     # run playing at the time is untouched.
     assert out["dropped"] == {"reason": "cancelled", "heard": []}
-    assert out["stillWaiting"] == [None, None, None]
-    assert out["audios"] == 4  # active + the three survivors
-    assert out["results"] == [
-        {"reason": "cancelled", "heard": []},
+    assert out["stillWaiting"] == [None] * MAX_QUEUED
+    assert out["audios"] == MAX_QUEUED + 1  # active + the survivors
+    assert out["results"] == [{"reason": "cancelled", "heard": []}] + [
         {
             "reason": "finished",
-            "heard": ["Queued reply 2 sentence one.", "Queued reply 2 sentence two."],
-        },
-        {
-            "reason": "finished",
-            "heard": ["Queued reply 3 sentence one.", "Queued reply 3 sentence two."],
-        },
-        {
-            "reason": "finished",
-            "heard": ["Queued reply 4 sentence one.", "Queued reply 4 sentence two."],
-        },
+            "heard": [f"Queued reply {n} sentence one.", f"Queued reply {n} sentence two."],
+        }
+        for n in range(2, MAX_QUEUED + 2)
     ]
     assert "Queued reply 1 sentence one." not in out["posts"]
     assert out["posts"][-2:] == [
-        "Queued reply 4 sentence one.",
-        "Queued reply 4 sentence two.",
+        f"Queued reply {MAX_QUEUED + 1} sentence one.",
+        f"Queued reply {MAX_QUEUED + 1} sentence two.",
     ]
 
 

@@ -1034,13 +1034,14 @@ async function _requestStyle(base) {
 const _activeTtsRuns = new Set();
 
 // Voice mode can hand the player another reply before the one it is speaking
-// has finished.  A short backlog keeps a burst of replies audible without
-// turning the player into an endless reading queue: past three waiting runs
-// the OLDEST is dropped, so the user hears the latest replies rather than a
-// stale backlog.  It is deliberately not a setting — the useful range is
+// has finished.  The cap is set well above any realistic burst (agents
+// finishing together produce three or four), so in practice nothing is
+// dropped; it exists only so a runaway cannot queue without bound.  Past ten
+// waiting runs the OLDEST is dropped, and Stop or a speaker press clears the
+// whole queue.  It is deliberately not a setting — the useful range is
 // small, and an operator cannot predict a session's reply burst better than
 // the player can.
-const MAX_QUEUED_VOICE_RUNS = 3;
+const MAX_QUEUED_VOICE_RUNS = 10;
 
 // One pane's read-aloud player.  Options:
 //   base            transport prefix ("" or "/node/{id}"), or a function

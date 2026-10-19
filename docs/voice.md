@@ -1012,8 +1012,9 @@ speaker on the finished reply still works.
 In a voice session, a reply that arrives while another is being read aloud
 waits its turn instead of cutting in. Replies are spoken in arrival order, and
 each keeps accumulating its text while it waits, so a burst of worker reports
-is heard in full. Up to three replies wait; a fourth arrival drops the oldest
-waiting one, so the queue stays current instead of becoming a backlog.
+is heard in full. Up to ten replies wait, far more than a real burst produces;
+only an eleventh arrival drops the oldest waiting one. Stop, or pressing any
+speaker button, clears the whole queue.
 
 A speaker-button press is you taking over, so it still supersedes: the reply
 being spoken stops, every waiting reply is dropped, and the chosen reply
