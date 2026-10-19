@@ -717,6 +717,49 @@ def _build_registry() -> dict[str, SettingDef]:
             reference_url=VOICE_DOCS_URL + "#auto-stop",
         ),
         SettingDef(
+            "audio.stt_frame_capture",
+            "bool",
+            False,
+            "Stream microphone frames to the server (speaker gate groundwork)",
+            "audio",
+            help="When on, a dictation recording also sends raw 32 ms audio frames to "
+            "this server, where they are buffered per recording for the future speaker "
+            "gate. Transcription is unchanged: the compressed clip still goes to the "
+            "speech-to-text model exactly as before. Off by default; the capture "
+            "stops accepting frames at the capture cap and expires shortly after, "
+            "in memory only.",
+            reference_url=VOICE_DOCS_URL + "#frame-capture-speaker-gate-groundwork",
+        ),
+        SettingDef(
+            "audio.stt_segment_gap_ms",
+            "int",
+            250,
+            "Quiet gap (ms) that closes a speaker segment",
+            "audio",
+            min_value=100,
+            max_value=2000,
+            help="How long a pause ends one speaker-checked segment. This is separate "
+            "from the auto-stop silence: it cuts the frame stream into short pieces for "
+            "the future speaker gate, it does not stop the recorder. Raise it if a "
+            "speaker's natural pauses split their sentences; lower it when two voices "
+            "follow each other quickly.",
+            reference_url=VOICE_DOCS_URL + "#segment-gap",
+        ),
+        SettingDef(
+            "audio.stt_frame_capture_max_seconds",
+            "int",
+            300,
+            "Longest frame capture (seconds) buffered per recording",
+            "audio",
+            min_value=10,
+            max_value=3600,
+            help="The hard cap on how much audio frame capture buffers for one "
+            "recording, in seconds (about 32 KB per second on the server). At the cap "
+            "the capture closes and later frames are refused; dictation itself keeps "
+            "recording and transcribing until you stop it.",
+            reference_url=VOICE_DOCS_URL + "#capture-caps",
+        ),
+        SettingDef(
             "audio.tts_stream",
             "bool",
             False,

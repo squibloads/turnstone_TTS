@@ -1853,6 +1853,16 @@ async def speech_to_text_stream(request: Request) -> Response:
     )
 
 
+async def speech_to_text_frames(request: Request) -> Response:
+    """POST /v1/api/workstreams/{ws_id}/speech-to-text/frames — raw PCM batches.
+
+    Console twin of the node route; see :func:`speech_to_text`.
+    """
+    from turnstone.core.web_helpers import frame_capture_response
+
+    return await frame_capture_response(request, authorize=_authorize_coordinator_ws)
+
+
 # ---------------------------------------------------------------------------
 # Route handlers — workstream creation
 # ---------------------------------------------------------------------------
@@ -17862,6 +17872,11 @@ def create_app(
                     Route(
                         "/api/workstreams/{ws_id}/speech-to-text/stream",
                         speech_to_text_stream,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/workstreams/{ws_id}/speech-to-text/frames",
+                        speech_to_text_frames,
                         methods=["POST"],
                     ),
                     Route("/api/cluster/overview", cluster_overview),

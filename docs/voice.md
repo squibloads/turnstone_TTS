@@ -1016,6 +1016,70 @@ refuses the module — dictation falls back to click-to-stop and
 The mic reads these three settings when it first needs them on a page, so a
 saved change reaches recordings started after a page reload.
 
+## Frame capture (speaker gate groundwork)
+
+Voice mode is being taught to tell speakers apart: a later release will check
+each short stretch of speech against the enrolled user before it becomes a
+turn. That needs raw audio in small pieces, and dictation captures one
+compressed clip per turn — a codec stream only means something as a whole. This
+section is the groundwork: while a recording runs, the page can tap the same
+microphone through an AudioWorklet and send fixed 32 ms frames (16 kHz mono
+PCM) to the server.
+
+Transcription does not change. The compressed clip still goes to the
+speech-to-text model exactly as before; the frames are a second, parallel tap
+used only by the future speaker gate. The page cuts the frame stream into short
+segments at the [segment gap](#segment-gap); the server buffers the frames in
+memory per recording and stops accepting them at the [capture cap](#capture-caps).
+The buffer is in memory only and expires a short while after the cap. Nothing is
+written to disk, nothing is scored yet, and the feature is off by default.
+
+### Turning frame capture on
+
+`audio.stt_frame_capture` · default off · boolean
+
+On, each dictation recording also streams raw frames to the server. Off keeps
+today's behavior exactly: no worklet is created, no extra request is made, and
+the only audio leaving the page is the clip you already sent for transcription.
+Turn it on only to exercise the speaker-gate groundwork; the turn itself is
+still assembled from the clip.
+
+Frame capture is best-effort. A browser without AudioWorklet, a worklet that
+fails to load, or a server that refuses a batch ends the frame tap and leaves
+the recorder running — the dictation still uploads and transcribes. The
+settings are read when the recording starts, so a saved change reaches the next
+recording after a page reload.
+
+### Segment gap
+
+`audio.stt_segment_gap_ms` · default `250` · range 100–2000
+
+How long a pause ends one segment. Segments are the unit a speaker verdict will
+be attached to, so they have to be short enough that a new voice gets a fresh
+check quickly, while a natural pause inside one person's sentence should not
+split it. This is deliberately separate from
+[`audio.stt_silence_ms`](#how-long-you-must-be-quiet): that clock stops the
+recorder after 900 ms by default, and stopping a recording is not the same as
+cutting it into segments.
+
+Raise the gap when a speaker's ordinary pauses split their sentences into
+several segments; lower it when two voices follow each other faster than the
+gate can react.
+
+### Capture caps
+
+`audio.stt_frame_capture_max_seconds` · default `300` · range 10–3600
+
+The hard limit on one recording's buffered frames, in seconds — about 32 KB per
+second on the server, so 300 seconds is roughly 9.6 MB. At the cap the capture
+closes and further batches are refused; the recording, the clip upload and the
+transcript continue untouched. A capture also expires automatically a short
+while after its cap, so a closed tab cannot pin memory.
+
+The browser stops sending at the same cap. The server is the authority: it
+rejects any batch that would cross the cap, even if an older page keeps
+sending.
+
 ## Streaming read-aloud
 
 By default a reply is read aloud only after it is finished: the speaker button
