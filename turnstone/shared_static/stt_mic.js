@@ -454,20 +454,37 @@ export function createMicController(opts) {
           return null;
         }
         if (!handle || typeof handle.start !== "function") return null;
-        return Promise.resolve(handle.start(s)).then(() => {
-          // The recording can end while the worklet module is still loading;
-          // do not adopt a graph nobody is listening to.
-          if (frameToken !== token || destroyed) {
-            try {
-              handle.stop();
-            } catch (e) {
-              /* already released */
-            }
-            return null;
-          }
-          frameHandle = handle;
-          return null;
-        });
+        // Adopt the handle before start() resolves: a teardown during the
+        // worklet module load must be able to stop the graph the session is
+        // already building.  createFrameCapture().stop() is safe mid-start.
+        frameHandle = handle;
+        return Promise.resolve()
+          .then(() => handle.start(s))
+          .then(
+            () => {
+              // The recording can end while the worklet module is still
+              // loading; do not keep a graph nobody is listening to.  If
+              // teardown already stopped this handle it cleared frameHandle,
+              // and a second stop would only repeat the release.
+              if (frameToken !== token || destroyed) {
+                if (frameHandle === handle) {
+                  frameHandle = null;
+                  try {
+                    handle.stop();
+                  } catch (e) {
+                    /* already released */
+                  }
+                }
+              }
+              return null;
+            },
+            () => {
+              // A failed start already released its own graph; forget it so a
+              // later teardown does not stop an unrelated session.
+              if (frameHandle === handle) frameHandle = null;
+              return null;
+            },
+          );
       })
       .catch(() => {});
   }

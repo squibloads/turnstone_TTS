@@ -381,6 +381,36 @@ console.log(JSON.stringify({
     assert out["tracksStopped"] == [True]
 
 
+def test_stopping_while_the_frame_session_starts_releases_it_once() -> None:
+    """The worklet module load is asynchronous; a teardown during it must stop
+    the graph the session is already building, and the late resolution must not
+    resurrect or double-release it."""
+    out = _run(
+        """
+let release = null, stops = 0, starts = 0;
+const composer = makeComposer();
+const m = createMicController({
+  composer, base: "", wsId: "w",
+  sttConfig: { auto_stop: false, silence_ms: 900, vad_threshold: 0.5,
+    frame_capture: true, segment_gap_ms: 250, frame_capture_max_seconds: 300 },
+  frameSession: () => ({
+    start() { starts++; return new Promise((r) => { release = r; }); },
+    stop() { stops++; },
+  }),
+});
+m.button.click(); await tick();
+const during = { starts, stops };
+m.button.click(); await tick();     // stop the recording while start() is pending
+const atStop = stops;
+release(true); await tick();
+console.log(JSON.stringify({ during, atStop, after: stops }));
+"""
+    )
+    assert out["during"] == {"starts": 1, "stops": 0}
+    assert out["atStop"] == 1
+    assert out["after"] == 1
+
+
 def test_frame_capture_needs_a_workstream_to_belong_to() -> None:
     out = _run(
         """
