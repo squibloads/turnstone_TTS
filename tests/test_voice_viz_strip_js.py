@@ -197,6 +197,28 @@ console.log(JSON.stringify({ mounted: host.children.length, frames: log.cancelle
     assert out["active"] is False
 
 
+def test_a_hidden_strip_takes_no_place_in_the_panel() -> None:
+    # Showing the strip must add exactly one band and hiding it must give that
+    # band back, so the panel's other sections never move.
+    out = _run(
+        """
+const host = document.createElement("div");
+const children = document.createElement("div");
+children.className = "side-section";
+host.appendChild(children);
+const strip = createSpectrumStrip({ host, before: children });
+const before = host.children.length;
+strip.show();
+const shown = host.children.length;
+strip.hide();
+const hidden = host.children.length;
+console.log(JSON.stringify({ before, shown, hidden }));
+"""
+    )
+    assert out["shown"] == out["before"] + 1
+    assert out["hidden"] == out["before"]
+
+
 def test_the_frame_loop_runs_only_while_a_source_is_active() -> None:
     out = _run(
         """
