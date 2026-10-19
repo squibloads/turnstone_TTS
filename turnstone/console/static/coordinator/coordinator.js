@@ -6721,7 +6721,9 @@ function createCoordinatorPane(root, wsId, opts) {
 
   // The loop ends a spoken turn on the player's `done`; the run is created
   // before the reply has finished, so the bubble reference travels with it
-  // (currentAssistantEl is cleared at stream_end, before playback ends).
+  // (currentAssistantEl is cleared at stream_end, before playback ends).  A
+  // voice run's own done can settle while a later reply is still queued, so
+  // the loop is told only once the player reports idle.
   function _watchVoiceRun(run, replyEl) {
     if (!run || !run.done || typeof run.done.then !== "function") {
       // A run without `done` cannot say when it stops speaking.  Reopening the
@@ -6748,6 +6750,16 @@ function createCoordinatorPane(root, wsId, opts) {
         }
         voiceAwaitingReply = replyEl;
         _voiceSpeakAwaiting();
+        return;
+      }
+      // The loop reopens the mic on onPlaybackDone, so wait for the player's
+      // queue too: this run's `done` settles at its own last clip, but a
+      // queued reply may be about to start.  A player that predates idle()
+      // keeps the immediate behaviour instead of stranding the loop.
+      if (typeof ttsPlayer.idle === "function") {
+        ttsPlayer.idle().then(() => {
+          if (voiceModeOn && voiceLoop) voiceLoop.onPlaybackDone(r);
+        });
         return;
       }
       voiceLoop.onPlaybackDone(r);

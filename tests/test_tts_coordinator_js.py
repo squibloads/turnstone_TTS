@@ -310,3 +310,79 @@ def test_voice_roles_come_from_the_console_and_the_player_uses_its_base() -> Non
     assert re.search(r'const ttsPlayer = createTtsPlayer\(\{ base: "" \}\);', _COORD)
     assert 'getVoiceRoles("").then(_applyVoiceRoles)' in _body("  async function init() {")
     assert "/node/" not in _body("  function _addTtsActions() {")
+
+
+# --------------------------------------------------------------------------
+# The voice loop waits for the player's queue, not just this run's done
+# --------------------------------------------------------------------------
+
+
+def _run_watch(body: str, player_decl: str) -> Any:
+    """Run ``_watchVoiceRun`` with the handful of pane bindings it reads."""
+    watch = extract_braced(_COORD, "  function _watchVoiceRun(run, replyEl) {")
+    prelude = "\n".join(
+        (
+            "const calls = [];",
+            "const tick = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };",
+            "let voiceModeOn = true;",
+            "let voiceLoop = { onPlaybackDone(result) { calls.push(['done', result]); } };",
+            "let voiceAwaitingReply = null;",
+            "function _voiceNoDone() { calls.push('nodone'); }",
+            "function _voiceSpeakAwaiting() { calls.push('await'); return true; }",
+            player_decl,
+            watch,
+        )
+    )
+    src = (
+        prelude
+        + f"\n(async () => {{\n{body}\n}})().catch((e) => {{ console.error(e); process.exit(1); }});"
+    )
+    r = run_node_source(src)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def test_the_voice_loop_is_not_told_playback_ended_until_the_queue_drains() -> None:
+    out = _run_watch(
+        """
+const run = { done: Promise.resolve({ reason: "finished", heard: ["A sentence."] }) };
+_watchVoiceRun(run, null);
+await tick();
+const whileQueued = [...calls];
+idleResolve();
+await tick();
+console.log(JSON.stringify({ whileQueued, afterIdle: calls }));
+""",
+        "let idleResolve = null;\n"
+        "const ttsPlayer = { idle() { return new Promise((r) => { idleResolve = r; }); } };",
+    )
+    assert out["whileQueued"] == []
+    assert out["afterIdle"] == [["done", {"reason": "finished", "heard": ["A sentence."]}]]
+
+
+def test_a_player_without_idle_still_reports_playback_done_immediately() -> None:
+    out = _run_watch(
+        """
+const run = { done: Promise.resolve({ reason: "finished", heard: ["A sentence."] }) };
+_watchVoiceRun(run, null);
+await tick();
+console.log(JSON.stringify(calls));
+""",
+        "const ttsPlayer = {};",
+    )
+    assert out == [["done", {"reason": "finished", "heard": ["A sentence."]}]]
+
+
+def test_an_empty_hearing_still_takes_the_finished_reply_fallback() -> None:
+    # A stream that produced no audio is spoken through the finished-reply
+    # path; it must not wait on a queue that its own fallback play() clears.
+    out = _run_watch(
+        """
+const run = { done: Promise.resolve({ reason: "finished", heard: [] }) };
+_watchVoiceRun(run, {});
+await tick();
+console.log(JSON.stringify(calls));
+""",
+        "const ttsPlayer = { idle() { return new Promise(() => {}); } };",
+    )
+    assert out == ["await"]
