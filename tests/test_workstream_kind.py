@@ -286,6 +286,9 @@ def test_interactive_and_coordinator_tool_sets_overlap_only_on_dual_kind():
     # a child purely to ship a message.  ``read_resource``/``use_prompt``
     # joined in 1.8 (#725): coordinators get the full MCP surface —
     # tools, resources, prompts — persona-gated like every session.
+    # ``open_preview`` is deliberately NOT here: #1442 gives it to voice
+    # and interactive, not to the text coordinator, because voice is its
+    # own surface between coordinator and interactive.
     dual_kind = {"memory", "skills", "notify", "read_resource", "use_prompt"}
 
     overlap = interactive_names & coord_names

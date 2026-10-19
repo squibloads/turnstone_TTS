@@ -20,5 +20,18 @@
     },
     "required": ["target"]
   },
+  "coordinator": true,
+  "voice": true,
+  "interactive": true,
+  "kind_variants": {
+    "voice": {
+      "description": "Show the user rich content in the preview pane beside the conversation: an image, a PDF, a data table, or a text or markdown document. In a voice session, open only content the session can already reach: a local file path, or attachment:<id> for a file attached to the conversation. Do not open http(s) URLs — voice sessions do not browse the web, and a URL fetch is an approval-gated network call. If the user asks to see a web page, start a child to fetch it and preview the file the child produces. The result only confirms what was shown.",
+      "parameter_overrides": {
+        "target": {
+          "description": "A local file path or attachment:<id> for a file the user or a child produced. Do not pass an http(s) URL: a voice session does not browse the web; start a child to fetch a page instead."
+        }
+      }
+    }
+  },
   "primary_key": "target"
 }

@@ -60,8 +60,9 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        # 32 tool files total: 12 coordinator-only + voice_report (voice-only,
-        # still coordinator-kind metadata) + the rest interactive, with
+        # 32 tool files total: 12 coordinator-only + voice_report and
+        # open_preview (voice-and-interactive, off the text coordinator
+        # shelf) + the rest interactive, with
         # memory/skills/notify/read_resource/use_prompt dual-kind.
         assert len(TOOLS) == 32
 
@@ -72,11 +73,13 @@ class TestToolsMetadata:
         # 17 = the plain coordinator surface.  voice_report carries
         # coordinator-kind metadata but is voice-only, and
         # wait_for_workstream is voice-excluded; the two lists trade exactly
-        # one tool each way (pinned in test_voice_reports.py).
+        # one tool that way (pinned in test_voice_reports.py).  Voice also
+        # has open_preview (#1442), which the text coordinator does NOT get —
+        # voice is its own surface between coordinator and interactive.
         from turnstone.core.tools import COORDINATOR_TOOLS, VOICE_COORDINATOR_TOOLS
 
         assert len(COORDINATOR_TOOLS) == 17
-        assert len(VOICE_COORDINATOR_TOOLS) == 17
+        assert len(VOICE_COORDINATOR_TOOLS) == 18
         assert {t["function"]["name"] for t in COORDINATOR_TOOLS} == {
             "spawn_workstream",
             "spawn_batch",
