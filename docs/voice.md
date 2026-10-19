@@ -800,7 +800,7 @@ them.
 | Setting | Default | Range | Effect |
 |---------|---------|-------|--------|
 | `coordinator.voice_max_agents_per_turn` | `1` | 0–10 | Child agents one spoken turn may start. A further spawn call is refused with a note telling the model to ask you first. `0` stops voice sessions starting agents at all. |
-| `coordinator.voice_max_requested_agents` | `4` | 0–10 | Ceiling on the agent count a turn may name; the turn's budget is that count, never more than this and never less than `coordinator.voice_max_agents_per_turn`. |
+| `coordinator.voice_max_requested_agents` | `4` | 0–10 | Ceiling on the budget a turn may take from a count you name; the budget is that count, never more than this and never less than `coordinator.voice_max_agents_per_turn`. |
 | `coordinator.voice_child_model` | `deepseek-flash-high` | any model alias; empty means the normal default | Model an agent starts on when the voice coordinator names none. |
 
 The default cap is one because spoken asides are easy to mistake for
