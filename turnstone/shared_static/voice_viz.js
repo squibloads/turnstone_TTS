@@ -163,8 +163,11 @@ export function createSpectrumStrip(opts) {
   const sources = new Map();
   // element -> its media-element source.  A source is allowed only once per
   // element and the player reuses one element for every clip of a run, so the
-  // source lives as long as the element, never as long as the clip.
+  // source lives as long as the element, never as long as the clip.  `routed`
+  // tracks which of those sources currently reach the speakers, so a finished
+  // run can leave the graph without ever muting a running one.
   const elementSources = new WeakMap();
+  const routed = new WeakSet();
   // A reply's element waiting for the shared context to start.  Routing it
   // into a suspended context would send its audio to a graph that is not
   // running, muting the reply, so native playback is left alone until then.
@@ -197,12 +200,21 @@ export function createSpectrumStrip(opts) {
     return new Uint8Array(analyser.frequencyBinCount);
   }
 
-  function _attachSource(key, node) {
+  function _attachSource(key, node, el2) {
     detach(key);
     const analyser = _analyse(node);
     const ctx = _audioContext();
+    // A media-element source is the reply's only route to the speakers (the
+    // element is detached from the output by createMediaElementSource), so it
+    // is connected here.  Connecting is idempotent; `routed` keeps a re-attach
+    // from depending on that.
+    if (el2 && !routed.has(node)) {
+      node.connect(ctx.destination);
+      routed.add(node);
+    }
     sources.set(key, {
       node,
+      el2,
       analyser,
       bins: _binsFor(analyser),
       ranges: barBinRanges(barCount, ctx.sampleRate, VIZ_FFT_SIZE),
@@ -271,12 +283,9 @@ export function createSpectrumStrip(opts) {
         return;
       }
       node = ctx.createMediaElementSource(el2);
-      // Required, not optional: a media-element source detaches the element
-      // from the output, so this graph is then the only route to the speakers.
-      node.connect(ctx.destination);
       elementSources.set(el2, node);
     }
-    _attachSource(key, node);
+    _attachSource(key, node, el2);
     setSpeaker(key);
   }
 
@@ -300,6 +309,20 @@ export function createSpectrumStrip(opts) {
     const src = sources.get(key);
     if (src) {
       _releaseBranch(src);
+      // A media-element source owns the reply's route to the speakers.  Once
+      // the element has stopped, release it so runs do not accumulate in the
+      // graph; a still-playing element keeps its route (the strip can leave
+      // while a clicked reply is mid-sentence) and reconnects on a re-attach.
+      if (src.el2 && (src.el2.paused === true || src.el2.ended === true)) {
+        if (routed.has(src.node)) {
+          try {
+            src.node.disconnect();
+          } catch (e) {
+            /* the route was already released */
+          }
+          routed.delete(src.node);
+        }
+      }
       sources.delete(key);
       if (sources.size === 0) _cancelFrame();
     }
@@ -479,7 +502,13 @@ export function createSpectrumStrip(opts) {
     }
     _unwatchTheme();
     _clearPendingAudio();
-    for (const key of [...sources.keys()]) detach(key);
+    for (const key of [...sources.keys()]) {
+      const src = sources.get(key);
+      // A reply that is still playing keeps its speaker route after the strip
+      // leaves: the player reports its release later, which detaches it then.
+      if (src && src.el2 && src.el2.paused !== true && src.el2.ended !== true) continue;
+      detach(key);
+    }
     if (el.parentNode) el.parentNode.removeChild(el);
   }
 

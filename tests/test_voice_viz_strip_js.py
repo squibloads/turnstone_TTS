@@ -35,7 +35,7 @@ _MODULE = (
 # Fakes for the browser surface the strip touches.  `log` records what the
 # module asked for, so each test can assert on requests rather than pixels.
 _FAKES = r"""
-const log = { frames: [], cancelled: [], contexts: 0, analysers: 0, analyserList: [], connects: [], sourcesMade: 0, streamSourcesMade: 0, liveBranches: 0, gets: 0, invalidFills: [], transforms: [], observers: [], stateChanges: 0 };
+const log = { frames: [], cancelled: [], contexts: 0, analysers: 0, analyserList: [], connects: [], sourcesMade: 0, streamSourcesMade: 0, liveBranches: 0, destLive: 0, gets: 0, invalidFills: [], transforms: [], observers: [], stateChanges: 0 };
 const dest = { kind: "destination" };
 let fps = [];
 // The browser surface the tests vary: the device pixel ratio the canvas must
@@ -89,15 +89,31 @@ class FakeContext {
     if (elementSourceThrows) throw new Error("InvalidStateError: the element already has a media-element source");
     log.sourcesMade++;
     const n = {
-      kind: "element-source", el, branches: new Set(),
+      kind: "element-source", el, branches: new Set(), destConnected: false,
       connect(t) {
         log.connects.push(["element-source", t === dest ? "destination" : "other"]);
-        // Only analyser branches are tracked as live; the destination route is
-        // the speaker path and is never torn down by a re-attach.
-        if (t !== dest) { this.branches.add(t); log.liveBranches = this.branches.size; }
+        // Only analyser branches are tracked as live branches; the destination
+        // route is the speaker path, counted separately so a test can see
+        // whether a finished reply left anything in the graph.
+        if (t === dest) {
+          if (!this.destConnected) { this.destConnected = true; log.destLive++; }
+        } else {
+          this.branches.add(t);
+          log.liveBranches = this.branches.size;
+        }
         return t;
       },
-      disconnect(t) { if (t) this.branches.delete(t); else this.branches.clear(); log.liveBranches = this.branches.size; },
+      disconnect(t) {
+        if (t === dest) {
+          if (this.destConnected) { this.destConnected = false; log.destLive--; }
+        } else if (t) {
+          this.branches.delete(t);
+        } else {
+          if (this.destConnected) { this.destConnected = false; log.destLive--; }
+          this.branches.clear();
+        }
+        log.liveBranches = this.branches.size;
+      },
     };
     return n;
   }
@@ -511,6 +527,51 @@ console.log(JSON.stringify({ threw, speaker: strip.colourFor(), active: strip.is
     assert out["threw"] is False
     assert out["speaker"] == "#e5a042"
     assert out["active"] is False
+
+
+def test_a_finished_reply_releases_its_route_to_the_speakers() -> None:
+    # A media-element source owns the only route to the speakers, so it must
+    # stay connected while the reply plays.  Once the player pauses the element
+    # and releases it, the route has to go too, or every reply leaves a live
+    # node in the audio graph for the life of the page.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+await strip.resumeFromGesture();
+const el = { src: "", paused: false, ended: false, play() {} };
+strip.attachAudio(el, "ai");
+const playing = log.destLive;
+el.paused = true;          // the player pauses before releasing the element
+strip.detach("ai");
+console.log(JSON.stringify({ playing, after: log.destLive }));
+"""
+    )
+    assert out["playing"] == 1
+    assert out["after"] == 0
+
+
+def test_hiding_the_strip_never_mutes_a_reply_that_is_still_playing() -> None:
+    # Turning voice mode off must not cut a reply short: the strip leaves, but
+    # a playing element keeps its route until the player reports its release.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+await strip.resumeFromGesture();
+const el = { src: "", paused: false, ended: false, play() {} };
+strip.attachAudio(el, "ai");
+strip.hide();
+const hidden = { live: log.destLive, active: strip.isActive() };
+el.paused = true;          // the run ends after the strip is gone
+strip.detach("ai");
+console.log(JSON.stringify({ hidden, after: log.destLive }));
+"""
+    )
+    assert out["hidden"] == {"live": 1, "active": False}
+    assert out["after"] == 0
 
 
 def test_the_audio_context_is_resumed_only_from_a_gesture() -> None:
