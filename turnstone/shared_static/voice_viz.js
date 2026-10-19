@@ -158,8 +158,9 @@ export function createSpectrumStrip(opts) {
   canvas.className = "voice-viz-canvas";
   el.appendChild(canvas);
 
-  // source -> { node, analyser, ranges, bins } for each attached source.  The
-  // key is the speaker, so one source per speaker is live at a time.
+  // source -> { node, el2, analyser, ranges, bins } for each attached source.
+  // The key is the speaker, so one source per speaker is live at a time;
+  // `el2` is set only for a media-element source, whose route it also owns.
   const sources = new Map();
   // element -> its media-element source.  A source is allowed only once per
   // element and the player reuses one element for every clip of a run, so the
@@ -258,30 +259,30 @@ export function createSpectrumStrip(opts) {
 
   function _tapElement(el2, key) {
     const ctx = _audioContext();
+    if (ctx.state !== "running") {
+      // The context cannot process anything yet, and routing the element into
+      // it would mute the reply.  Leave native playback alone and tap the
+      // element once the Voice click (or another gesture) resumes the context.
+      _clearPendingAudio();
+      pendingAudio = { el: el2, key };
+      if (typeof ctx.addEventListener === "function") {
+        stateListener = () => {
+          const pending = pendingAudio;
+          _clearPendingAudio();
+          if (!pending || ctx.state !== "running") return;
+          try {
+            _tapElement(pending.el, pending.key);
+          } catch (e) {
+            /* see attachAudio */
+          }
+        };
+        ctx.addEventListener("statechange", stateListener);
+      }
+      setSpeaker(key);
+      return;
+    }
     let node = elementSources.get(el2);
     if (!node) {
-      if (ctx.state !== "running") {
-        // The context cannot process anything yet.  Leave the element on its
-        // native playback path and tap it once the Voice click (or any other
-        // gesture the coordinator uses) resumes the context.
-        _clearPendingAudio();
-        pendingAudio = { el: el2, key };
-        if (typeof ctx.addEventListener === "function") {
-          stateListener = () => {
-            const pending = pendingAudio;
-            _clearPendingAudio();
-            if (!pending || ctx.state !== "running") return;
-            try {
-              _tapElement(pending.el, pending.key);
-            } catch (e) {
-              /* see attachAudio */
-            }
-          };
-          ctx.addEventListener("statechange", stateListener);
-        }
-        setSpeaker(key);
-        return;
-      }
       node = ctx.createMediaElementSource(el2);
       elementSources.set(el2, node);
     }
