@@ -4048,9 +4048,10 @@ def test_copy_button_survives_retry_teardown_in_both_clients() -> None:
     start = _pane_method_offset(interactive, "_attachRetryToLastAssistant")
     end = _pane_method_offset(interactive, "announceToolBlock")
     teardown = interactive[start:end]
-    assert '".msg-retry-btn"' in teardown and ".msg-tts-btn" not in teardown.split(
-        "_addTtsActionsToFinished"
-    )[0], (
+    assert (
+        '".msg-retry-btn"' in teardown
+        and ".msg-tts-btn" not in teardown.split("_addTtsActionsToFinished")[0]
+    ), (
         "interactive teardown must remove only the transient retry button by class; "
         "the read-aloud button belongs to every finished reply"
     )
