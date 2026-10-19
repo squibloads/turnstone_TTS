@@ -463,6 +463,10 @@ export function createSpectrumStrip(opts) {
       document.addEventListener("visibilitychange", _onVisibility);
     }
     _watchTheme();
+    // One resting frame: the strip shows its muted floor line immediately (and
+    // a theme applied while it was hidden is painted, not left stale).  The
+    // frame loop itself still waits for a source.
+    _draw();
     _scheduleFrame();
   }
 

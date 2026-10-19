@@ -556,6 +556,23 @@ console.log(JSON.stringify({ rects: draws.rects, fills: [...new Set(draws.fills)
     assert out["invalidFills"] == []
 
 
+def test_showing_the_strip_paints_the_resting_floor_line() -> None:
+    # An idle-but-shown strip is a flat muted line, not an empty box: it is
+    # painted on show, before any source exists, so the documentation's "flat
+    # grey line means nobody is talking" is what the user actually sees.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+draws.rects = 0; draws.fills = [];
+strip.show();
+console.log(JSON.stringify({ rects: draws.rects, fills: [...new Set(draws.fills)] }));
+"""
+    )
+    assert out["rects"] == 64
+    assert out["fills"] == ["#8a93ad"]
+
+
 def test_stop_releases_the_theme_observer() -> None:
     # The observer watches the document root, so it must not outlive the strip
     # any more than the visibility listener does.
