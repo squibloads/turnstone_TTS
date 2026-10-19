@@ -177,6 +177,11 @@ export function loadVad() {
 //   onState    optional (state) => void; "recording" | "transcribing" |
 //              "idle" on every change; a repeated state is not re-announced
 //              and construction is not a change (the controller starts idle).
+//   onStream   optional (stream | null) => void; the live microphone stream
+//              once capture has started, and null when it is released.  Only
+//              the page's analyser reads it, never the destination, so the
+//              mic is never echoed back.  A denied or aborted capture never
+//              hands one over.
 //   loadVad    optional detector loader (tests / a pane with its own source);
 //              resolves to { watch(stream, onProbability) -> { stop() } } or
 //              null.  Defaults to the vendored build.
@@ -290,6 +295,8 @@ export function createMicController(opts) {
     if (stream) {
       stream.getTracks().forEach((t) => t.stop());
       stream = null;
+      // Only a real release is announced, so a repeated teardown is silent.
+      if (typeof opts.onStream === "function") opts.onStream(null);
     }
     recorder = null;
   }
@@ -502,6 +509,9 @@ export function createMicController(opts) {
           return;
         }
         stream = s;
+        // The live stream is handed out once it is adopted, after the abort
+        // latch, so a listener never sees a stream the controller discards.
+        if (typeof opts.onStream === "function") opts.onStream(s);
         let mimeType = "";
         for (let i = 0; i < _MIME_CANDIDATES.length; i++) {
           if (

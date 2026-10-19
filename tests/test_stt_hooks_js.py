@@ -231,3 +231,43 @@ console.log(JSON.stringify({
     assert out["toasts"] == [["Microphone access was denied", "error"]]
     assert out["afterDenied"] == 1
     assert out["states"] == ["recording", "idle"]
+
+
+def test_on_stream_hands_over_the_mic_stream_on_start_and_null_on_release() -> None:
+    # The spectrum strip analyses the live microphone.  It gets the stream the
+    # moment capture starts, and is told when the stream is released, so it never
+    # reads a stream the mic no longer owns.
+    out = _run(
+        """
+const seen = [];
+const m = createMicController({
+  composer: makeComposer(), base: "", wsId: "w",
+  onStream: (s) => seen.push(s === null ? "null" : (s && s.getTracks ? "stream" : typeof s)),
+});
+m.start(); await tick();
+const whileRecording = seen.slice();
+m.stop(true); await tick();
+console.log(JSON.stringify({ whileRecording, seen }));
+"""
+    )
+    # Construction is not a change; capture hands over a stream; release says null.
+    assert out["whileRecording"] == ["stream"]
+    assert out["seen"] == ["stream", "null"]
+
+
+def test_on_stream_is_not_called_for_a_denied_capture() -> None:
+    # A stream that never opens must not be handed over: a denied start has no
+    # microphone to analyse, so the strip must see nothing.
+    out = _run(
+        """
+const seen = [];
+const m = createMicController({
+  composer: makeComposer(), base: "", wsId: "w",
+  onStream: (s) => seen.push(s === null ? "null" : "stream"),
+});
+fake.gum = "deny";
+m.start(); await tick();
+console.log(JSON.stringify({ seen }));
+"""
+    )
+    assert out["seen"] == []
