@@ -68,3 +68,32 @@ def test_child_model_setting() -> None:
     d = validate_key("coordinator.voice_child_model")
     assert (d.type, d.section, d.default) == ("str", "coordinator", "deepseek-flash-high")
     assert d.help and d.reference_url.startswith(VOICE_DOCS_URL + "#")
+
+
+def test_voice_model_role_settings() -> None:
+    """The two Voice roles sit beside their Coordinator counterparts and use
+    the same value shapes, so the Models → Roles row can be a straight copy."""
+    model = validate_key("coordinator.voice_model_alias")
+    assert (model.type, model.section, model.default) == ("str", "coordinator", "")
+    assert model.help
+    assert model.reference_url == VOICE_DOCS_URL + "#voice-model-role"
+
+    effort = validate_key("coordinator.voice_reasoning_effort")
+    assert (effort.type, effort.section, effort.default) == ("str", "coordinator", "")
+    assert effort.help
+    assert effort.reference_url == VOICE_DOCS_URL + "#voice-reasoning-effort"
+    # Same choices as the Coordinator effort role: empty is "use Coordinator",
+    # and the literal values match the shared effort vocabulary.
+    assert effort.choices == [
+        "",
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    validate_value("coordinator.voice_reasoning_effort", "high")
+    with pytest.raises(ValueError):
+        validate_value("coordinator.voice_reasoning_effort", "extreme")

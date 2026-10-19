@@ -214,6 +214,8 @@ _EXPECTED_AFFECTING_KEYS = frozenset(
         "model.task_effort",
         "coordinator.model_alias",
         "coordinator.reasoning_effort",
+        "coordinator.voice_model_alias",
+        "coordinator.voice_reasoning_effort",
         "judge.model",
         "channels.default_model_alias",
     }

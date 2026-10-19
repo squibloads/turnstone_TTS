@@ -1323,6 +1323,34 @@ def _build_registry() -> dict[str, SettingDef]:
             "Use ‘none’ to disable reasoning where the model supports that.",
         ),
         SettingDef(
+            "coordinator.voice_model_alias",
+            "str",
+            "",
+            "Model alias used for voice-persona coordinator sessions",
+            "coordinator",
+            help="Which model alias coordinators created with the voice persona run on. "
+            "When empty, a voice session falls back to the ordinary coordinator chain: "
+            "coordinator.model_alias, then model.default_alias, then the console's "
+            "[model].default. A model chosen for one session in the launcher still wins "
+            "over this role. When this alias names a model that isn't loaded, creating "
+            "the voice session fails instead of using another model.",
+            reference_url=VOICE_DOCS_URL + "#voice-model-role",
+        ),
+        SettingDef(
+            "coordinator.voice_reasoning_effort",
+            "str",
+            "",
+            "Reasoning effort for voice coordinator sessions (empty = use the Coordinator setting)",
+            "coordinator",
+            choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            help="Reasoning effort for coordinators created with the voice persona. When "
+            "empty (the default), a voice session uses coordinator.reasoning_effort and "
+            "then the normal global/model ladder. A value set here applies only to voice "
+            "sessions; text coordinators keep their own setting. Use ‘none’ to disable "
+            "reasoning where the model supports that.",
+            reference_url=VOICE_DOCS_URL + "#voice-reasoning-effort",
+        ),
+        SettingDef(
             "coordinator.max_active",
             "int",
             5,

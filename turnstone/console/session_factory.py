@@ -29,6 +29,7 @@ from turnstone.core.model_turn import (
     resolve_temperature_setting,
 )
 from turnstone.core.session import ChatSession
+from turnstone.core.voice_config import is_voice_persona
 from turnstone.core.workstream import WorkstreamKind
 from turnstone.prompts import ClientType
 
@@ -121,8 +122,18 @@ def build_console_session_factory(
         # Anthropic/Google-backed.  See
         # :func:`turnstone.console.coordinator_alias.resolve_coordinator_alias`
         # for the three-tier chain shared with the placeholder API.
+        # The persona is the only voice signal the factory gets: a voice
+        # coordinator is an ordinary coordinator by kind, so both role settings
+        # below key off the stamp.  An explicit per-session model keeps priority
+        # over the role.
+        voice = persona_snapshot is not None and is_voice_persona(persona_snapshot.name)
+        explicit_alias = model_alias
+        if voice and not (explicit_alias or "").strip():
+            # Empty voice role means the ordinary coordinator chain, so route
+            # it through the same resolver instead of restating the tiers.
+            explicit_alias = config_store.get("coordinator.voice_model_alias") or ""
         effective_alias = resolve_coordinator_alias(
-            explicit=model_alias,
+            explicit=explicit_alias,
             config_store=config_store,
             registry=registry,
         )
@@ -205,9 +216,16 @@ def build_console_session_factory(
             if r_cfg.max_tokens is not None
             else config_store.get("model.max_tokens")
         )
-        eff_reasoning_effort = resolve_effort_setting(
-            r_cfg, config_store, role_key="coordinator.reasoning_effort"
-        )
+        # Voice gets its own rung, but only when it names one: the shared
+        # resolver treats an empty role key as "fall through to the global
+        # rung", which would skip the Coordinator setting the voice role is
+        # documented to inherit from.
+        effort_role_key = "coordinator.reasoning_effort"
+        if voice:
+            voice_effort = (config_store.get("coordinator.voice_reasoning_effort") or "").strip()
+            if voice_effort:
+                effort_role_key = "coordinator.voice_reasoning_effort"
+        eff_reasoning_effort = resolve_effort_setting(r_cfg, config_store, role_key=effort_role_key)
 
         coord_client = coord_client_factory(ws_id or "", uid)
 

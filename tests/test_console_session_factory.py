@@ -105,6 +105,13 @@ def _invoke(factory: Any, **factory_kwargs: Any) -> None:
         factory(ui, **factory_kwargs)
 
 
+def _persona(name: str) -> Any:
+    """A minimal persona stamp, the way session_routes hands one to the factory."""
+    from turnstone.core.personas import PersonaSnapshot
+
+    return PersonaSnapshot(name=name, prompt="", tools=None, mcp=False, memory=False)
+
+
 # ---------------------------------------------------------------------------
 # Tier 1 — explicit pin (per-call arg or coordinator.model_alias)
 # ---------------------------------------------------------------------------
@@ -165,6 +172,109 @@ def test_per_call_model_alias_arg_passed_through_unvalidated() -> None:
     )
     _invoke(factory, model_alias="ghost")
     assert registry.captured_alias == "ghost"
+
+
+# ---------------------------------------------------------------------------
+# Voice persona — model role (coordinator.voice_model_alias)
+# ---------------------------------------------------------------------------
+
+
+def test_voice_model_alias_wins_for_a_voice_persona() -> None:
+    factory, registry = _build_factory(
+        known_aliases={"voice-pin", "coord-pin", "admin-default", "registry-default"},
+        settings={
+            "coordinator.voice_model_alias": "voice-pin",
+            "coordinator.model_alias": "coord-pin",
+            "model.default_alias": "admin-default",
+        },
+    )
+    _invoke(factory, persona_snapshot=_persona("voice"))
+    assert registry.captured_alias == "voice-pin"
+
+
+def test_voice_model_alias_falls_back_to_the_coordinator_pin() -> None:
+    factory, registry = _build_factory(
+        known_aliases={"coord-pin", "admin-default", "registry-default"},
+        settings={
+            "coordinator.voice_model_alias": "",
+            "coordinator.model_alias": "coord-pin",
+            "model.default_alias": "admin-default",
+        },
+    )
+    _invoke(factory, persona_snapshot=_persona("voice"))
+    assert registry.captured_alias == "coord-pin"
+
+
+def test_voice_model_alias_falls_back_through_the_coordinator_chain() -> None:
+    """Empty voice role means the ordinary coordinator chain, not a short cut
+    to the registry default."""
+    factory, registry = _build_factory(
+        known_aliases={"admin-default", "registry-default"},
+        settings={
+            "coordinator.voice_model_alias": "",
+            "coordinator.model_alias": "",
+            "model.default_alias": "admin-default",
+        },
+    )
+    _invoke(factory, persona_snapshot=_persona("voice"))
+    assert registry.captured_alias == "admin-default"
+
+
+def test_non_voice_persona_ignores_the_voice_model_alias() -> None:
+    factory, registry = _build_factory(
+        known_aliases={"voice-pin", "coord-pin", "registry-default"},
+        settings={
+            "coordinator.voice_model_alias": "voice-pin",
+            "coordinator.model_alias": "coord-pin",
+        },
+    )
+    _invoke(factory, persona_snapshot=_persona("engineer"))
+    assert registry.captured_alias == "coord-pin"
+
+
+def test_per_call_model_alias_still_wins_for_a_voice_persona() -> None:
+    factory, registry = _build_factory(
+        known_aliases={"per-call", "voice-pin", "registry-default"},
+        settings={"coordinator.voice_model_alias": "voice-pin"},
+    )
+    _invoke(factory, model_alias="per-call", persona_snapshot=_persona("voice"))
+    assert registry.captured_alias == "per-call"
+
+
+def test_unknown_voice_model_alias_is_passed_through_unvalidated() -> None:
+    """Same #1359 contract as the coordinator pin: a stale/typo'd voice role
+    reaches resolve_binding so the create fails with model_not_loaded instead
+    of silently launching on the coordinator fallback."""
+    factory, registry = _build_factory(
+        known_aliases={"coord-pin", "registry-default"},
+        settings={
+            "coordinator.voice_model_alias": "voice-ghost",
+            "coordinator.model_alias": "coord-pin",
+        },
+    )
+    _invoke(factory, persona_snapshot=_persona("voice"))
+    assert registry.captured_alias == "voice-ghost"
+
+
+def test_unknown_voice_model_alias_preserves_registry_value_error() -> None:
+    registry = MagicMock()
+    registry.default = "default"
+    registry.resolve_binding.side_effect = ValueError("Unknown model alias: voice-ghost")
+    factory = build_console_session_factory(
+        registry=registry,
+        config_store=_FakeConfigStore(
+            {"coordinator.voice_model_alias": "voice-ghost"},
+        ),  # type: ignore[arg-type]
+        node_id="console",
+        coord_client_factory=lambda ws_id, uid: MagicMock(),
+    )
+    ui = MagicMock()
+    ui._user_id = ""
+
+    with pytest.raises(ValueError, match=r"^Unknown model alias: voice-ghost$"):
+        factory(ui, persona_snapshot=_persona("voice"))
+
+    registry.resolve_binding.assert_called_once_with("voice-ghost")
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +409,7 @@ def _capture_chatsession_kwargs(
     settings: dict[str, Any],
     mcp_client_getter: Any = None,
     getter_passed: bool = True,
+    **factory_kwargs: Any,
 ) -> Any:
     """Run the factory through to a (patched) ChatSession and return the
     captured construction kwargs.  ChatSession's own contract is covered
@@ -320,7 +431,7 @@ def _capture_chatsession_kwargs(
     ui = MagicMock()
     ui._user_id = ""
     with patch("turnstone.console.session_factory.ChatSession") as cs:
-        factory(ui, ws_id="w1")
+        factory(ui, ws_id="w1", **factory_kwargs)
     assert cs.call_count == 1
     return cs.call_args.kwargs
 
@@ -383,3 +494,52 @@ def test_mcp_getter_resolved_per_construction() -> None:
         second = cs.call_args.kwargs["mcp_client"]
     assert first is None
     assert second is manager
+
+
+# ---------------------------------------------------------------------------
+# Voice persona - reasoning effort (coordinator.voice_reasoning_effort)
+# ---------------------------------------------------------------------------
+
+
+def test_voice_reasoning_effort_wins_for_a_voice_persona() -> None:
+    got = _capture_chatsession_kwargs(
+        settings={
+            "coordinator.voice_reasoning_effort": "high",
+            "coordinator.reasoning_effort": "low",
+        },
+        persona_snapshot=_persona("voice"),
+    )
+    assert got["reasoning_effort"] == "high"
+
+
+def test_voice_reasoning_effort_falls_back_to_the_coordinator_setting() -> None:
+    got = _capture_chatsession_kwargs(
+        settings={
+            "coordinator.voice_reasoning_effort": "",
+            "coordinator.reasoning_effort": "low",
+        },
+        persona_snapshot=_persona("voice"),
+    )
+    assert got["reasoning_effort"] == "low"
+
+
+def test_voice_reasoning_effort_empty_falls_through_the_shared_ladder() -> None:
+    got = _capture_chatsession_kwargs(
+        settings={
+            "coordinator.voice_reasoning_effort": "",
+            "coordinator.reasoning_effort": "",
+        },
+        persona_snapshot=_persona("voice"),
+    )
+    assert got["reasoning_effort"] is None
+
+
+def test_non_voice_persona_ignores_the_voice_reasoning_effort() -> None:
+    got = _capture_chatsession_kwargs(
+        settings={
+            "coordinator.voice_reasoning_effort": "high",
+            "coordinator.reasoning_effort": "low",
+        },
+        persona_snapshot=_persona("engineer"),
+    )
+    assert got["reasoning_effort"] == "low"

@@ -10412,6 +10412,8 @@ _MODEL_AFFECTING_SETTING_KEYS: frozenset[str] = frozenset(
         "model.task_effort",
         "coordinator.model_alias",
         "coordinator.reasoning_effort",
+        "coordinator.voice_model_alias",
+        "coordinator.voice_reasoning_effort",
         "judge.model",
         "channels.default_model_alias",
     }
@@ -14230,6 +14232,7 @@ _FAIL_CLOSED_ROUTING_KEYS: tuple[str, ...] = (
     "model.default_alias",
     "model.task_alias",
     "coordinator.model_alias",
+    "coordinator.voice_model_alias",
     "channels.default_model_alias",
 )
 

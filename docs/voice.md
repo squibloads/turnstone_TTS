@@ -747,9 +747,11 @@ change the other.
 A voice session is a coordinator created with the `voice` persona. Use it when
 the conversation is spoken rather than typed: you talk to it, its replies are
 read aloud, and it is expected to answer briefly instead of producing a
-document. It is a coordinator persona, so start it from the console's
-**Coordinator** launcher with **Voice** selected in the persona picker, or
-pass `persona` on `POST /v1/api/workstreams/new`:
+document. Start it from the console dashboard's **Voice** tab: the tab forces
+the persona, and the optional opening line you type becomes the session's
+first message. The same create is available from the **Coordinator** tab with
+**Voice** selected in the persona picker, or by passing `persona` on
+`POST /v1/api/workstreams/new`:
 
 ```json
 {"persona": "voice", "initial_message": "What needs my attention today?"}
@@ -772,6 +774,37 @@ just does not volunteer one.
 It also starts background agents only when you ask for work, not when you
 think out loud. A voice session is easy to talk to in asides, and an aside
 like "I wonder whether the tests pass" should not turn into a fan-out.
+
+### Voice model role
+
+`coordinator.voice_model_alias` · default empty (use the Coordinator model) · set in **Models → Roles**
+
+The model alias coordinators created with the `voice` persona run on. It is a
+role, not a per-session pick: the **Voice** row in Models → Roles sets the
+default for every voice session. When empty, a voice session walks the ordinary
+coordinator chain — `coordinator.model_alias`, then `model.default_alias`, then
+the console's `[model].default`. A model chosen for one session in the launcher
+still wins over the role.
+
+Point it at a smaller or faster model when spoken turns should feel immediate;
+leave it empty when voice and text coordinators share a model. Like the
+Coordinator role, the alias is not checked against what is loaded: a stale or
+misspelled value makes creating the voice session fail with
+`model_not_loaded` instead of quietly launching on another model.
+
+### Voice reasoning effort
+
+`coordinator.voice_reasoning_effort` · default empty (use the Coordinator setting) · set in **Models → Roles**
+
+Reasoning effort for voice-persona coordinators, using the same choices as the
+Coordinator role. When empty, a voice session uses `coordinator.reasoning_effort`
+and then the normal ladder: the model's own setting, `model.reasoning_effort`,
+and the model's declared or serving-side default. A value set here applies only
+to voice sessions; text coordinators keep their own setting.
+
+Spoken turns are usually short and latency-sensitive, so a lower value than the
+Coordinator role is often the right trade. Use `none` to disable reasoning
+where the model supports that.
 
 ### Voice memories
 

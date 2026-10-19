@@ -36,16 +36,45 @@ def test_voice_doc_documents_the_persona_subsections() -> None:
     slugs = heading_slugs(_voice_text())
     assert "voice-memories" in slugs
     assert "starting-agents" in slugs
+    assert "voice-model-role" in slugs
+    assert "voice-reasoning-effort" in slugs
 
 
 def test_voice_doc_names_the_persona_settings() -> None:
     text = _voice_text()
     for key in (
+        "coordinator.voice_model_alias",
+        "coordinator.voice_reasoning_effort",
         "coordinator.voice_max_agents_per_turn",
         "coordinator.voice_max_requested_agents",
         "coordinator.voice_child_model",
     ):
         assert key in text, f"docs/voice.md must name {key}"
+
+
+def test_voice_coordinator_settings_link_to_real_headings() -> None:
+    """Every coordinator.voice_* "learn more" link must land on a heading in
+    docs/voice.md — the audio.* sweep in test_voice_docs.py does not cover the
+    coordinator-scoped voice roles."""
+    from turnstone.core.settings_registry import SETTINGS
+    from turnstone.core.voice_config import VOICE_DOCS_URL
+
+    slugs = heading_slugs(_voice_text())
+    prefix = VOICE_DOCS_URL + "#"
+    keys = [key for key in SETTINGS if key.startswith("coordinator.voice_")]
+    assert keys, "positive control: the registry has coordinator.voice_* settings"
+    problems: list[str] = []
+    for key in keys:
+        defn = SETTINGS[key]
+        if not defn.help.strip():
+            problems.append(f"{key}: empty help")
+        if not defn.reference_url.startswith(prefix):
+            problems.append(f"{key}: reference_url {defn.reference_url!r} lacks {prefix!r}")
+            continue
+        anchor = defn.reference_url[len(prefix) :]
+        if anchor not in slugs:
+            problems.append(f"{key}: anchor #{anchor} is not a heading in docs/voice.md")
+    assert not problems, "\n".join(problems)
 
 
 def test_memory_doc_says_voice_sessions_use_the_interactive_scopes() -> None:
