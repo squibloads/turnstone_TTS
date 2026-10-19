@@ -76,6 +76,14 @@ export function barLevels(bins, ranges) {
   return levels;
 }
 
+// How a bar moves between frames.  A bar rises at once with the sound but falls
+// by a fraction of its height each frame, so it settles to the floor rather
+// than snapping; the falling peak marker holds the recent maximum and drops more
+// slowly still, so a burst stays readable after the bar has fallen.  The fall
+// rates are per-frame fractions: about 60 frames is a second at refresh rate.
+const VIZ_BAR_FALL = 0.18;
+const VIZ_PEAK_FALL = 0.02;
+
 // Colour follows who is speaking.  Both are console tokens from base.css: the
 // AI is the accent, the user the muted grey-blue, and silence settles to the
 // same muted token as a flat line.  No palette of its own.
@@ -135,6 +143,8 @@ export function createSpectrumStrip(opts) {
   let speaker = null;
   let frameId = null;
   let levels = new Array(barCount).fill(0);
+  // The falling peak markers, one per bar, carried across frames.
+  let peaks = new Array(barCount).fill(0);
 
   function _analyse(node) {
     const ctx = _audioContext();
@@ -249,9 +259,21 @@ export function createSpectrumStrip(opts) {
   // every bar at its floor, so an idle strip is a visible baseline, not a gap.
   // Reduced motion paints a single meter bar that spans the strip's width.
   function _draw() {
+    // The live reading for this frame: the spectrum of the one speaking, or
+    // silence when nothing is attached, so the bars still fall to the floor.
+    let target = new Array(barCount).fill(0);
     for (const src of sources.values()) {
       src.analyser.getByteFrequencyData(src.bins);
-      levels = barLevels(src.bins, src.ranges);
+      target = barLevels(src.bins, src.ranges);
+    }
+    for (let i = 0; i < barCount; i++) {
+      const t = target[i] || 0;
+      // A bar rises with the sound and falls toward it, so it settles.
+      levels[i] = t >= levels[i] ? t : levels[i] - (levels[i] - t) * VIZ_BAR_FALL;
+      // The marker jumps to any new height and otherwise falls more slowly.
+      // Clamped at the floor: an unclamped fall runs below zero and draws the
+      // marker above the canvas.
+      peaks[i] = levels[i] >= peaks[i] ? levels[i] : Math.max(0, peaks[i] - VIZ_PEAK_FALL);
     }
     const ctx2d = canvas.getContext("2d");
     if (!ctx2d) return;
@@ -270,6 +292,12 @@ export function createSpectrumStrip(opts) {
     for (let i = 0; i < count; i++) {
       const bar = Math.max(2, levels[i] * h);
       ctx2d.fillRect(i * slot, h - bar, slot - gap, bar);
+      // A 2px marker at the held peak, above the bar it belongs to.  Its top is
+      // kept on the canvas: a full-scale peak would otherwise put the marker's
+      // own thickness above the top edge.
+      const mark = Math.max(2, peaks[i] * h);
+      const top = Math.max(0, h - mark - 2);
+      ctx2d.fillRect(i * slot, top, slot - gap, 2);
     }
   }
 

@@ -32,7 +32,7 @@ _MODULE = (
 # Fakes for the browser surface the strip touches.  `log` records what the
 # module asked for, so each test can assert on requests rather than pixels.
 _FAKES = r"""
-const log = { frames: [], cancelled: [], contexts: 0, analysers: 0, connects: [], sourcesMade: 0, liveBranches: 0, gets: 0 };
+const log = { frames: [], cancelled: [], contexts: 0, analysers: 0, analyserList: [], connects: [], sourcesMade: 0, liveBranches: 0, gets: 0 };
 const dest = { kind: "destination" };
 let fps = [];
 globalThis.requestAnimationFrame = (fn) => { log.frames.push(fn); return log.frames.length; };
@@ -41,7 +41,11 @@ globalThis.matchMedia = (q) => ({ matches: fps.includes(q) || fps.includes("*"),
 // A branch is live from connect() until its own disconnect().  Counting live
 // branches, not connect calls, is what shows whether a re-attach leaks.
 class FakeAnalyser {
-  constructor() { log.analysers++; this.fftSize = 0; this.smoothingTimeConstant = 0; this.bins = new Uint8Array(4096); this.connected = false; }
+  // A real AnalyserNode reports frequencyBinCount as half its fftSize; the strip
+  // sizes its bin buffer from it, so the fake must report it too or every read
+  // is zero-length and the bars never move.
+  constructor() { log.analysers++; this.fftSize = 0; this.smoothingTimeConstant = 0; this.bins = new Uint8Array(4096); this.connected = false; log.analyserList.push(this); }
+  get frequencyBinCount() { return this.fftSize / 2; }
   connect(t) { this.connected = true; log.connects.push(["analyser", t === dest ? "destination" : "other"]); }
   disconnect() { if (this.connected) { this.connected = false; } }
   getByteFrequencyData(out) { log.gets++; out.set(this.bins.subarray(0, out.length)); }
@@ -71,10 +75,10 @@ class FakeContext {
 globalThis.AudioContext = FakeContext;
 globalThis.webkitAudioContext = undefined;
 // A canvas with the 2D surface the strip draws on.  Each draw is counted.
-const draws = { rects: 0, fills: [], clears: 0 };
+const draws = { rects: 0, fills: [], clears: 0, rectsGeom: [] };
 function fakeCanvas() {
   const ctx = {
-    fillStyle: "", clearRect() { draws.clears++; }, fillRect(x, y, w, h) { draws.rects++; draws.fills.push(ctx.fillStyle); },
+    fillStyle: "", clearRect() { draws.clears++; }, fillRect(x, y, w, h) { draws.rects++; draws.fills.push(ctx.fillStyle); draws.rectsGeom.push({ x, y, w, h, fill: ctx.fillStyle }); },
     beginPath() {}, moveTo() {}, lineTo() {}, fill() {}, stroke() {}, arc() {}, rect() {}, fillText() {},
     save() {}, restore() {}, scale() {}, setTransform() {},
   };
@@ -383,8 +387,131 @@ for (const f of pending) f();
 console.log(JSON.stringify({ rects: draws.rects, fills: [...new Set(draws.fills)] }));
 """
     )
-    assert out["rects"] == 32
+    # 32 bars, each with a falling peak marker: 64 rects per frame.
+    assert out["rects"] == 64
     assert out["fills"] == ["var(--accent)"]
+
+
+def test_a_peak_marker_holds_the_recent_maximum_and_falls_slower_than_the_bar() -> None:
+    # The approved look has a falling peak marker above each bar: it jumps up
+    # with a loud frame and then drops slowly, so a burst stays readable after
+    # the bar itself has fallen.  Measured on the drawn geometry: in the first
+    # column, the marker is the thin rect above the bar, and it must sit higher
+    # than the bar after a silent frame.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+const analyser = log.analyserList[log.analyserList.length - 1];
+analyser.bins = new Uint8Array(4096).fill(255);
+draws.rectsGeom = [];
+for (const f of log.frames.slice()) f();          // a loud frame
+analyser.bins = new Uint8Array(4096);
+draws.rectsGeom = [];
+for (const f of log.frames.slice()) f();          // then silence
+const col0 = draws.rectsGeom.filter((r) => r.x === 0);
+const markerTop = Math.min(...col0.filter((r) => r.h <= 2).map((r) => r.y));
+const barTop = Math.min(...col0.filter((r) => r.h > 2).map((r) => r.y));
+console.log(JSON.stringify({ markerTop, barTop }));
+"""
+    )
+    # Canvas y grows downward: a smaller top is higher.  The marker stays above
+    # the fallen bar, so the burst remains visible for a moment.
+    assert out["markerTop"] < out["barTop"]
+
+
+def test_a_falling_peak_never_drops_below_the_floor() -> None:
+    # The marker falls by a fixed step each frame.  Left unclamped, a long fall
+    # takes the stored peak below zero, which draws above the canvas.  The
+    # marker's drawn top must never leave the canvas.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+const analyser = log.analyserList[log.analyserList.length - 1];
+analyser.bins = new Uint8Array(4096).fill(255);
+log.frames[log.frames.length - 1]();
+analyser.bins = new Uint8Array(4096);
+const drawn = [];
+for (let i = 0; i < 60; i++) {
+  draws.rectsGeom = [];
+  log.frames[log.frames.length - 1]();
+  const m = draws.rectsGeom.filter((r) => r.x === 0 && r.h === 2)[0];
+  if (m) drawn.push(m.y);
+}
+console.log(JSON.stringify({ minY: Math.min(...drawn) }));
+"""
+    )
+    # Canvas y is 0 at the top.  The marker may rest at the floor, never above it.
+    assert out["minY"] >= 0
+
+
+def test_the_marker_outlasts_the_bar_on_the_way_down() -> None:
+    # The qualitative test proves the marker sits above a fallen bar once; this
+    # pins the rate: a few frames after a burst the marker is still well above the
+    # bar, and the bar has reached the floor before the marker does.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+const analyser = log.analyserList[log.analyserList.length - 1];
+analyser.bins = new Uint8Array(4096).fill(255);
+log.frames[log.frames.length - 1]();
+analyser.bins = new Uint8Array(4096);
+function step() {
+  draws.rectsGeom = [];
+  log.frames[log.frames.length - 1]();
+  const c0 = draws.rectsGeom.filter((r) => r.x === 0);
+  // The bar's drawn height and the marker's drawn top, both from the canvas.
+  const bar = c0.filter((r) => r.h > 2).map((r) => r.h)[0] || 0;
+  const markTop = c0.filter((r) => r.h === 2).map((r) => r.y)[0];
+  return [bar, markTop];
+}
+const samples = [];
+for (let i = 0; i < 40; i++) samples.push(step());
+// The gap is how far the marker stands above the bar's top.  The bar's top is
+// 48 - bar; the marker's top is markTop, so a larger gap means the marker is
+// higher and still holding the burst.
+const gap = (s) => (48 - s[0]) - s[1];
+console.log(JSON.stringify({ gap5: gap(samples[5]), gap10: gap(samples[10]), bar10: samples[10][0] }));
+"""
+    )
+    # Five frames in the marker still stands well above the bar's top.
+    assert out["gap5"] > 10
+    # Ten frames in the bar has largely fallen while the marker still holds
+    # clear air above it, so the burst stays readable after the bar has gone.
+    assert out["gap10"] > 10
+    assert out["bar10"] < 10
+
+
+def test_bars_settle_gradually_to_the_floor_instead_of_snapping() -> None:
+    # A loud frame then silence: the bar must still stand above the floor on the
+    # first silent frame, so it visibly falls rather than vanishing in one frame.
+    out = _run(
+        """
+const host = document.createElement("div");
+const strip = createSpectrumStrip({ host });
+strip.show();
+strip.attachStream({ getTracks: () => [] }, "user");
+const analyser = log.analyserList[log.analyserList.length - 1];
+analyser.bins = new Uint8Array(4096).fill(255);
+for (const f of log.frames.slice()) f();
+analyser.bins = new Uint8Array(4096);
+draws.rectsGeom = [];
+for (const f of log.frames.slice()) f();
+const col0 = draws.rectsGeom.filter((r) => r.x === 0 && r.h > 2);
+console.log(JSON.stringify({ firstSilentH: col0[0].h }));
+"""
+    )
+    # The floor is 2px; a bar still above it on the first silent frame has fallen
+    # gradually, not in one frame.
+    assert out["firstSilentH"] > 2
 
 
 def test_silence_draws_a_flat_muted_line_not_nothing() -> None:
@@ -403,7 +530,8 @@ for (const f of pending) f();
 console.log(JSON.stringify({ rects: draws.rects, fills: [...new Set(draws.fills)] }));
 """
     )
-    assert out["rects"] == 32
+    # Silence still paints every bar and its marker: 64 rects, all muted.
+    assert out["rects"] == 64
     assert out["fills"] == ["var(--fg-dim)"]
 
 
@@ -415,16 +543,23 @@ const host = document.createElement("div");
 const strip = createSpectrumStrip({ host });
 strip.show();
 strip.attachStream({ getTracks: () => [] }, "user");
+const analyser = log.analyserList[log.analyserList.length - 1];
+analyser.bins = new Uint8Array(4096).fill(255);
 draws.rects = 0;
+draws.rectsGeom = [];
 for (const f of log.frames.slice()) f();
 const meterDraws = draws.rects;
-console.log(JSON.stringify({ reduced: strip.isReducedMotion(), meterDraws, bars: strip.barCount() }));
+const meterH = draws.rectsGeom[0] ? draws.rectsGeom[0].h : 0;
+console.log(JSON.stringify({ reduced: strip.isReducedMotion(), meterDraws, bars: strip.barCount(), meterH }));
 """
     )
     assert out["reduced"] is True
     assert out["bars"] == 1
     # The meter is one rectangle painted, not the bar field.
     assert out["meterDraws"] == 1
+    # And it reads a real level: a loud spectrum draws a tall meter, not the
+    # 2px floor an empty read would give.
+    assert out["meterH"] > 2
 
 
 def test_a_stream_source_is_never_connected_to_the_destination() -> None:
