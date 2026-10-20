@@ -53,6 +53,59 @@ users to the admin Settings API.
 
 ---
 
+## Speech Synthesis Limits
+
+`POST /v1/api/tts` is not a setting-driven surface. Two limits are fixed, and
+they are deliberately kept together:
+
+- **8,000 characters per request** (`_TTS_TEXT_CAP` in `turnstone/server.py`).
+  A longer text is refused with a 400 rather than synthesised in part. This
+  only binds on local backends: OpenAI documents a 4,096-character maximum on
+  the `input` field of its speech models, so a cloud alias refuses first.
+- **90 seconds for the console's `tts` wait** (`_TTS_PROXY_READ_TIMEOUT_S` in
+  `turnstone/console/server.py`). The node answers only once the whole clip is
+  synthesized, so ordinary request latency does not describe this route. At the
+  slowest backend measured — Kokoro-82M on CPU, ~107 chars/s — a full-cap clip
+  needs about 75 seconds. A test pins the two numbers together, so raising the
+  cap past what the deadline covers fails CI.
+
+Only the read wait is extended. Connecting, writing, and the pool keep the
+proxy client's shared bound, and every other forwarded request is unchanged.
+
+### The wait is only as long as the shortest hop in front of it
+
+The console's deadline is not the only one in the path. A load balancer or
+ingress between the browser and the console closes an idle connection on its
+own schedule, and it measures silence, not total duration: from its side the
+connection is quiet for the whole synthesis. The repository's AWS ECS module
+(`deploy/terraform/modules/aws-ecs/alb.tf`) sets no `idle_timeout`, so the ALB
+inherits the AWS default of **60 seconds**, and a longer wait is cut into an
+HTML 504 the UI cannot parse.
+
+Two consequences for operators:
+
+- Behind that module, raise the ALB `idle_timeout`, or keep each request short
+  enough to answer inside 60 seconds — roughly 6,400 characters at the rate
+  above.
+- Prefer short clips. Read-aloud splits a reply into ~600-character pieces and
+  starts playing the first while the rest render, so no single request
+  approaches either limit. That is the intended shape for long text; the cap
+  exists to bound a single request, not to be raised for long ones.
+
+### Concurrency
+
+A node synthesizes at most `_TTS_MAX_CONCURRENT` (2) clips at once and refuses
+further requests with 503 + `Retry-After` rather than queueing them. Queue time
+is spent from the same wait as synthesis, so a queued clip at the cap would
+time out and appear as "Node unreachable" — the failure this design removes.
+The node also holds each finished clip in memory twice while it is in flight
+(the SDK buffer and the response body), so the limit bounds memory as well as
+work. Note that a local CPU backend serves roughly seven continuous listeners
+at ~14 chars/s of playback against ~107 chars/s of synthesis, so concurrency
+above that does not add throughput.
+
+---
+
 ## Approval Wait Timeout
 
 `tools.approval_timeout_seconds` controls how long a workstream waits for a
@@ -301,6 +354,7 @@ initialization:
 | `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
+| `audio` | stt_model_alias, stt_prompt, tts_model_alias, tts_voice |
 | `server` | workstream_idle_timeout, max_workstreams |
 | `cluster` | node_fan_out_limit, mcp_max_servers |
 | `mcp` | config_path, registry_url, oauth_allow_private_network |
