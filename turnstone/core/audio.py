@@ -700,7 +700,11 @@ def synthesize(
         raise AudioUnavailableError(f"TTS model alias {alias!r} cannot synthesize speech")
     refuse_aborted_request(cancel_ref)
     try:
-        client = lane_call_client(lane, cancel_ref=cancel_ref)
+        # No retries: the SDK's default re-runs a failed call twice, and this one
+        # is minutes long at the cap.  A caller that has already given up would
+        # be waiting on a third invisible attempt.  Same reasoning as the startup
+        # probe, which disables retries for the same reason (model_registry.py).
+        client = lane_call_client(lane, cancel_ref=cancel_ref).with_options(max_retries=0)
         manager = client.audio.speech.with_streaming_response.create(
             model=model,
             voice=voice or _DEFAULT_VOICE,

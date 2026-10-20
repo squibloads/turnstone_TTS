@@ -8,9 +8,11 @@ pending-list, GET /content, DELETE, auth isolation, and the extended
 
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import pytest
 from starlette.testclient import TestClient
@@ -1070,6 +1072,9 @@ def voice_app_client(tmp_path):
         default="voice",
     )
     mock_client = MagicMock()
+    # ``synthesize`` clones the client to pin max_retries=0; a real clone shares
+    # the same audio surface, so route the clone back to this mock.
+    mock_client.with_options.return_value = mock_client
     transcription_response = MagicMock()
     transcription_response.parse.return_value = MagicMock(text="hello from speech")
     transcription_manager = MagicMock()
@@ -1204,6 +1209,27 @@ class TestSpeechToTextStream:
 
 
 class TestTextToSpeech:
+    def test_a_caller_that_leaves_stops_the_synthesis(self, monkeypatch):
+        """A handler is not cancelled on disconnect; the watcher closes the
+        captured stream, which is what unblocks the worker."""
+        import turnstone.server as srv
+        from turnstone.core.deadline import StreamAbortRef
+
+        monkeypatch.setattr(srv, "_TTS_DISCONNECT_POLL_S", 0.0)
+        ref = StreamAbortRef()
+        handle = MagicMock()
+        ref.append(handle)  # what _capture_audio_handle does once the call starts
+        done = asyncio.Event()
+
+        async def _ask() -> bool:
+            return True
+
+        request = SimpleNamespace(is_disconnected=_ask)
+        asyncio.run(srv._abort_when_caller_leaves(request, ref, done))
+
+        assert ref.aborted
+        handle.close.assert_called_once_with()
+
     def test_unconfigured_returns_503(self, app_client):
         client, _ = app_client
         resp = client.post("/v1/api/tts", json={"text": "hello"}, headers=_auth("userA"))
@@ -1241,6 +1267,39 @@ class TestTextToSpeech:
         client.app.state.config_store._values["audio.tts_max_chars"] = 10
         ok = client.post("/v1/api/tts", json={"text": "x" * 8000}, headers=_auth("userA"))
         assert ok.status_code == 200, ok.text
+
+    def test_a_busy_node_refuses_instead_of_queueing(self, voice_app_client):
+        # Queueing is worse than refusing here: the console's read deadline
+        # covers queue time and synthesis together, so a queued clip times out
+        # and shows "Node unreachable" -- the bug this change removes.
+        import threading
+
+        client, _ = voice_app_client
+        slots = threading.BoundedSemaphore(1)
+        slots.acquire()  # the node is already at its maximum
+        client.app.state.tts_slots = slots
+
+        resp = client.post("/v1/api/tts", json={"text": "hi"}, headers=_auth("userA"))
+
+        assert resp.status_code == 503
+        assert resp.headers["retry-after"] == "5"
+        assert "busy" in resp.json()["error"]
+
+    def test_the_slot_is_released_after_a_failed_synthesis(self, voice_app_client):
+        import threading
+
+        client, mock_client = voice_app_client
+        slots = threading.BoundedSemaphore(1)
+        client.app.state.tts_slots = slots
+        create = mock_client.audio.speech.with_streaming_response.create
+        create.side_effect = RuntimeError("backend down")
+
+        assert (
+            client.post("/v1/api/tts", json={"text": "hi"}, headers=_auth("userA")).status_code
+            == 502
+        )
+        # A failure must not leak the slot, or the node refuses for ever.
+        assert slots.acquire(blocking=False)
 
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         client, mock_client = voice_app_client
@@ -1302,7 +1361,10 @@ class TestVoiceBackendAuth:
             scopes="",
             grant_leg="entra",
         )
-        mock_client.with_options.assert_called_once_with(api_key="minted-token")
+        # The mint must reach the call as a clone.  tts clones once more to pin
+        # max_retries=0, so assert the credential call is among them rather than
+        # that it was the only one.
+        assert call(api_key="minted-token") in mock_client.with_options.call_args_list
 
     @pytest.mark.parametrize("route", ["stt", "stt-stream", "tts"])
     def test_auth_failure_is_masked_and_never_dispatches(

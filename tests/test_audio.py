@@ -402,9 +402,37 @@ class TestTranscribe:
         response.parse.assert_not_called()
 
 
+def _tts_client() -> MagicMock:
+    """An SDK client whose ``with_options`` returns itself.
+
+    ``synthesize`` clones the client to pin ``max_retries=0``.  A bare MagicMock
+    hands back a *different* mock, so assertions on the original would see none
+    of the call.  A real client's clone shares the same ``audio`` surface, which
+    is what this reproduces.
+    """
+    client = MagicMock()
+    client.with_options.return_value = client
+    return client
+
+
 class TestSynthesize:
+    def test_retries_are_disabled(self):
+        # The SDK re-runs a failed call twice by default, and this call is
+        # minutes long at the cap.  A caller that already gave up must not leave
+        # a third attempt running invisibly.
+        client = _tts_client()
+        manager, _response = _response_manager(body=b"a")
+        client.audio.speech.with_streaming_response.create.return_value = manager
+        audio.synthesize(
+            registry=_FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client),
+            alias="voice",
+            text="hi",
+            voice="nova",
+        )
+        client.with_options.assert_called_once_with(max_retries=0)
+
     def test_calls_audio_speech_and_returns_bytes(self):
-        client = MagicMock()
+        client = _tts_client()
         manager, _response = _response_manager(body=b"RIFF...wavbytes")
         client.audio.speech.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
@@ -417,7 +445,7 @@ class TestSynthesize:
         assert kwargs["input"] == "hi"
 
     def test_default_voice_when_empty(self):
-        client = MagicMock()
+        client = _tts_client()
         manager, _response = _response_manager(body=b"a")
         client.audio.speech.with_streaming_response.create.return_value = manager
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
@@ -426,7 +454,7 @@ class TestSynthesize:
         assert kwargs["voice"] == "alloy"
 
     def test_backend_failure_raises_backend_error(self):
-        client = MagicMock()
+        client = _tts_client()
         client.audio.speech.with_streaming_response.create.side_effect = RuntimeError("down")
         reg = _FakeRegistry("voice", _Cfg("gpt-4o-mini-tts"), client)
         with pytest.raises(audio.AudioBackendError):
@@ -436,6 +464,7 @@ class TestSynthesize:
         base_client = MagicMock()
         call_client = MagicMock()
         base_client.with_options.return_value = call_client
+        call_client.with_options.return_value = call_client
         manager, _response = _response_manager(body=b"voice")
         call_client.audio.speech.with_streaming_response.create.return_value = manager
         cfg = _Cfg("gpt-4o-mini-tts")
@@ -457,7 +486,7 @@ class TestSynthesize:
         call_client.close.assert_not_called()
 
     def test_abort_after_speech_manager_creation_prevents_dispatch(self):
-        client = MagicMock()
+        client = _tts_client()
         ref = StreamAbortRef()
         manager, response = _response_manager(body=b"too late")
 

@@ -1687,6 +1687,19 @@ _STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation cl
 # three grow together.
 _TTS_TEXT_CAP = 8000  # characters per synthesis request
 
+# How many clips this node synthesizes at once.  Each in-flight clip holds the
+# finished audio twice (the SDK's buffer and the response body), ~17 MB at the
+# cap, and a local backend serializes on the CPU or GPU regardless.
+#
+# Arrivals beyond this are refused rather than queued, following the same rule
+# as the PDF worker: "queue time shares the same wall deadline as execution"
+# (``core/pdf.py``).  The console's read deadline covers queue time and
+# synthesis together, and a full-cap clip already spends ~75 s of it, so a
+# queued clip would time out and surface as "Node unreachable" -- the symptom
+# this whole change exists to remove.  A 600-character clip needs ~5.6 s, so
+# the chunked client that motivated this work never approaches the limit.
+_TTS_MAX_CONCURRENT = 2
+
 
 def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
     """Bind one audio HTTP request to its authenticated model principal."""
@@ -1933,6 +1946,29 @@ async def speech_to_text_stream(request: Request) -> Response:
     )
 
 
+# How often the synthesis path asks whether its caller is still there.
+_TTS_DISCONNECT_POLL_S = 1.0
+
+
+async def _abort_when_caller_leaves(request: Request, abort_ref: Any, done: asyncio.Event) -> None:
+    """Stop synthesis when the caller hangs up.
+
+    A handler is not cancelled when its peer disconnects, and a thread cannot be
+    cancelled once it is inside the SDK read.  Closing the captured stream is
+    what stops the work: ``synthesize`` publishes the response handle on
+    ``abort_ref``, so closing it makes the blocked read raise and the worker
+    returns instead of synthesizing a clip nobody is waiting for.
+
+    Polls rather than awaiting a disconnect signal because the request body is
+    already read; ``is_disconnected`` is the only surface Starlette offers here.
+    """
+    while not done.is_set():
+        await asyncio.sleep(_TTS_DISCONNECT_POLL_S)
+        if await request.is_disconnected():
+            abort_ref.abort()
+            return
+
+
 async def text_to_speech(request: Request) -> Response:
     """POST /v1/api/tts — synthesize assistant text into playable audio."""
     from turnstone.core.audio import (
@@ -1973,11 +2009,24 @@ async def text_to_speech(request: Request) -> Response:
     if not voice and config_store is not None:
         voice = (config_store.get("audio.tts_voice") or "").strip()
 
+    slots = getattr(request.app.state, "tts_slots", None)
+    if slots is not None and not slots.acquire(blocking=False):
+        # Refused, not queued: see _TTS_MAX_CONCURRENT for why a queued clip is
+        # a clip that times out.
+        return JSONResponse(
+            {"error": "Speech synthesis is busy; try again shortly"},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+
     abort_ref = StreamAbortRef()
     backend_auth_resolver = _audio_backend_auth_resolver(request)
+    done = asyncio.Event()
+    watcher = asyncio.create_task(_abort_when_caller_leaves(request, abort_ref, done))
+    executor = getattr(request.app.state, "tts_executor", None)
     try:
         # Blocking SDK round-trip — offload off the event loop.
-        speech = await asyncio.to_thread(
+        call = functools.partial(
             synthesize,
             registry=registry,
             alias=alias,
@@ -1986,6 +2035,12 @@ async def text_to_speech(request: Request) -> Response:
             config_store=config_store,
             backend_auth_resolver=backend_auth_resolver,
             cancel_ref=abort_ref,
+        )
+        loop = asyncio.get_running_loop()
+        speech = (
+            await loop.run_in_executor(executor, call)
+            if executor is not None
+            else await asyncio.to_thread(call)
         )
     except BackendAuthUnavailableError:
         log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
@@ -1997,7 +2052,13 @@ async def text_to_speech(request: Request) -> Response:
         log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
         return JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
     finally:
+        done.set()
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
         abort_ref.abort()
+        if slots is not None:
+            slots.release()
 
     return Response(
         speech.audio_bytes,
@@ -5377,6 +5438,17 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     # Dedicated executor for SSE queue polling so it doesn't compete
     # with the default asyncio executor (which caps at ~32 workers).
     app.state.sse_executor = ThreadPoolExecutor(max_workers=200, thread_name_prefix="sse")
+    # Speech synthesis is the one request whose worker is held for the whole
+    # answer -- minutes at the cap on a slow backend.  On the default executor
+    # (min(32, cpu+4), so 8 on a 4-core node) a handful of clips take every
+    # worker, including the one the service heartbeat needs
+    # (``asyncio.to_thread(_svc_storage.heartbeat_service, ...)`` below), so the
+    # console sees the node miss its heartbeat and marks it offline.  A
+    # performance limit must not be able to do that.
+    app.state.tts_executor = ThreadPoolExecutor(
+        max_workers=_TTS_MAX_CONCURRENT, thread_name_prefix="tts"
+    )
+    app.state.tts_slots = threading.BoundedSemaphore(_TTS_MAX_CONCURRENT)
     # Lifespan daemon-thread shutdown (#885): one shared Event for the
     # sleep-loop threads plus the queue sentinel for the fanout; refs
     # kept so the shutdown tail below can join them.  ``daemon=True``
@@ -5682,6 +5754,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
         if _t.is_alive():
             log.warning("server.daemon_thread_join_timeout", thread=_t.name)
     app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
+    app.state.tts_executor.shutdown(wait=True, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
