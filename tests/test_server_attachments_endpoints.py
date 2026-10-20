@@ -12,10 +12,13 @@ import asyncio
 import queue
 import threading
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, call
 
 import pytest
 from starlette.testclient import TestClient
+
+from turnstone.core.settings_registry import SETTINGS
 
 # Magic-byte-valid 1x1 PNG
 PNG_1x1 = (
@@ -1019,11 +1022,23 @@ class TestServiceScopedActorFlow:
 
 
 class _VoiceConfigStore:
-    def __init__(self, **values: str) -> None:
+    """A ConfigStore stand-in for the voice endpoints.
+
+    A missing key returns the *registry* default, as the real store does
+    (``core/config_store.py``: ``get`` falls through to ``SETTINGS[key].default``).
+    Returning a bare ``""`` here instead would let a test install a state
+    production cannot reach, and a test written against such a state proves
+    nothing about production.
+    """
+
+    def __init__(self, **values: Any) -> None:
         self._values = dict(values)
 
-    def get(self, key: str, default: str = "") -> str:
-        return self._values.get(key, default)
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._values:
+            return self._values[key]
+        defn = SETTINGS.get(key)
+        return defn.default if defn is not None else default
 
 
 @pytest.fixture
