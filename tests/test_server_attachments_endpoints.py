@@ -1230,6 +1230,18 @@ class TestTextToSpeech:
         resp = client.post("/v1/api/tts", json={"text": "x" * 9000}, headers=_auth("userA"))
         assert resp.status_code == 400
 
+    def test_the_cap_is_a_constant(self, voice_app_client):
+        # The cap was briefly a registry setting.  It is a constant again: the
+        # fix for a long read-aloud is several short clips, so nothing needs to
+        # raise it, and a stored value must not move it either.
+        from turnstone.server import _TTS_TEXT_CAP
+
+        assert _TTS_TEXT_CAP == 8000
+        client, _ = voice_app_client
+        client.app.state.config_store._values["audio.tts_max_chars"] = 10
+        ok = client.post("/v1/api/tts", json={"text": "x" * 8000}, headers=_auth("userA"))
+        assert ok.status_code == 200, ok.text
+
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         client, mock_client = voice_app_client
         create = mock_client.audio.speech.with_streaming_response.create

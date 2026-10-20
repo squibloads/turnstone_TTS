@@ -775,6 +775,13 @@ frozen.
 - **Saving a model definition with `max_tokens` set to `Infinity` answers 400.** The JSON body
   parsed it as a float that `int()` can't convert, and the create and update endpoints answered
   500.
+- **A long speech-synthesis reply no longer shows "Node unreachable".** `POST /v1/api/tts` answers
+  only once the whole clip is synthesized, so a slow or local backend outlasted the console's
+  shared 30-second proxy timeout and the user saw a connection error for a node that was working
+  fine. The console now allows 90 seconds for the `tts` answer and only for that wait: connecting,
+  writing, and the pool keep the shared bound, and every other forwarded request is unchanged.
+  The deadline is derived from the proxy client's own timeout rather than rebuilt from a constant,
+  so a client constructed with different bounds keeps them.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the

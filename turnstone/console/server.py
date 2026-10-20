@@ -299,6 +299,25 @@ _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 # proxy client's granular Timeout is a separate contract.
 _PROXY_CLIENT_TIMEOUT_S = 30
 
+# How long the console waits for a node's ``tts`` answer, and only for that
+# wait: connecting, writing and the pool keep _PROXY_CLIENT_TIMEOUT_S.
+#
+# The node answers only once the whole clip is synthesized, so ordinary
+# request latency does not describe this route.  The node accepts up to
+# ``_TTS_TEXT_CAP`` (8,000) characters and the slowest backend measured —
+# Kokoro-82M on CPU — synthesizes ~107 chars/s, so a full-cap request needs
+# ~75 s.  90 s covers that with margin, and ``test_the_tts_deadline_covers_a_full_cap_clip``
+# pins the two numbers together: raising the cap past what this covers fails
+# CI instead of restoring the "Node unreachable" this replaces.
+#
+# Behind the repository's AWS ECS module the ALB inherits its 60 s default
+# idle timeout, which cuts any longer wait into an HTML 504.  A deployment
+# behind that module either raises ``idle_timeout`` or splits long text into
+# clips short enough to answer inside 60 s -- which is what the chunked
+# read-aloud client does, at ~600 characters a call.
+_TTS_PROXY_READ_TIMEOUT_S = 90.0
+
+
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
 
 
@@ -3680,12 +3699,21 @@ async def _proxy_post(
         target += f"?{request.url.query}"
     headers = {"Content-Type": content_type}
     headers.update(_proxy_auth_headers(request))
+    # The tts wait is extended from the client's own timeout rather than
+    # rebuilt from a constant, so connect/write/pool keep whatever bound the
+    # pool was actually constructed with (startup, or the mTLS re-create).
+    timeout = (
+        httpx2.Timeout(**{**client.timeout.as_dict(), "read": _TTS_PROXY_READ_TIMEOUT_S})
+        if path == "tts"
+        else client.timeout
+    )
     try:
         resp = await client.request(
             request.method,
             target,
             content=body,
             headers=headers,
+            timeout=timeout,
         )
     except REQUEST_FAILURES as exc:
         log.debug("Proxy %s error for %r: %s", request.method, f"{api_prefix}/{path}", exc)

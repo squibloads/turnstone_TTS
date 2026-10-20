@@ -1675,6 +1675,16 @@ async def list_available_models(request: Request) -> JSONResponse:
 
 
 _STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation clips
+
+# Longest text one synthesis request may carry.  A constant rather than a
+# setting: the cheap fix for long read-aloud is to send several short clips,
+# not one enormous one, so the cap only needs to bound a single request.
+#
+# It only bites on local backends.  OpenAI documents a 4,096-character maximum
+# on the ``input`` field of its speech models, so a cloud alias refuses first;
+# Kokoro and vLLM-Omni have no such limit, and this is the only thing that
+# bounds the work, the buffered reply and the console's wait.  Raise it and all
+# three grow together.
 _TTS_TEXT_CAP = 8000  # characters per synthesis request
 
 
@@ -1941,13 +1951,13 @@ async def text_to_speech(request: Request) -> Response:
     text = str(body.get("text") or "").strip()
     if not text:
         return JSONResponse({"error": "text is required"}, status_code=400)
+    config_store = getattr(request.app.state, "config_store", None)
     if len(text) > _TTS_TEXT_CAP:
         return JSONResponse(
             {"error": f"text too long (cap {_TTS_TEXT_CAP} chars)"}, status_code=400
         )
 
     registry = getattr(request.app.state, "registry", None)
-    config_store = getattr(request.app.state, "config_store", None)
     alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
     if not alias:
         return JSONResponse(

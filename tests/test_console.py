@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import queue
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, MagicMock
 
@@ -3526,3 +3527,97 @@ class TestProxyGetHeaderPassThrough:
             "server" not in {k.lower() for k in resp.headers}
             or resp.headers.get("server") != "upstream-internal"
         )
+
+
+class TestProxyTtsTimeout:
+    """The node's ``tts`` route answers only once the whole clip is synthesized,
+    so it gets a longer read deadline than the shared proxy client.  Every other
+    proxied POST keeps that client's own timeout, and the deadline is derived from
+    the live client rather than rebuilt from a constant.
+
+    These assert ``request.extensions["timeout"]``: that is the deadline httpx2
+    hands the transport and the one actually enforced, so a wrong kwarg cannot
+    pass the test.  (``MockTransport`` itself ignores timeouts, which is why the
+    check is made where the client materialises them rather than on a wall clock.)
+    """
+
+    @staticmethod
+    def _call(monkeypatch, path, timeout):
+        import httpx2
+
+        from turnstone.console import server as csrv
+
+        seen: dict[str, float] = {}
+
+        async def _handler(request):
+            seen.update(request.extensions["timeout"])
+            return httpx2.Response(200, content=b"ok")
+
+        async def _body():
+            return b"{}"
+
+        async def _run():
+            async with httpx2.AsyncClient(
+                transport=httpx2.MockTransport(_handler), timeout=timeout
+            ) as client:
+                request = SimpleNamespace(
+                    app=SimpleNamespace(state=SimpleNamespace(proxy_client=client)),
+                    method="POST",
+                    body=_body,
+                    headers={"content-type": "application/json"},
+                    url=SimpleNamespace(query=""),
+                )
+                return await csrv._proxy_post(request, "http://n:1", path, api_prefix="v1/api")
+
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+        resp = asyncio.run(_run())
+        assert resp.status_code == 200
+        return seen
+
+    def test_tts_read_deadline_is_extended(self, monkeypatch):
+        import httpx2
+
+        from turnstone.console.server import _TTS_PROXY_READ_TIMEOUT_S
+
+        timeout = httpx2.Timeout(30.0)
+        applied = self._call(monkeypatch, "tts", timeout)
+        assert applied["read"] == _TTS_PROXY_READ_TIMEOUT_S
+        # Only the wait for the clip moves; reaching the node keeps the client's bound.
+        assert applied["connect"] == timeout.connect
+        assert applied["write"] == timeout.write
+        assert applied["pool"] == timeout.pool
+
+    def test_other_paths_keep_the_client_timeout(self, monkeypatch):
+        import httpx2
+
+        assert self._call(monkeypatch, "workstreams/ws-1/send", httpx2.Timeout(30.0)) == {
+            "connect": 30.0,
+            "read": 30.0,
+            "write": 30.0,
+            "pool": 30.0,
+        }
+
+    def test_a_differently_built_client_is_followed(self, monkeypatch):
+        # The regression this guards: rebuilding the timeout from the module
+        # constant silently reset connect/write/pool whenever a client was built
+        # with anything else (the mTLS re-create is the live example).
+        import httpx2
+
+        timeout = httpx2.Timeout(connect=7.0, read=9.0, write=11.0, pool=13.0)
+        applied = self._call(monkeypatch, "tts", timeout)
+        assert (applied["connect"], applied["write"], applied["pool"]) == (7.0, 11.0, 13.0)
+
+    def test_the_console_outwaits_a_full_cap_clip(self):
+        """The two numbers must stay coherent, or the node accepts text the
+        console abandons -- the bug this replaces, which shipped because the cap
+        and the wait were configured independently.
+
+        A cap raised past what the deadline covers fails here rather than in
+        production.  ~107 chars/s is Kokoro-82M on CPU, the slowest backend
+        measured, so the margin is real on anything faster.
+        """
+        from turnstone.console.server import _TTS_PROXY_READ_TIMEOUT_S
+        from turnstone.server import _TTS_TEXT_CAP
+
+        slowest_measured_chars_per_second = 107
+        assert _TTS_TEXT_CAP / slowest_measured_chars_per_second <= _TTS_PROXY_READ_TIMEOUT_S
