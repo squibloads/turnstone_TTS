@@ -178,32 +178,15 @@ suits the team better. The right value comes from the model's own
 documentation; Turnstone cannot validate it because voice names are
 backend-specific.
 
-#### Longest speech request
+#### Speech request limits
 
-`audio.tts_max_chars` · default `8000` · range 1–50000 characters
-
-The cap on one speech request. With the default profile, one request is one
-clip, so this bounds recitation of a very long paragraph rather than a whole
-reply. A request over the cap is refused with an error instead of being read
-aloud.
-
-Raise it together with `audio.tts_timeout_seconds`, because the whole clip is
-synthesized before playback starts. Lower it if a slow backend cannot finish
-long clips in time. The default is generous for normal replies; most operators
-never change it.
-
-#### Synthesis timeout
-
-`audio.tts_timeout_seconds` · default `30` · range 1–600 seconds
-
-How long the console waits for a node to return one complete audio clip. Local
-speech backends can take far longer than an ordinary chat request; every other
-request the console forwards keeps the proxy's shared timeout.
-
-Raise it when long clips time out on a slow or CPU-only backend, and pair the
-change with `audio.tts_max_chars`. Lower it to fail fast when a wedged backend
-should not hold the player. The console applies this value; a node serving its
-own UI uses its own configured timeout.
+These are fixed, not settings. One speech request carries at most 8,000
+characters; a longer one is refused with an error. The node gives the backend
+80 seconds for one clip, in a single attempt, and the console waits up to 90
+seconds for the node's answer, so the node reports its own error first. Each
+node, and the console for coordinator replies, synthesizes at most two clips at
+once and answers a third with "busy" and a retry hint. With the default
+profile a request is one short clip, so none of these bind on normal replies.
 
 #### Text cleanup master switch
 
