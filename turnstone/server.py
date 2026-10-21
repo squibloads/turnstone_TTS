@@ -2048,6 +2048,14 @@ async def text_to_speech(request: Request) -> Response:
         # Every rule is linear and the length cap bounds the work; a thread would
         # not help (the regex holds the GIL).
         text = normalize_for_speech(text, parse_pronunciations(pronunciations))
+        # Cleanup grows text (units and dates become words), and the cap is what
+        # sizes the backend call and the console's wait, so it bounds the text
+        # actually synthesized as well as the text sent.
+        if len(text) > _TTS_TEXT_CAP:
+            return JSONResponse(
+                {"error": f"text too long after speech cleanup (cap {_TTS_TEXT_CAP} chars)"},
+                status_code=400,
+            )
     capacity: _SpeechCapacity = request.app.state.tts
     if not capacity.try_admit():
         # Refused, not queued: see _SpeechCapacity.  429 like the node's other
