@@ -550,6 +550,7 @@ def test_node_shutdown_allows_revocation_to_finish_during_manager_drain(
             app.state.rate_limiter = None
             app.state.watch_runner = None
             app.state.registry = None
+            app.state.tts = server._SpeechCapacity()
             entered, finished = threading.Event(), threading.Event()
             observed: list[bool] = []
 
