@@ -6131,12 +6131,16 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     storage = getattr(app.state, "auth_storage", None)
     config_store = None
     if storage:
-        try:
-            from turnstone.core.config_store import ConfigStore
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.storage import storage_errors
 
+        # Settings that can't be read end startup rather than run the console
+        # on every default; a supervisor restart retries the read.
+        try:
             config_store = ConfigStore(storage)
-        except Exception:
-            log.warning("Failed to initialise ConfigStore", exc_info=True)
+        except storage_errors() as exc:
+            log.error("settings.load_failed: %s", exc)
+            raise SystemExit(1) from exc
     app.state.config_store = config_store
 
     # Initialize rule registry for configurable judge rules
@@ -6266,7 +6270,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
         except Exception:
             log.warning("Failed to register console service", exc_info=True)
 
-    # TLS: init CA, issue console certs, start renewal
+    # TLS: init CA, issue console certs, start renewal. main() exits when the CA
+    # can't start; a failure here is logged and the console keeps serving, since
+    # nodes still enroll through that CA, and a restart retries.
     tls_mgr = getattr(app.state, "tls_manager", None)
     if tls_mgr is not None:
         try:
@@ -6329,7 +6335,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
                 app.state.collector.upgrade_tls(tls_verify=client_ctx)
                 log.info("tls.proxy_clients.upgraded")
         except Exception:
-            log.warning("TLS initialization failed — continuing without TLS", exc_info=True)
+            log.warning(
+                "tls.console_setup_failed: the console's certificate, renewal or mTLS clients "
+                "didn't start; it keeps serving, but can't reach nodes that require mTLS until "
+                "it restarts",
+                exc_info=True,
+            )
 
     # Coordinator workstream plumbing.  Lazy — failure here is non-fatal;
     # the coordinator endpoints return 503 with a remediation message
@@ -14696,7 +14707,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     if body.get("max_tokens") is not None:
         try:
             max_tokens = int(body["max_tokens"])
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             return JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
         if max_tokens < 1:
             return JSONResponse({"error": "max_tokens must be >= 1"}, status_code=400)
@@ -15037,7 +15048,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         else:
             try:
                 mt_val = int(raw_mt)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 return JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
             if mt_val < 1:
                 return JSONResponse({"error": "max_tokens must be >= 1"}, status_code=400)
@@ -17581,24 +17592,55 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
     Only seeds known settings from the registry to avoid storing garbage.
     Uses config_store.set() for proper validation, serialization, and
     cache invalidation.
-    """
-    from turnstone.core.settings_registry import SETTINGS
 
+    An empty value counts as unset, as a Compose ``${X:-}`` passthrough of an
+    unset variable gives. Every other value is checked before anything is
+    written: one its setting refuses is logged and the console exits with
+    nothing seeded, so a mistyped value never leaves its setting at the
+    default. A storage error while seeding is logged with its key and exits
+    too. A value shadowed by a ``console-startup`` row (#1413) is reported,
+    since the operator set the variable to change it.
+    """
+    from turnstone.core.settings_registry import SETTINGS, serialize_value, validate_value
+    from turnstone.core.storage import storage_errors
+
+    seeds: list[tuple[str, str, str, str]] = []
+    refused = False
     for key in SETTINGS:
         env_name = "TURNSTONE_" + key.replace(".", "_").upper()
         env_val = os.environ.get(env_name)
-        if env_val is None:
-            continue
-        # Only seed if not already stored (check raw storage to avoid
-        # config_store cache, which may not reflect DB state yet)
-        existing = storage.get_system_setting(key)
-        if existing is not None:
+        if env_val is None or not env_val.strip():
             continue
         try:
-            config_store.set(key, env_val, changed_by="env")
+            seeds.append((key, env_name, env_val, serialize_value(validate_value(key, env_val))))
+        except ValueError as exc:
+            log.error("config.seed_refused: %s from %s: %s", key, env_name, exc)
+            refused = True
+    if refused:
+        raise SystemExit(1)
+    for key, env_name, env_val, serialized in seeds:
+        # Only seed if not already stored (check raw storage to avoid
+        # config_store cache, which may not reflect DB state yet)
+        try:
+            existing = storage.get_system_setting(key)
+            if existing is None:
+                config_store.set(key, env_val, changed_by="env")
+        except storage_errors() as exc:
+            log.error("config.seed_failed: %s from %s: %s", key, env_name, exc)
+            raise SystemExit(1) from exc
+        if existing is None:
             log.info("config.seeded_from_env: %s from %s", key, env_name)
-        except Exception:
-            log.warning("config.seed_failed: %s from %s", key, env_name, exc_info=True)
+        elif (
+            existing.get("changed_by") == "console-startup" and existing.get("value") != serialized
+        ):
+            log.warning(
+                "config.env_ignored: %s is stored as %s, so %s is not applied; reset %s in the "
+                "Settings tab to apply it",
+                key,
+                existing.get("value"),
+                env_name,
+                key,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -18690,12 +18732,26 @@ def main() -> None:
             _advertise_host = _socket.gethostname()
         console_url = f"http://{_advertise_host}:{args.port}"
     if auth_storage:
-        try:
-            from turnstone.core.config_store import ConfigStore
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.storage import storage_errors
 
+        # Settings that can't be read end startup rather than run the console on
+        # every default; a supervisor restart retries.
+        try:
             _cs = ConfigStore(auth_storage)
-            # Seed ConfigStore from env vars (TURNSTONE_{SECTION}_{KEY})
-            _seed_config_from_env(_cs, auth_storage)
+        except storage_errors() as exc:
+            log.error("settings.load_failed: %s", exc)
+            raise SystemExit(1) from exc
+        # Seed ConfigStore from env vars (TURNSTONE_{SECTION}_{KEY})
+        _seed_config_from_env(_cs, auth_storage)
+
+        # Once TLS is enabled, a console that can't load or create its CA exits
+        # rather than serve without the ACME responder nodes enroll through (a node
+        # that can't enroll falls back to plain HTTP), and a supervisor restart
+        # retries. The lifespan issues the console's own certificate, and logs a
+        # failure there and serves on. Nothing is written back: nodes read
+        # tls.enabled as stored, and unset reads as off (#1413).
+        try:
             if _cs.get("tls.enabled"):
                 from turnstone.console.tls import TLSManager
 
@@ -18714,30 +18770,9 @@ def main() -> None:
                 # / docs/tls.md); rewriting the scheme to https here would
                 # advertise an ACME URL nodes can't reach.
                 log.info("TLS enabled")
-        except Exception:
-            log.warning("TLS initialization failed", exc_info=True)
-            tls_mgr = None
-
-        # Sync TLS state to ConfigStore so server nodes see the correct value.
-        # Three cases:
-        # 1. TLS succeeded → write true
-        # 2. TLS not configured (DB false/unset) → write false (definitive)
-        # 3. TLS configured (DB true) but init failed → don't overwrite
-        #    (transient failure shouldn't permanently disable TLS)
-        try:
-            db_enabled = _cs.get("tls.enabled")
-            if tls_mgr is not None:
-                if not db_enabled:
-                    _cs.set("tls.enabled", True, changed_by="console-startup")
-            elif db_enabled:
-                log.warning(
-                    "tls.enabled is true in ConfigStore but TLS init failed — "
-                    "server nodes will attempt TLS and fall back to plain HTTP"
-                )
-            else:
-                _cs.set("tls.enabled", False, changed_by="console-startup")
-        except Exception:
-            log.debug("Failed to sync TLS state to ConfigStore", exc_info=True)
+        except Exception as exc:
+            log.error("tls.init_failed: %s", exc, exc_info=True)
+            raise SystemExit(1) from exc
 
     app = create_app(
         collector=collector,
@@ -18758,7 +18793,9 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    # lifespan="on": a lifespan that can't start (its settings can't load) ends the
+    # process instead of leaving it serving without one.
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", lifespan="on")
 
 
 if __name__ == "__main__":
