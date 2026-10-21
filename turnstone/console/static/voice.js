@@ -50,8 +50,6 @@ const VOICE_SETTING_GROUPS = [
     keys: [
       "audio.tts_voice",
       "audio.tts_playback_rate",
-      "audio.tts_max_chars",
-      "audio.tts_timeout_seconds",
       "audio.tts_style",
       "audio.tts_pronunciations",
       "audio.tts_stream",
