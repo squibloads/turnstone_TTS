@@ -5,6 +5,12 @@ are loaded from the ``system_settings`` table on init and cached in
 memory.  Call ``reload()`` to refresh from storage (e.g. on MQ
 invalidation event).
 
+The first load raises when storage can't be read, so a failed read never
+leaves a process on the registry defaults; a failed ``reload()`` keeps
+the settings that last loaded. A stored value that can't be decoded is
+logged as ``config_store.setting_invalid``, and its key reads as the
+default.
+
 Precedence chain for **server** entry point:
   CLI flag  >  ConfigStore (this)  >  registry default
 
@@ -57,7 +63,7 @@ class ConfigStore:
         self._mutation_lock = threading.Lock()
         self._lock = threading.Lock()
         self._version = 0
-        self.reload()
+        self.reload(strict=True)
 
     @property
     def storage(self) -> StorageBackend:
@@ -75,7 +81,7 @@ class ConfigStore:
         with self._lock:
             return self._version
 
-    def reload(self, *, if_changed: bool = False) -> bool:
+    def reload(self, *, if_changed: bool = False, strict: bool = False) -> bool:
         """Load all settings from storage into the in-memory cache.
 
         Every reload publishes a new :attr:`version`, so snapshots taken before
@@ -83,11 +89,18 @@ class ConfigStore:
         differ from the cache: a periodic caller (the model refresh timer) must
         not make every in-flight snapshot stale when nothing changed. Returns
         whether a new cache was published.
+
+        A failed read keeps the settings that last loaded. *strict* raises it
+        instead: the constructor's first load has nothing to keep, and serving
+        every default would prune workstreams on the default retention and move
+        the default model (#1406).
         """
         with self._mutation_lock:
             try:
                 raw = self._storage.get_system_settings_bulk(node_id=self._node_id)
             except Exception:
+                if strict:
+                    raise
                 log.warning("Failed to load settings from storage", exc_info=True)
                 return False
             new_cache: dict[str, Any] = {}
@@ -98,7 +111,8 @@ class ConfigStore:
                     # silently replaced by the default.
                     value = deserialize_value(key, json_val, clamp_range=True)
                 except (ValueError, KeyError):
-                    log.warning("Skipping invalid setting: %s", key)
+                    # Key only: the error text quotes the stored value.
+                    log.error("config_store.setting_invalid", key=key)
                     continue
                 new_cache[key] = value
                 if key not in self._clamp_warned:
@@ -109,7 +123,7 @@ class ConfigStore:
                         # until an operator rewrites it, and every reload would
                         # otherwise repeat the warning.
                         self._clamp_warned.add(key)
-                        log.warning("Clamped out-of-range setting %s to %r", key, value)
+                        log.warning("config_store.setting_clamped", key=key, value=value)
             if if_changed and new_cache == self._cache:
                 return False
             with self._lock:

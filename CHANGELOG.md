@@ -273,6 +273,26 @@ frozen.
   closes the live stream and the stream teardown also stopped the audio. It now stops on Stop,
   when the conversation is rebuilt from history, and when the pane is closed.
 - **Every finished reply has its own read-aloud button** — the speaker used to appear only on the latest reply and moved on with Retry. It now stays on each reply once it has finished (a reply still streaming gets it when it settles), so an earlier answer can be read, or keep playing, while a newer one arrives.
+- **A console exits when it can't start the TLS certificate authority it has enabled, or when a
+  setting's `TURNSTONE_*` variable holds a value the setting refuses (#1406)** *(BREAKING)* — a
+  failed CA load (a storage error, a corrupt row) used to leave the console running without TLS
+  until a restart, and nodes that started meanwhile fell back to plain HTTP; a refused value such
+  as `TURNSTONE_TLS_ENABLED=on` was logged and skipped, leaving its setting at the default, and
+  one for a setting already stored was never read. The console now logs `tls.init_failed`, or
+  `config.seed_refused` once per refused variable, and exits, seeding nothing on a start that
+  refuses a value; a bool takes `true`, `1`, `yes`, `false`, `0` or `no`. An empty variable now
+  counts as unset, so it no longer stores an empty string. A console whose CA can't start for a
+  lasting reason doesn't serve its Settings tab either, so turning TLS off then means setting
+  `tls.enabled` to `false` in the `system_settings` table. A failure issuing the console's own
+  certificate is still logged, now as `tls.console_setup_failed`, and the console keeps serving.
+- **Database errors no longer quote the values a failed statement was sent** — an error message,
+  and a traceback logged with it, names the statement and the database's reason only; the values
+  stay on the exception's `params`.
+- **A SQLite database path holding `%` and two hex digits, or a `?`, opens the file it names**
+  *(BREAKING)* — the path was read as a URL, so `/data/a%20b/turnstone.db` opened
+  `/data/a b/turnstone.db`, and a `?` ended the path. Before upgrading, set the path the
+  deployment was using: when the escape is in the file name, the upgraded process opens a new,
+  empty database beside the old one.
 - **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
   `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
   (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP
@@ -280,7 +300,26 @@ frozen.
   instead of certifi's bundle (`SSL_CERT_FILE` and `SSL_CERT_DIR` still override it), and one
   streamed event may be up to 16 MiB, so a larger tool result fails (1.x had no limit). When a
   global OpenTelemetry tracer provider is configured, the SDK opens a span for each MCP request and
-  passes the trace context to the server in `_meta`; turnstone configures none.
+  passes the trace context to the server in `_meta`; turnstone configures none. A server's JSON-RPC
+  error with the positive code 32600, the 1.x SDK's stand-in for a lost session that a proxy built
+  on it can still forward, is now an ordinary protocol error: a call that gets one keeps its
+  session, is not counted by the circuit breaker and reconnects nothing, and a connection test or a
+  failed connect shows the server's own message.
+- **OIDC sign-in and OAuth run on httpx2 (#1011)** — the identity provider's discovery, keys and
+  code exchange at sign-in, and every OAuth request for MCP servers and models (discovery, client
+  registration, code exchange, refresh, revocation, and the on-behalf-of and client-credential
+  mints) now go through httpx2. Certificates are verified against the operating system's trust
+  store instead of certifi's bundle. A deployment that trusted its identity provider's or
+  authorization server's private CA through a modified `certifi` bundle must install that CA's
+  root certificate in the system store (an intermediate CA on its own no longer verifies), or point
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` at a bundle holding the public roots as well as the private CA.
+  Those variables apply to every httpx2 client in the process, and strict X.509 checks and
+  `SSLKEYLOGFILE` apply only while one of them is set. The proxy variables still apply; `NO_PROXY`
+  now also matches IPv4 and IPv6 CIDR ranges and bracketed IPv6 addresses, and ignores an entry it
+  can't parse or that carries a path, so list such a host without its path. These requests send a
+  `python-httpx2` User-Agent and also accept zstd-compressed responses, and when something lowers
+  httpx2's log level (for example `ANTHROPIC_LOG=info`) they now log request lines, which show
+  only each URL's scheme, host and port.
 - **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
   model, the task model, the coordinator model or the channel model names a definition that isn't
   loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference
@@ -630,6 +669,77 @@ frozen.
 
 ### Fixed
 
+- **An OAuth or OIDC endpoint URL the client can't send is refused when its document is read.** An
+  identity provider's discovery document, an MCP server's challenge or metadata, or an
+  authorization server's metadata could name an endpoint holding a control character (a stray
+  trailing newline, say), a lone surrogate, or a host that isn't valid IDNA 2008. The address
+  checks accepted it and the request then failed with an error OAuth didn't handle: a JWKS URL
+  like that stopped the node, console or CLI from starting; the MCP consent callback and client
+  registration answered 500; a challenge like that ended discovery before the server's
+  origin-level document was tried; an MCP token lookup raised instead of returning a retryable
+  failure; and a model token mint failed without recording a cause. Such a URL is now refused like
+  any other rejected endpoint, also in a field that is sent only on some paths or never (an
+  identity provider's `userinfo_endpoint`, an authorization server's `revocation_endpoint`): OIDC
+  sign-in turns off with the configuration error logged until the next start, consent fails with
+  the discovery error, and the challenge is skipped. A URL that reaches a request anyway fails like
+  an unreachable endpoint.
+- **A node or console that can't read its settings at startup exits instead of running on the
+  defaults (#1406).** When the settings query failed after the database migrations had run (a
+  dropped connection, a failover, a timeout), the process ran on every setting's default until
+  something reloaded them. A node pruned workstreams on the default 90-day retention even with
+  retention off or longer, and closed idle workstreams on the default timeout; the default model
+  and the task, coordinator, channel, judge and audio models moved; `model.auth_fail_closed`,
+  `model.auth_audience_allowlist`, `ratelimit.enabled` and `server.require_project` reverted;
+  workstreams created meanwhile were saved without `session.instructions`; and the node and the
+  console skipped TLS. The console could also store `tls.enabled = false` over a stored `true`,
+  which kept TLS off after later restarts: if a console started during a database outage, check
+  `tls.enabled` in the Settings tab. Both now log `settings.load_failed` and exit, so a supervisor
+  restart retries the read, and a node that can't read its model definitions logs
+  `model_registry.load_failed` and exits too instead of running on config.toml's models until a
+  Sync. A reload that fails later keeps the settings that last loaded.
+  `turnstone-admin rerank-calibrate` stops with the error instead of calibrating on the default
+  query instruction.
+- **`TURNSTONE_TLS_ENABLED` can turn TLS on for a console that has already started without it
+  (#1413).** Each console start without TLS stored `tls.enabled = false`, and a setting is seeded
+  from its environment variable only while nothing is stored for it, so adding the TLS compose
+  overlay to an existing deployment left TLS off. The console's startup no longer writes back the
+  TLS state it found; unset reads as off on the console and the nodes. A database an earlier start
+  wrote `false` into keeps it, and the console now logs `config.env_ignored` when that row
+  shadows `TURNSTONE_TLS_ENABLED`: reset `tls.enabled` in the Settings tab to apply the variable.
+- **Database certificate paths and database passwords with punctuation no longer stop a node or
+  console from starting.** The migration step failed before it connected when the PostgreSQL URL
+  carried `sslrootcert`, `sslcert` or `sslkey` (under `[database]`, or as
+  `TURNSTONE_DB_SSLROOTCERT`, `TURNSTONE_DB_SSLCERT` and `TURNSTONE_DB_SSLKEY`), another parameter
+  holding a path such as a Unix-socket `host=/run/postgresql`, or a password with punctuation
+  other than `+`, `-`, `.`, `_` and `~`, and when a SQLite path held a `%`, a letter outside ASCII
+  or punctuation such as `(`, `,`, `:` or `#`. `python -m turnstone.core.storage._migrate` failed
+  the same way; `sslmode` alone was not affected.
+- **The Docker image's migration step reads the database settings the services use.** `python -m
+  turnstone.core.storage._migrate`, which the entrypoint runs before the services start, read
+  only `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL` and `TURNSTONE_DB_PATH`. It now reads
+  config.toml's `[database]` first and then the `TURNSTONE_DB_*` variables, as the node does, the
+  TLS settings (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`) included. A database configured
+  only in config.toml no longer leaves the step migrating a SQLite file in its working directory.
+- **A stored model definition whose `temperature` or `max_tokens` isn't a number, or is outside
+  the range the console accepts (0 to 2, and at least 1), loads with that field unset.** The
+  loader logs `model_registry.override_invalid`, as it already did for such values in config.toml.
+  A value that isn't a number used to stop the load at that row: a node's Sync answered 503, and
+  doctor and the console's coordinator went without it and every definition sorting after it. One
+  out of range, `NaN` among them, was sent to the provider. The console refuses such values, so
+  only a direct write to the table stores one.
+- **Saving a model definition with `max_tokens` set to `Infinity` answers 400.** The JSON body
+  parsed it as a float that `int()` can't convert, and the create and update endpoints answered
+  500.
+- **Channel bots no longer start conversations on the wrong model before they have fetched the
+  channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
+  once, every conversation started meanwhile took the setting as unset and ran for good on the
+  fallback model (Discord's `--model`, else the server default). That covered a slow or failing
+  first fetch and, for a bot started less than 30 seconds after its host booted, the rest of those
+  30 seconds, when it didn't fetch at all. A conversation start now waits for the setting, and one
+  that can't fetch it doesn't start: Discord and the Slack slash command reply that they couldn't
+  look up the model, and the slash command keeps the current session open; a Slack DM gets its
+  usual error, including one that has to restart its conversation. Messages to a live conversation
+  don't fetch it.
 - **A JPEG saved in an extreme number of passes no longer ties up a CPU.** A progressive JPEG
   decodes in passes (scans), each costing a pass over the whole picture, and a small file can
   hold thousands. Chat attachment uploads now refuse a JPEG with more than 100 scans, and
@@ -1102,6 +1212,72 @@ frozen.
 
 ### Security
 
+- **Connections still made with `httpx` no longer trust the root of the compromised eMudhra
+  CAs.** The private keys of several eMudhra intermediate CAs can be recovered by anyone
+  (GHSA-6q48-6c7w-9gw2), so a client that trusts their root, emSign ECC Root CA - G3, accepts a
+  forged certificate for any host. Connections still made with `httpx` rather than HTTPX2, such
+  as web search, the reranker, skill sources, the MCP registry, notifications to channel gateways,
+  the console's connections to its nodes when it has no TLS certificate authority enabled, and the
+  SDK, CLI and channel clients, verify against the `certifi` bundle, which held that root.
+  Turnstone now requires `certifi>=2026.10.19`, which drops it. Connections on HTTPX2, such as
+  model providers, URL fetches, MCP servers, OAuth and OIDC sign-in, verify against the operating
+  system's trust store instead, so a native install must also update that store (Debian 13:
+  `ca-certificates` 20250419+deb13u1, DSA-6572-1). A deployment that sets `SSL_CERT_FILE` or
+  `SSL_CERT_DIR` verifies against that bundle instead, with `httpx` and HTTPX2 alike, and must
+  remove the root from it. Either way, restart Turnstone afterwards: a running process keeps the
+  roots it has already loaded.
+- **The Docker image no longer trusts the root of the compromised eMudhra CAs.** The image now
+  refuses to build with a `ca-certificates` older than 20250419+deb13u1 (DSA-6572-1), Debian's
+  update that removes the root from the system store. Its `pip`, which loads its own `certifi`
+  bundle beside the system store, moves to 26.2.2 or later, and its `uv`, which `uvx` uses to
+  fetch packages, moves to 0.13.4; both drop the root from their bundled lists. A virtual
+  environment made with `python -m venv` still starts with the base image's pip 26.2.1, which
+  trusts the root, until its pip is upgraded. Node.js, which `npx` uses, now checks the system
+  store instead of its built-in list, which still has the root: the image sets
+  `NODE_OPTIONS=--use-openssl-ca`, so a `NODE_OPTIONS` set at run time, in the container's
+  environment or in an MCP server's `env`, must keep that flag. Node also follows `SSL_CERT_FILE`
+  and `SSL_CERT_DIR` now. Images published before this release still trust the root.
+- **A remote MCP server can no longer have the console send plain-http requests to its loopback
+  ports.** The OAuth address check's localhost development lane (plain http to a localhost name
+  that resolves only to loopback) also covered URLs an MCP server's metadata or challenge named,
+  so with the private-network setting off a server could still have the console send blind
+  requests to any port and path on its own loopback, and time them to learn which ports answer.
+  A URL a remote document names now gets that lane only when the server URL the operator typed
+  is itself a localhost URL; otherwise it is judged like any other address. A server reached
+  through a localhost URL keeps the lane for every URL its documents name, so one that isn't a
+  local development server (a remote server behind a local forwarder, say) can still name the
+  console's loopback ports. A remote MCP server whose authorization server runs on the console's
+  host needs that server's Authorization Server URL set to it.
+- **A media tool's thumbnail URL can no longer reach the host's own services or cloud metadata
+  through an internationalized host name.** The channel thumbnail guard judged such a name as the
+  system resolver encodes it (IDNA 2003), while the fetch connects to the name's IDNA 2008 form,
+  and for some names (one holding `ß`, say) those are two different hosts. A tool result could
+  name such a host to get a GET, with a path of its choosing, sent to loopback or a cloud metadata
+  address over plain http; the answer reached the channel only when it was a 200 image. The guard
+  now resolves the name the fetch connects to, and refuses a URL whose host can't be sent.
+- **A compressed OAuth response can no longer exhaust memory.** The OAuth client checked a
+  response body's size only after reading and decompressing all of it, so a few hundred bytes of
+  brotli from an MCP server, or from the authorization server its metadata names, could decode to
+  gigabytes first and take the console or node down for every user; connecting to such a server
+  or refreshing a token against it set it off. Bytes sent after the end of a gzip stream piled up
+  the same way while decoding to nothing. The client now stops reading a body past 256 KiB
+  decoded, past 512 KiB received, or once the request's read timeout has passed while reading it,
+  and each request keeps its own, smaller or equal, size limit.
+- **The OAuth address check judges the host the client connects to.** It resolved an
+  internationalized host name the way the system resolver encodes it (IDNA 2003), while the HTTP
+  client connects to the name's IDNA 2008 form, and for some names (one holding `ß`, say) those
+  are two different hosts. An MCP server's metadata or challenge could name such a host, so the
+  check passed on one name's public address while the client connected to the other's internal
+  one: a TCP connection and TLS handshake to an internal host and port of the server's choosing,
+  which failed certificate verification before any request was sent. The check now resolves the
+  name the client connects to, and reads `[oidc] trusted_endpoint_hosts` the same way, so a host
+  there may be written in Unicode or as its `xn--` name.
+- **A user's bearer replaces the operator's Authorization header on per-user MCP servers.** On an
+  `oauth_user` or `oauth_obo` server whose headers held an Authorization header spelled otherwise
+  than `Authorization` (`authorization`, say), each user's connection sent that header beside the
+  user's bearer, and first. A server that reads the first one, as Starlette and the MCP SDK's
+  bearer middleware do, took every user for the operator's credential. The user's bearer now
+  replaces an operator Authorization header in any casing.
 - **The model reads only framework-written output-guard findings (#1291).** With the LLM stage on
   (`judge.output_guard_llm`), the advisory after a flagged tool result carried the judge's
   reasoning and its free-form flags: text the judge wrote after reading the attacker-controlled
