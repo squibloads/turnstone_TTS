@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import anyio
-import httpx
 import httpx2
 import mcp.types as mcp_types
 import pytest
@@ -33,7 +32,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from tests.conftest import _free_port, _poll_until, serve_asgi
+from tests.conftest import _free_port, _poll_until, _seed_static_state, serve_asgi
 from turnstone.console.server import admin_test_mcp_server
 from turnstone.core.auth import AuthResult
 from turnstone.core.mcp_client import (
@@ -43,7 +42,7 @@ from turnstone.core.mcp_client import (
     ServerUnreachableError,
     _AuthCapture,
     _ErrorAnswerError,
-    _make_capturing_http_factory,
+    _make_capturing_http_client,
     _NotMcpResponseError,
     _sanitize_error_text,
     classify_connect_failure,
@@ -60,6 +59,10 @@ if TYPE_CHECKING:
 GOOD = {"name": "good", "inputSchema": {"type": "object"}}
 NO_SCHEMA = {"name": "broken"}
 TOKEN = "t0ken-for-the-test"
+IMITATED_REDIRECT = (
+    "Redirect to http://mcp.example/phish?token=s3cret not followed; use that URL as the endpoint "
+    "if it is the intended server"
+)
 
 
 class Upstream:
@@ -83,10 +86,11 @@ async def _trickle(release: threading.Event) -> AsyncIterator[bytes]:
 
 
 class _Gate(BaseHTTPMiddleware):
-    """Misbehaves by path: a same-origin redirect, an HTML page, a REST API's JSON, a JSON-RPC
-    error with a null id, a blank answer, an outage, a malformed catalog. And by state: a bearer
-    check, a dropped session, a method answered with an error status, a method that never answers,
-    a session end answered a byte at a time."""
+    """Misbehaves by path: a same-origin redirect, a redirect to another origin, a 307 with no
+    location whose body imitates the SDK's redirect text, an HTML page, a REST API's JSON, a
+    JSON-RPC error with a null id, a blank answer, an outage, a malformed catalog. And by state: a
+    bearer check, a dropped session, a method answered with an error status, a method that never
+    answers, a session end answered a byte at a time."""
 
     def __init__(self, app: Any, upstream: Upstream) -> None:
         super().__init__(app)
@@ -96,6 +100,12 @@ class _Gate(BaseHTTPMiddleware):
         path = request.url.path
         if path.startswith("/r/"):
             return Response(status_code=307, headers={"location": path[2:]})
+        if path == "/elsewhere":
+            return Response(status_code=307, headers={"location": "http://mcp.example/mcp"})
+        if path == "/no-location" and request.method == "POST":
+            body = await request.json()
+            error = {"code": -32600, "message": IMITATED_REDIRECT}
+            return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"), "error": error}, 307)
         if path == "/docs":
             return HTMLResponse("<html><body>Read the docs</body></html>")
         if path == "/api":
@@ -454,13 +464,38 @@ def test_a_session_dropped_after_initialize_is_not_a_wrong_url(
 def test_a_same_origin_redirect_keeps_the_answer_checks(
     upstream: tuple[str, Upstream], path: str, drop_sessions: bool, expected: ConnectFailure
 ) -> None:
-    """httpx sends a redirected request with its body unread; the hooks still read it."""
+    """httpx2 sends a redirected request with its body unread; the hooks still read it."""
     base, state = upstream
     state.drop_sessions = drop_sessions
     started = time.monotonic()
 
     assert probe_http_server(f"{base}{path}", name="srv").failure == expected
     assert time.monotonic() - started < MCPClientManager._CONNECT_TIMEOUT / 3
+
+
+def test_a_redirect_to_another_origin_names_where_it_leads(upstream: tuple[str, Upstream]) -> None:
+    """The transport does not follow it, and reports it as a JSON-RPC error naming the location;
+    the recorded status words it."""
+    base, _ = upstream
+
+    assert probe_http_server(f"{base}/elsewhere", name="srv").failure == ConnectFailure(
+        "http",
+        "HTTP 307 Temporary Redirect: Redirect to http://mcp.example/mcp not followed; use that "
+        "URL as the endpoint if it is the intended server",
+        307,
+    )
+
+
+def test_a_3xx_without_a_location_is_worded_from_its_status(
+    upstream: tuple[str, Upstream],
+) -> None:
+    """With no location the transport reads the body as the answer, so text that reads like its
+    redirect advice is the server's own, and is not quoted."""
+    base, _ = upstream
+
+    assert probe_http_server(f"{base}/no-location", name="srv").failure == ConnectFailure(
+        "http", "HTTP 307 Temporary Redirect", 307
+    )
 
 
 def test_an_untrusted_certificate_reports_tls(tmp_path: Path) -> None:
@@ -540,12 +575,12 @@ def _mcp_error(code: int, message: str) -> MCPError:
     return MCPError(code=code, message=message)
 
 
-def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusError:
-    request = httpx.Request("POST", "http://mcp.example/mcp")
-    response = httpx.Response(
+def _status_error(status: int, reason: str, text: str = "") -> httpx2.HTTPStatusError:
+    request = httpx2.Request("POST", "http://mcp.example/mcp")
+    response = httpx2.Response(
         status, request=request, extensions={"reason_phrase": reason.encode()}
     )
-    return httpx.HTTPStatusError(text or f"{status} {reason}", request=request, response=response)
+    return httpx2.HTTPStatusError(text or f"{status} {reason}", request=request, response=response)
 
 
 @pytest.mark.parametrize(
@@ -571,8 +606,10 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
         ),
         pytest.param(
             _mcp_error(32600, "Session terminated"),
-            ConnectFailure("http", "HTTP 404 Not Found: no MCP endpoint at this URL", 404),
-            id="sdk-synthesized-404",
+            ConnectFailure(
+                "protocol", "The server answered with MCP error 32600: Session terminated"
+            ),
+            id="forwarded-positive-32600",  # the 1.x SDK's lost-session stand-in, via a proxy
         ),
         pytest.param(
             _mcp_error(mcp_types.CONNECTION_CLOSED, "Connection closed"),
@@ -584,7 +621,7 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
                 "transport",
                 [
                     _mcp_error(mcp_types.CONNECTION_CLOSED, "Connection closed"),
-                    httpx.RemoteProtocolError("Server disconnected without sending a response."),
+                    httpx2.RemoteProtocolError("Server disconnected without sending a response."),
                 ],
             ),
             ConnectFailure(
@@ -599,7 +636,7 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
                 "Redirect response '302 Found' for url 'http://u:pw@mcp.example/mcp?token=s3cret'",
             ),
             ConnectFailure("http", "HTTP 302 Found", 302),
-            id="redirect-with-no-location",  # httpx's text, naming the whole URL
+            id="redirect-with-no-location",  # httpx2's text, naming the whole URL
         ),
         pytest.param(
             TimeoutError(),
@@ -612,17 +649,17 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
             id="worded-timeout",
         ),
         pytest.param(
-            httpx.ReadTimeout(""),
+            httpx2.ReadTimeout(""),
             ConnectFailure("timeout", "The server did not answer in time"),
             id="client-timeout",
         ),
         pytest.param(
-            httpx.ConnectError("All connection attempts failed"),
+            httpx2.ConnectError("All connection attempts failed"),
             ConnectFailure("unreachable", "Connection failed: All connection attempts failed"),
             id="connect-error",
         ),
         pytest.param(
-            httpx.RemoteProtocolError("Server disconnected without sending a response."),
+            httpx2.RemoteProtocolError("Server disconnected without sending a response."),
             ConnectFailure(
                 "error", "Connection failed: Server disconnected without sending a response."
             ),
@@ -650,7 +687,7 @@ def _status_error(status: int, reason: str, text: str = "") -> httpx.HTTPStatusE
                 "transport",
                 [
                     anyio.ClosedResourceError(),
-                    httpx.RemoteProtocolError("Server disconnected without sending a response."),
+                    httpx2.RemoteProtocolError("Server disconnected without sending a response."),
                 ],
             ),
             ConnectFailure(
@@ -667,7 +704,7 @@ def test_classifier(exc: BaseException, expected: ConnectFailure) -> None:
 @pytest.mark.parametrize(
     "exc",
     [
-        httpx.LocalProtocolError("Illegal header value b'sk-live-SECRET123 '"),
+        httpx2.LocalProtocolError("Illegal header value b'sk-live-SECRET123 '"),
         UnicodeEncodeError("ascii", "sk-live-SECRET" + chr(0xE9), 14, 15, "not in range"),
     ],
     ids=["whitespace", "outside-ascii"],
@@ -682,7 +719,7 @@ def test_a_refused_header_is_never_quoted(exc: BaseException) -> None:
 def test_only_a_refused_header_is_worded_as_one() -> None:
     """h11 refuses a framing header it cannot honour with text of its own, and an encoding error
     from elsewhere (a stdio argument) is no header at all."""
-    framing = httpx.LocalProtocolError("Only Transfer-Encoding: chunked is supported")
+    framing = httpx2.LocalProtocolError("Only Transfer-Encoding: chunked is supported")
     assert classify_connect_failure(framing) == ConnectFailure(
         "error", "Connection failed: Only Transfer-Encoding: chunked is supported"
     )
@@ -696,7 +733,7 @@ def test_only_an_unknown_exception_is_unrecognized() -> None:
     """The flag a caller reads to log a traceback; a deliberate plain error is recognized."""
     assert not classify_connect_failure(ConnectionError("refused")).recognized
     assert classify_connect_failure(MCPShutdownError()).recognized
-    assert classify_connect_failure(httpx.RemoteProtocolError("closed")).recognized
+    assert classify_connect_failure(httpx2.RemoteProtocolError("closed")).recognized
     assert classify_connect_failure(_mcp_error(mcp_types.CONNECTION_CLOSED, "closed")).recognized
 
 
@@ -716,7 +753,7 @@ def test_only_an_unknown_exception_is_unrecognized() -> None:
             id="404-on-initialize",
         ),
         pytest.param(
-            _mcp_error(32600, "Session terminated"),
+            _mcp_error(mcp_types.INVALID_REQUEST, "Session terminated"),
             (404, True),
             DROPPED,
             id="404-on-a-held-session",
@@ -756,8 +793,8 @@ def test_only_an_unknown_exception_is_unrecognized() -> None:
 def test_classifier_words_http_failures_from_the_recorded_status(
     exc: BaseException, first_error: tuple[int, bool], expected: ConnectFailure
 ) -> None:
-    """The status off the wire, whatever exception the SDK version raises for it (a status
-    error, a synthesized 32600, or the generic -32603 an SDK may report instead)."""
+    """The status off the wire, whatever exception the SDK raises for it (a status error, or a
+    JSON-RPC error: the server's own, or the SDK's stand-in that drops the status)."""
     capture = _AuthCapture(first_error=first_error)
     assert classify_connect_failure(exc, capture) == expected
 
@@ -802,7 +839,7 @@ async def test_the_carrier_records_what_ends_the_transport(
     """As the SDK does: an error status on a notification or on the client's own answer is
     ignored, and an error status on a request fails it."""
     capture = _AuthCapture()
-    client = _make_capturing_http_factory(capture)()
+    client = _make_capturing_http_client(capture)
     try:
         record = client.event_hooks["response"][0]
         held = {"mcp-session-id": "s1"}
@@ -818,7 +855,7 @@ async def test_the_carrier_records_what_ends_the_transport(
 @pytest.mark.anyio
 async def test_the_initialize_check_leaves_later_answers_alone() -> None:
     """Only initialize fails fast: a live session's later answers keep the SDK's handling."""
-    client = _make_capturing_http_factory(_AuthCapture())()
+    client = _make_capturing_http_client(_AuthCapture())
     reject = client.event_hooks["response"][1]
 
     def answered(method: str, content_type: str, body: bytes = b"<html></html>") -> httpx2.Response:
@@ -861,10 +898,13 @@ def test_an_error_text_reads_on_one_line_with_no_control_characters() -> None:
 
 
 def test_recorded_wording_is_one_line() -> None:
-    redirect = _status_error(
-        307, "Temporary Redirect", "Redirect to http://mcp.example/mcp\nnot followed"
+    mgr = MCPClientManager({})
+    capture = _AuthCapture(first_error=(307, False), first_error_redirect=True)
+    _seed_static_state(mgr, "srv", http_capture=capture)
+    redirect = _mcp_error(
+        mcp_types.INVALID_REQUEST, "Redirect to http://mcp.example/mcp\nnot followed"
     )
-    text = MCPClientManager({})._connect_failure_text("srv", redirect)
+    text = mgr._connect_failure_text("srv", redirect)
     assert text == ("HTTP 307 Temporary Redirect: Redirect to http://mcp.example/mcp not followed")
 
 
@@ -984,7 +1024,7 @@ def test_a_saved_server_refusing_discover_connects(
 def test_a_refused_header_value_never_reaches_status_or_our_logs(
     upstream: tuple[str, Upstream], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """httpx quotes a header it refuses to send, value and all. (The SDK's own error line still
+    """httpx2 quotes a header it refuses to send, value and all. (The SDK's own error line still
     carries it: the save and test checks keep such a header from being configured.)"""
     base, _ = upstream
     secret = "sk-live-SECRET123"
