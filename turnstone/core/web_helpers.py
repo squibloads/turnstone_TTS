@@ -438,21 +438,83 @@ def auth_user_id(request: Request) -> str:
     return str(getattr(auth, "user_id", "") or "")
 
 
-def tts_text_cap(config_store: Any) -> int:
-    """The ``audio.tts_max_chars`` setting, or its default when unset or unusable.
+# Longest text one synthesis request may carry.  The browser's read-aloud sends a
+# whole message in one request, so this is also the longest message it can read.
+# A hosted backend may refuse first (OpenAI's speech models take at most 4,096
+# characters), but a local backend has no limit of its own, so this one bounds
+# the work, the buffered reply and the console's wait for it.  At ~107 chars/s,
+# the slowest backend measured, a full-cap clip takes ~75 s;
+# test_the_console_outwaits_a_full_cap_clip pins the deadlines against it.
+TTS_TEXT_CAP = 8000  # characters per synthesis request
 
-    Read per request so a change in the Settings tab applies without a restart;
-    a bad stored value must not refuse every request or lift the cap entirely.
+# How many clips a process synthesizes at once, each on a thread of its own.
+TTS_MAX_CONCURRENT = 2
+
+
+class SpeechCapacity:
+    """A process's synthesis threads, and how many of them are taken.
+
+    Each thread blocks for a whole clip, so they are a pool of their own: on the
+    default executor a few long clips would take the workers the service
+    heartbeat needs, and the console would mark a working node offline.
+
+    A play that finds every thread taken is refused rather than queued, because
+    queue time would come out of the console's wait, which a long clip needs most
+    of.  Two at once lets a play start beside a long one, and lets a user who
+    replaces a play start the new one before the old one's abort lands.  On a
+    backend that synthesizes one clip at a time, a play started beside a long one
+    waits behind it there and can still time out: after 80 s of silence at the
+    node, or at the console's 90 s.
+
+    The node and the console each hold one: the console serves coordinator
+    read-aloud itself and must not borrow a node's threads.
+
+    Only the event loop admits and releases, so the count needs no lock.
     """
-    from turnstone.core.settings_registry import DEFAULT_TTS_MAX_CHARS
 
-    if config_store is None:
-        return DEFAULT_TTS_MAX_CHARS
-    try:
-        cap = int(config_store.get("audio.tts_max_chars"))
-    except (TypeError, ValueError):
-        return DEFAULT_TTS_MAX_CHARS
-    return cap if cap > 0 else DEFAULT_TTS_MAX_CHARS
+    def __init__(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.executor = ThreadPoolExecutor(max_workers=TTS_MAX_CONCURRENT, thread_name_prefix="tts")
+        self.in_flight = 0
+
+    def try_admit(self) -> bool:
+        if self.in_flight >= TTS_MAX_CONCURRENT:
+            return False
+        self.in_flight += 1
+        return True
+
+    def release(self) -> None:
+        self.in_flight -= 1
+
+    def shutdown(self) -> None:
+        self.executor.shutdown(wait=True, cancel_futures=True)
+
+
+async def _abort_when_caller_leaves(
+    request: Request, abort_ref: Any, done: Any, poll_s: float
+) -> None:
+    """Stop synthesis when the caller hangs up.
+
+    A handler is not cancelled when its peer disconnects, and a thread cannot be
+    cancelled once it is inside the SDK read.  Closing the captured stream is
+    what stops the work: ``synthesize`` publishes the response handle on
+    ``abort_ref``, so closing it makes the next read raise and the worker return
+    instead of reading a clip nobody is waiting for.  A read already waiting on a
+    silent backend notices only when bytes arrive, and before the backend sends
+    headers there is no handle yet; the backend call's own timeout bounds both.
+
+    The caller is the browser on a direct connection, or the console, which
+    closes its node request when the browser leaves (``_proxy_tts``).  Polls
+    ``is_disconnected`` every *poll_s* seconds.
+    """
+    import asyncio
+
+    while not done.is_set():
+        await asyncio.sleep(poll_s)
+        if await request.is_disconnected():
+            abort_ref.abort()
+            return
 
 
 def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
@@ -480,15 +542,20 @@ def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | 
     return _resolve
 
 
-async def text_to_speech_response(request: Request, *, registry: Any | None) -> Response:
+async def text_to_speech_response(
+    request: Request, *, registry: Any | None, capacity: SpeechCapacity, poll_s: float = 1.0
+) -> Response:
     """Serve ``POST /v1/api/tts`` against *registry*.
 
     The node and the console hold their model registries under different
     ``app.state`` names (``registry`` / ``coord_registry``), so the caller
-    passes it in; everything else — validation, role resolution, error masking
-    — is one contract so coordinator read-aloud behaves exactly like a node's.
+    passes it in, with its own *capacity*; everything else (validation, role
+    resolution, the synthesis bounds, error masking) is one contract so
+    coordinator read-aloud behaves exactly like a node's.
     """
     import asyncio
+    import contextvars
+    import functools
 
     from starlette.responses import JSONResponse as _JSONResponse
 
@@ -498,7 +565,7 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
         resolve_role_alias,
         synthesize,
     )
-    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
     from turnstone.core.log import get_logger
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
     from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
@@ -510,11 +577,12 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
     text = str(body.get("text") or "").strip()
     if not text:
         return _JSONResponse({"error": "text is required"}, status_code=400)
-    config_store = getattr(request.app.state, "config_store", None)
-    cap = tts_text_cap(config_store)
-    if len(text) > cap:
-        return _JSONResponse({"error": f"text too long (cap {cap} chars)"}, status_code=400)
+    if len(text) > TTS_TEXT_CAP:
+        return _JSONResponse(
+            {"error": f"text too long (cap {TTS_TEXT_CAP} chars)"}, status_code=400
+        )
 
+    config_store = getattr(request.app.state, "config_store", None)
     alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
     if not alias:
         return _JSONResponse(
@@ -540,20 +608,40 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
         # not help (the regex holds the GIL).
         text = normalize_for_speech(text, parse_pronunciations(pronunciations))
 
+    if not capacity.try_admit():
+        # Refused, not queued: see SpeechCapacity.  429 like the node's other
+        # capacity refusals, which the browser retries after Retry-After.
+        return _JSONResponse(
+            {"error": "Speech synthesis is busy; try again shortly"},
+            status_code=429,
+            headers={"Retry-After": "5"},
+        )
+
     abort_ref = StreamAbortRef()
-    backend_auth_resolver = audio_backend_auth_resolver(request)
+    done = asyncio.Event()
+    watcher = asyncio.create_task(_abort_when_caller_leaves(request, abort_ref, done, poll_s))
     try:
-        # Blocking SDK round-trip — offload off the event loop.
-        speech = await asyncio.to_thread(
+        call = functools.partial(
             synthesize,
             registry=registry,
             alias=alias,
             text=text,
             voice=voice,
             config_store=config_store,
-            backend_auth_resolver=backend_auth_resolver,
+            backend_auth_resolver=audio_backend_auth_resolver(request),
             cancel_ref=abort_ref,
         )
+        # Blocking SDK round-trip, off the event loop.  The context copy carries
+        # the request's log fields, as asyncio.to_thread does.
+        context = contextvars.copy_context()
+        speech = await asyncio.get_running_loop().run_in_executor(
+            capacity.executor, context.run, call
+        )
+    except DeadlineCancelledError:
+        # Only the watcher aborts during the call, so the caller has gone and
+        # nobody reads this answer.
+        log.debug("text_to_speech.caller_left")
+        return _JSONResponse({"error": "Speech synthesis was cancelled"}, status_code=499)
     except BackendAuthUnavailableError:
         log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
         return _JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
@@ -564,7 +652,12 @@ async def text_to_speech_response(request: Request, *, registry: Any | None) -> 
         log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
         return _JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
     finally:
+        done.set()
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
         abort_ref.abort()
+        capacity.release()
 
     return Response(
         speech.audio_bytes,
@@ -971,9 +1064,9 @@ _VERSIONED_VENDOR_PATH_RE = re.compile(rf"^{_VERSIONED_VENDOR_DIR}/")
 def is_safe_static_asset_path(path: str) -> bool:
     """Return whether *path* is a canonical mount-relative asset path.
 
-    Starlette decodes percent escapes before populating ``{path:path}``, and
-    HTTPX normalizes dot segments when it builds an outbound URL.  Reject the
-    ambiguous forms before a console proxy can leave its static mount.
+    Starlette decodes percent escapes before populating ``{path:path}``, and httpx2 normalizes dot
+    segments when it builds an outbound URL.  Reject the ambiguous forms before a console proxy can
+    leave its static mount.
     """
     return (
         bool(path)

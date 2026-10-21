@@ -127,7 +127,9 @@ from turnstone.core.session_ui_base import (
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.trajectory import final_assistant_text
+from turnstone.core.web_helpers import TTS_TEXT_CAP as _TTS_TEXT_CAP  # noqa: F401 — the node's name for it
 from turnstone.core.web_helpers import RevalidatingStaticFiles
+from turnstone.core.web_helpers import SpeechCapacity as _SpeechCapacity
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
@@ -1716,12 +1718,19 @@ async def speech_to_text_stream(request: Request) -> Response:
     )
 
 
+# How often the synthesis path asks whether its caller is still there.
+_TTS_DISCONNECT_POLL_S = 1.0
+
+
 async def text_to_speech(request: Request) -> Response:
     """POST /v1/api/tts — synthesize assistant text into playable audio."""
     from turnstone.core.web_helpers import text_to_speech_response
 
     return await text_to_speech_response(
-        request, registry=getattr(request.app.state, "registry", None)
+        request,
+        registry=getattr(request.app.state, "registry", None),
+        capacity=request.app.state.tts,
+        poll_s=_TTS_DISCONNECT_POLL_S,
     )
 
 
@@ -2285,7 +2294,7 @@ def _deliver_notification(
     auth_headers: dict[str, str],
 ) -> None:
     """POST to channel gateway /v1/api/notify with retry."""
-    import httpx
+    import httpx2
 
     from turnstone.core.session import _notify_delivery_statuses, _notify_log_url
 
@@ -2315,7 +2324,7 @@ def _deliver_notification(
                 log.warning("notify_completion.invalid_url", **gateway_fields)
                 continue
             try:
-                resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
+                resp = httpx2.post(url, json=payload, timeout=10, headers=auth_headers)
                 if resp.status_code < 300:
                     # Verify at least one target was delivered (mirrors _exec_notify)
                     try:
@@ -5401,6 +5410,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
         if _t.is_alive():
             log.warning("server.daemon_thread_join_timeout", thread=_t.name)
     app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
+    app.state.tts.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -5853,6 +5863,9 @@ def create_app(
     app.state.judge_config = judge_config
     app.state.config_store = config_store
     app.state.advertise_url = advertise_url
+    # Built here rather than in the lifespan so every app, test apps included,
+    # runs synthesis through it; its threads start on first use.
+    app.state.tts = _SpeechCapacity()
 
     from turnstone.core.auth import LoginRateLimiter
 
