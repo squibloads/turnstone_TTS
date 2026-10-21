@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import httpx2
 import mcp.types as mcp_types
 import pytest
@@ -21,7 +20,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Mount
 
 from tests.conftest import (
@@ -36,7 +35,7 @@ from turnstone.core.mcp_client import (
     _AuthCapture,
     _CapturedHTTPError,
     _is_dead_transport,
-    _make_capturing_http_factory,
+    _make_capturing_http_client,
 )
 
 if TYPE_CHECKING:
@@ -53,6 +52,7 @@ class Upstream:
     def __init__(self) -> None:
         self.status = 200
         self.protocol_error = False
+        self.bare_error = False  # a failure status with no JSON-RPC error body
         self.fail_discovery = False
         self.epoch = 0
         self.sessions: list[str | None] = []
@@ -77,6 +77,10 @@ class FailOperations(BaseHTTPMiddleware):
                     request.headers.get("mcp-session-id") or f"stateless-{self.upstream.epoch}"
                 )
                 if self.upstream.status != 200 or self.upstream.protocol_error:
+                    if self.upstream.bare_error:
+                        return PlainTextResponse(
+                            "no such session", status_code=self.upstream.status
+                        )
                     return JSONResponse(
                         {
                             "jsonrpc": "2.0",
@@ -90,7 +94,7 @@ class FailOperations(BaseHTTPMiddleware):
 
 class RefuseDiscover(BaseHTTPMiddleware):
     """Answers ``server/discover`` as a 2025-11-25 server does, so the client falls back to
-    ``initialize`` and the session gets its results as SSE events."""
+    ``initialize`` and the session runs 2025-11-25."""
 
     async def dispatch(self, request: Request, call_next: Callable[..., Any]) -> Response:
         if request.method == "POST":
@@ -165,7 +169,9 @@ def _build_server() -> Server[Any]:
 
 
 @pytest.fixture
-def upstream_server() -> Iterator[tuple[str, Upstream]]:
+def upstream_server(request: pytest.FixtureRequest) -> Iterator[tuple[str, Upstream]]:
+    """A real upstream; parametrized indirectly with "2025-11-25", it refuses ``server/discover`` so
+    that sessions run that revision."""
     upstream = Upstream()
     sessions = StreamableHTTPSessionManager(app=_build_server(), json_response=True)
 
@@ -176,6 +182,8 @@ def upstream_server() -> Iterator[tuple[str, Upstream]]:
 
     app = Starlette(routes=[Mount("/", app=sessions.handle_request)], lifespan=lifespan)
     app.add_middleware(FailOperations, upstream=upstream)
+    if getattr(request, "param", None) == "2025-11-25":
+        app.add_middleware(RefuseDiscover)
     port = _free_port()
     server = uvicorn.Server(
         uvicorn.Config(
@@ -330,6 +338,35 @@ def test_http_failure_is_prompt_counted_and_reconnects(dispatch_env, kind, statu
     assert mgr._consecutive_failures.get("srv", 0) == 0
 
 
+@pytest.mark.parametrize("upstream_server", ["2025-11-25"], indirect=True)
+@pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])
+def test_a_bare_404_on_a_held_2025_11_25_session_reconnects(dispatch_env, kind):
+    """A restarted server answers the held ``mcp-session-id`` with a 404 and no JSON-RPC body.
+    The SDK reports its -32600 'Session terminated' stand-in, so only the recorded status says
+    the session is gone: it is evicted, one breaker failure is counted, and the next call opens a
+    new session."""
+    mgr, upstream, pooled = dispatch_env
+    assert _session(mgr, pooled).protocol_version == "2025-11-25"
+    upstream.status = 404
+    upstream.bare_error = True
+    started = time.monotonic()
+
+    with pytest.raises(Exception) as caught:
+        _call(mgr, kind, pooled)
+
+    elapsed = time.monotonic() - started
+    assert elapsed < 2, f"a bare 404 took {elapsed:.2f}s to reach the caller"
+    assert "HTTP 404" in str(caught.value)
+    assert mgr._consecutive_failures.get("srv", 0) == 1
+    assert _session(mgr, pooled) is None
+    assert upstream.sessions[0] == upstream.sessions[1]
+
+    upstream.status = 200
+    assert "ok" in _call(mgr, kind, pooled)
+    assert upstream.sessions[2] != upstream.sessions[1]
+    assert mgr._consecutive_failures.get("srv", 0) == 0
+
+
 @pytest.mark.parametrize("kind", ["tool", "resource", "prompt"])
 @pytest.mark.parametrize("status", [200, 400])
 def test_http_protocol_error_keeps_session_and_breaker(dispatch_env, kind, status):
@@ -393,7 +430,8 @@ def test_pool_reconnect_classifies_its_own_http_failure(dispatch_env):
     assert entry.auth_capture.status == 502
 
 
-@pytest.mark.parametrize("sdk_code", [-32600, -32603])
+# 32600: the 1.x SDK's lost-session stand-in, which a proxy built on that SDK can still forward.
+@pytest.mark.parametrize("sdk_code", [-32600, -32603, 32600])
 @pytest.mark.parametrize(
     ("status", "classification"),
     [(401, "auth_401"), (403, "auth_403"), (404, "transport"), (502, "transport")],
@@ -405,7 +443,6 @@ def test_http_status_precedes_sdk_protocol_codes(sdk_code, status, classificatio
     assert mgr._classify_failure(error) == "protocol"
 
 
-@pytest.mark.parametrize("client", [httpx, httpx2], ids=["httpx", "httpx2"])
 @pytest.mark.parametrize(
     ("error_name", "dead"),
     [
@@ -421,14 +458,13 @@ def test_http_status_precedes_sdk_protocol_codes(sdk_code, status, classificatio
         ("LocalProtocolError", False),
     ],
 )
-def test_http_exception_families(client, error_name, dead):
-    error = getattr(client, error_name)("failure")
+def test_http_exception_families(error_name, dead):
+    error = getattr(httpx2, error_name)("failure")
     assert _is_dead_transport(error) is dead
     mgr = MCPClientManager({})
     assert mgr._classify_failure(error) == ("transport" if dead else "other")
 
 
-@pytest.mark.parametrize("client", [httpx, httpx2], ids=["httpx", "httpx2"])
 @pytest.mark.parametrize(
     ("status", "held", "classification"),
     [
@@ -439,12 +475,12 @@ def test_http_exception_families(client, error_name, dead):
         (502, False, "transport"),
     ],
 )
-def test_http_status_exception_fallback(client, status, held, classification):
-    request = client.Request(
+def test_http_status_exception_fallback(status, held, classification):
+    request = httpx2.Request(
         "POST", "https://mcp.example.com/", headers={"mcp-session-id": "held"} if held else {}
     )
-    response = client.Response(status, request=request)
-    error = client.HTTPStatusError("failure", request=request, response=response)
+    response = httpx2.Response(status, request=request)
+    error = httpx2.HTTPStatusError("failure", request=request, response=response)
     assert MCPClientManager({})._classify_failure(error) == classification
 
 
@@ -452,7 +488,7 @@ def test_http_status_exception_fallback(client, status, held, classification):
 async def test_hook_keeps_first_failure_and_ignores_cleanup():
     capture = _AuthCapture()
     fired = asyncio.Event()
-    async with _make_capturing_http_factory(capture, fired)() as client:
+    async with _make_capturing_http_client(capture, fired) as client:
         hook = client.event_hooks["response"][0]
         cleanup = httpx2.Request("DELETE", "https://mcp.example.com/")
         await hook(httpx2.Response(502, request=cleanup))
@@ -464,6 +500,16 @@ async def test_hook_keeps_first_failure_and_ignores_cleanup():
         assert capture.status == 401
         assert capture.www_authenticate == "Bearer"
         assert fired.is_set()
+
+
+@pytest.mark.anyio
+async def test_connection_client_sends_its_headers_and_keeps_the_sdk_timeouts():
+    """A connection's client sends the headers it is built with, and waits 30 s to connect, write
+    or get a pooled connection and 300 s for a read, since a server may hold a stream open."""
+    client = _make_capturing_http_client(_AuthCapture(), headers={"X-Api-Key": "key-1"})
+    async with client:
+        assert client.headers["x-api-key"] == "key-1"
+        assert client.timeout == httpx2.Timeout(30.0, read=300.0)
 
 
 @pytest.mark.anyio

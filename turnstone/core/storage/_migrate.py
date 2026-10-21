@@ -26,10 +26,14 @@ def run_migrations(storage: Any, backend: str) -> None:
 
     engine = storage._engine  # noqa: SLF001
 
-    # Build Alembic config programmatically (no alembic.ini needed)
+    # Build Alembic config programmatically (no alembic.ini needed). Its options go
+    # through ConfigParser interpolation, so a literal % is written %%: an encoded
+    # certificate path or password character, or a % in a path.
     cfg = Config()
-    cfg.set_main_option("script_location", _MIGRATIONS_DIR)
-    cfg.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
+    cfg.set_main_option("script_location", _MIGRATIONS_DIR.replace("%", "%%"))
+    cfg.set_main_option(
+        "sqlalchemy.url", engine.url.render_as_string(hide_password=False).replace("%", "%%")
+    )
 
     # Check if this is an existing database without alembic_version
     if backend == "sqlite":
@@ -138,20 +142,37 @@ def _bootstrap_existing_sqlite(engine: Any, cfg: Any) -> None:
             command.stamp(cfg, "001")
 
 
+def _main() -> None:
+    """Apply migrations with the database settings the services start with."""
+    import os
+
+    from turnstone.core.config import load_config
+    from turnstone.core.log import configure_logging
+    from turnstone.core.storage import get_storage, init_storage
+
+    configure_logging(level="INFO", service="migrate")
+    # config.toml [database] first, then the environment, as the node reads them.
+    database = load_config("database")
+
+    def setting(key: str, env_name: str, default: str = "") -> str:
+        value = database.get(key)
+        return str(value) if value else os.environ.get(env_name, default)
+
+    init_storage(
+        setting("backend", "TURNSTONE_DB_BACKEND", "sqlite"),
+        path=setting("path", "TURNSTONE_DB_PATH"),
+        url=setting("url", "TURNSTONE_DB_URL"),
+        sslmode=setting("sslmode", "TURNSTONE_DB_SSLMODE"),
+        sslrootcert=setting("sslrootcert", "TURNSTONE_DB_SSLROOTCERT"),
+        sslcert=setting("sslcert", "TURNSTONE_DB_SSLCERT"),
+        sslkey=setting("sslkey", "TURNSTONE_DB_SSLKEY"),
+        run_migrations=True,
+    )
+    log.info("Migrations complete")
+    get_storage().close()
+
+
 if __name__ == "__main__":
     # Allow running as: python -m turnstone.core.storage._migrate
     # Used by Docker entrypoint to apply migrations before starting services.
-    import os
-
-    from turnstone.core.storage import get_storage, init_storage
-
-    backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
-    url = os.environ.get("TURNSTONE_DB_URL", "")
-    path = os.environ.get("TURNSTONE_DB_PATH", "")
-
-    from turnstone.core.log import configure_logging
-
-    configure_logging(level="INFO", service="migrate")
-    init_storage(backend, path=path, url=url, run_migrations=True)
-    log.info("Migrations complete")
-    get_storage().close()
+    _main()
