@@ -369,9 +369,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
     def __init__(self, path: str, *, create_tables: bool = True) -> None:
         self._path = path
         self._engine = sa.create_engine(
-            f"sqlite:///{path}",
+            # Built, not parsed, so a %XX in the path stays part of its name.
+            sa.engine.URL.create("sqlite", database=path),
             pool_pre_ping=True,
             connect_args={"check_same_thread": False, "timeout": 30},
+            # Error text names the statement, not its values; they stay on exc.params.
+            hide_parameters=True,
         )
 
         # Enable WAL mode for better concurrent read/write performance.

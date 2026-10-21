@@ -446,6 +446,26 @@ class TestMessageCog:
         thread.send.assert_awaited_once_with(MODEL_UNAVAILABLE_REPLY)
         ts.router.send_message.assert_not_awaited()
 
+    def test_mention_that_cannot_look_up_the_model_starts_nothing(self):
+        """#1377: a failed channel-model lookup leaves no empty thread and
+        doesn't fall back to the gateway's --model."""
+        from turnstone.channels._routing import MODEL_LOOKUP_FAILED_REPLY
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        cog, ts, bot = self._make_cog()
+        bot.user.mentioned_in = MagicMock(return_value=True)
+        ts.router.get_channel_default_alias = AsyncMock(side_effect=TurnstoneAPIError(503, "down"))
+        ts.router.get_or_create_workstream = AsyncMock()
+        msg = _make_message(content="<@99999> hi", channel=MagicMock(spec=discord.TextChannel))
+        msg.create_thread = AsyncMock()
+        msg.reply = AsyncMock()
+
+        _run(cog._on_message(msg))
+
+        msg.create_thread.assert_not_awaited()
+        ts.router.get_or_create_workstream.assert_not_awaited()
+        msg.reply.assert_awaited_once_with(MODEL_LOOKUP_FAILED_REPLY)
+
     def test_ignores_non_allowed_channels(self):
         cog, ts, _bot = self._make_cog()
         ts._is_allowed_channel = MagicMock(return_value=False)
@@ -540,6 +560,23 @@ class TestAskModelSelection:
 
         _, kwargs = ts.router.get_or_create_workstream.call_args
         assert kwargs["model"] == "cli-model"
+
+    def test_ask_that_cannot_look_up_the_model_starts_nothing(self):
+        """#1377: a failed channel-model lookup creates no thread and doesn't
+        fall back to the gateway's --model."""
+        from turnstone.channels._routing import MODEL_LOOKUP_FAILED_REPLY
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        cog, ts, interaction = self._make_cog_and_interaction()
+        ts.router.get_channel_default_alias = AsyncMock(side_effect=TurnstoneAPIError(503, "down"))
+
+        _run(cog._cmd_ask(interaction, "hello"))
+
+        interaction.channel.create_thread.assert_not_awaited()
+        ts.router.get_or_create_workstream.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once_with(
+            MODEL_LOOKUP_FAILED_REPLY, ephemeral=True
+        )
 
     def test_empty_model_when_no_defaults(self):
         cog, ts, interaction = self._make_cog_and_interaction()
@@ -1436,6 +1473,59 @@ class TestIsSafeImageUrl:
 
         self._patch_resolver(monkeypatch, ["fd00:ec2::23"])
         assert _run(_is_safe_image_url("http://ecs-meta.example.com/")) is False
+
+    def test_resolves_the_name_the_fetch_dials(self, monkeypatch):
+        """This host's IDNA 2003 form resolves to a public address and its IDNA 2008 form, which
+        the fetch dials, to loopback. The resolver stand-in encodes a str host with IDNA 2003, as
+        CPython's getaddrinfo does, so judging the Unicode name would check the wrong host."""
+        import socket
+
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        addresses = {
+            "strasse.example.com": "203.0.113.5",
+            "xn--strae-oqa.example.com": "127.0.0.1",
+        }
+
+        def fake(host, port, family=0, *args, **kwargs):  # noqa: ARG001
+            name = (host.encode("idna") if isinstance(host, str) else host).decode("ascii")
+            return [(family, 0, 0, "", (addresses[name], 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake)
+        url = "http://stra" + chr(0xDF) + "e.example.com/Items/abc/Images/Primary"
+        assert _run(_is_safe_image_url(url)) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://" + chr(0x2603) + ".example.com/poster.png",
+            "http://[fe80::1%" + chr(0xFC) + "]/poster.png",
+        ],
+        ids=["not-idna-2008", "non-ascii-zone"],
+    )
+    def test_a_host_the_fetch_cannot_send_is_rejected(self, monkeypatch, url):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        self._patch_resolver(monkeypatch, ["203.0.113.5"])
+        assert _run(_is_safe_image_url(url)) is False
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://stra" + chr(0xDF) + "e.example.com/poster.png",
+            "http://example" + chr(0x3002) + "com/poster.png",
+            "http://" + chr(0x212A) + ".example.com/poster.png",
+            "http://[fe80::1%25eth0]/poster.png",
+        ],
+        ids=["sharp-s", "ideographic-full-stop", "kelvin-sign", "zone-id"],
+    )
+    def test_the_guard_and_the_fetch_read_the_same_host(self, url):
+        """The guard reads the host with httpx2 and the fetch dials through the bot's httpx
+        client, so the guard checks the host the fetch reaches only while the two agree."""
+        import httpx
+        import httpx2
+
+        assert httpx.URL(url).raw_host == httpx2.URL(url).raw_host
 
 
 class TestBuildMediaEmbed:
