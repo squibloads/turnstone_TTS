@@ -1389,6 +1389,45 @@ class TestTextToSpeech:
         # A failure must give its slot back, or the node refuses for ever.
         assert client.app.state.tts.in_flight == 0
 
+    def test_text_is_normalised_before_synthesis(self, voice_app_client):
+        client, mock_client = voice_app_client
+        resp = client.post(
+            "/v1/api/tts", json={"text": "Needs ~32GB at 120ms"}, headers=_auth("userA")
+        )
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Needs about 32 gigabytes at 120 milliseconds"
+
+    def test_missing_config_store_still_normalises(self, voice_app_client, monkeypatch):
+        # No config store means defaults (normalisation on), not "off".  The alias
+        # lookup needs a store, so stub it to isolate the normalise branch.
+        import turnstone.core.audio as audio_mod
+
+        client, mock_client = voice_app_client
+        client.app.state.config_store = None
+        monkeypatch.setattr(audio_mod, "resolve_role_alias", lambda **_kw: "voice")
+        resp = client.post("/v1/api/tts", json={"text": "Needs ~32GB"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert "about 32 gigabytes" in create.call_args.kwargs["input"]
+
+    def test_normalisation_applies_pronunciations(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_pronunciations"] = "# note\nSQL = sequel"
+        resp = client.post("/v1/api/tts", json={"text": "Use SQL"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Use sequel"
+
+    def test_normalisation_can_be_disabled(self, voice_app_client):
+        client, mock_client = voice_app_client
+        client.app.state.config_store._values["audio.tts_normalize"] = False
+        resp = client.post("/v1/api/tts", json={"text": "Needs ~32GB"}, headers=_auth("userA"))
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "Needs ~32GB"
+
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         client, mock_client = voice_app_client
         create = mock_client.audio.speech.with_streaming_response.create

@@ -648,6 +648,36 @@ def _build_registry() -> dict[str, SettingDef]:
             "onyx, nova, shimmer; local backends (vLLM-Omni, Kokoro) define their own — set "
             "this to a voice your configured TTS model backend supports.",
         ),
+        SettingDef(
+            "audio.tts_normalize",
+            "bool",
+            True,
+            "Rewrite symbols, units and versions into speakable words before text-to-speech",
+            "audio",
+            help="Technical replies contain symbols, units and version numbers that speech "
+            "models read badly (~5, 32GB, 1.8.5). When on, a small English rule set rewrites "
+            "them into plain words (about 5, 32 gigabytes, 1 point 8 point 5) before the text "
+            "is sent to the TTS backend. It covers symbols, units, versions, ISO dates and "
+            "year-months, ten-digit phone numbers, file names, seconds versus decades, "
+            "abbreviations (e.g., i.e., etc., vs.) and a few technical terms such as "
+            "PostgreSQL, YAML and JSON. It works the same for every backend; turn it off for "
+            "non-English replies or a model that already handles this itself.",
+        ),
+        SettingDef(
+            "audio.tts_pronunciations",
+            "str",
+            "",
+            "Custom pronunciations for text-to-speech (one 'word = respelling' per line)",
+            "audio",
+            help="One entry per line as `word = respelling`, for example `SQL = sequel` or "
+            "`nginx = engine ex`. Matching is whole-word and case-insensitive, and applies "
+            "after the built-in rules. Write the respelling as plain words that sound right "
+            "when read aloud: plain respellings work with every TTS model, unlike phoneme or "
+            "SSML syntax. Blank lines and lines starting with # are ignored. At most 200 "
+            "entries are used; keys and respellings may be up to 100 characters. An entry "
+            "overrides a built-in respelling, and a later duplicate line wins. Only used when "
+            "text normalisation is on.",
+        ),
         # -- judge ----------------------------------------------------------
         SettingDef(
             "judge.enabled",
