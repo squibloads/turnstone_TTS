@@ -1,11 +1,9 @@
 """Phase 7 integration tests — per-user catalog scoping.
 
-These tests drive ``_connect_one_pool`` against a real
-``streamablehttp_client`` with the SDK's response hook bound to an
-``httpx.MockTransport`` (R6 verified the happy path closes cleanly and
-a mid-discovery 401 propagates through anyio TaskGroup unwinding).
-Direct method injection on ``MagicMock`` as the SOLE gate is
-forbidden — invariant 14 of the OAuth-MCP RFC.
+These tests drive ``_connect_one_pool`` against a real ``streamable_http_client`` with the response
+hook bound to an ``httpx2.MockTransport`` (the happy path closes cleanly, and a mid-discovery 401
+fails the connect promptly). Direct method injection on ``MagicMock`` as the SOLE gate is forbidden
+(invariant 14 of the OAuth-MCP RFC).
 
 The test scaffolding mirrors ``tests/test_mcp_pool_auth_introspection.py``
 (per-test ``running_loop_mgr`` fixture, ``_seed_oauth_server`` helper,
@@ -30,7 +28,7 @@ from turnstone.core.mcp_client import (
     MCPClientManager,
     PoolEntryState,
     _AuthCapture,
-    _make_capturing_http_factory,
+    _make_capturing_http_client,
 )
 
 # ---------------------------------------------------------------------------
@@ -70,32 +68,23 @@ def _build_mock_transport_factory(
     monkeypatch: pytest.MonkeyPatch,
     handler: Any,
 ) -> None:
-    """Wrap ``_make_capturing_http_factory`` so the resulting httpx2
-    client uses an ``httpx2.MockTransport(handler)``.
+    """Wrap ``_make_capturing_http_client`` so the client it builds uses an
+    ``httpx2.MockTransport(handler)``.
 
-    The production capturing factory is preserved (we still get the
-    response-hook plumbing); only the underlying transport is swapped.
-    Mirrors the spike v3 pattern that R6 used to verify discovery
+    The production capturing client is preserved (we still get the response-hook plumbing); only the
+    underlying transport is swapped. Mirrors the spike v3 pattern that R6 used to verify discovery
     behaviour against the real SDK.
     """
-    real_factory = _make_capturing_http_factory
+    real_builder = _make_capturing_http_client
 
-    def _wrapped_factory(
-        capture: _AuthCapture,
-        fired_event: asyncio.Event | None = None,
-    ) -> Any:
-        inner = real_factory(capture, fired_event=fired_event)
-
-        def _factory(*args: Any, **kwargs: Any) -> httpx2.AsyncClient:
-            client = inner(*args, **kwargs)
-            client._transport = httpx2.MockTransport(handler)
-            return client
-
-        return _factory
+    def _wrapped_builder(*args: Any, **kwargs: Any) -> httpx2.AsyncClient:
+        client = real_builder(*args, **kwargs)
+        client._transport = httpx2.MockTransport(handler)
+        return client
 
     monkeypatch.setattr(
-        "turnstone.core.mcp_client._make_capturing_http_factory",
-        _wrapped_factory,
+        "turnstone.core.mcp_client._make_capturing_http_client",
+        _wrapped_builder,
     )
 
 
@@ -360,7 +349,7 @@ def _connect_pool(
 
 
 # ---------------------------------------------------------------------------
-# Discovery on first connect — drives REAL streamablehttp_client + httpx
+# Discovery on first connect — drives REAL streamable_http_client + httpx2
 # MockTransport per invariant 14.
 # ---------------------------------------------------------------------------
 
@@ -371,10 +360,9 @@ def test_discovery_on_pool_connect_via_real_streamable_http(
     """``_connect_one_pool`` discovers the user's tool catalog after
     ``initialize()`` and stores it on the entry.
 
-    Drives through the real ``streamablehttp_client`` and the real
-    SDK ``ClientSession`` (only the underlying httpx transport is
-    swapped). Asserts on observable state rather than mock call count
-    so a refactor that produces the same end state still passes.
+    Drives through the real ``streamable_http_client`` and the real SDK ``ClientSession`` (only
+    the underlying httpx2 transport is swapped). Asserts on observable state rather than mock
+    call count so a refactor that produces the same end state still passes.
 
     Verified by reverting the discovery block in ``_connect_one_pool``
     (the ``await session.list_tools()`` + ``_rebuild_user_tool_map``
@@ -889,10 +877,9 @@ def test_pool_connect_list_tools_401_propagates(
     """A 401 returned to the discovery POST surfaces as an exception
     from ``_connect_one_pool`` within a bounded timeout (no hang).
 
-    The SDK propagates the 401 through anyio TaskGroup unwinding (raises
-    an ``ExceptionGroup`` from the surrounding ``streamablehttp_client``
-    context); the production reading is "discovery does not need the
-    carrier-race shape from ``_dispatch_pool_with_entry``."
+    The SDK answers the 401 with its generic JSON-RPC error (``MCPError(-32603, "Server returned
+    an error response")``, verified on mcp 2.3.0) and the response hook records the status, so
+    discovery does not need the carrier race in ``_await_session_call``.
 
     If a future SDK bump silently re-introduces the hang, this test
     will time out — ``_run_on_loop`` is invoked below with a 5s budget.
@@ -910,11 +897,9 @@ def test_pool_connect_list_tools_401_propagates(
     capture = _AuthCapture()
     fired = asyncio.Event()
     t0 = time.monotonic()
-    # The 401 surfaces as ``ExceptionGroup`` (anyio TaskGroup unwinding
-    # wraps the underlying ``HTTPStatusError``); both are ``Exception``
-    # subclasses. The point of the assertion is "the call returned/raised
-    # within the timeout instead of hanging" — the type-discrimination
-    # tests cover the carrier classification path.
+    # The 401 surfaces as the SDK's generic ``MCPError`` ("Server returned an error response"). The
+    # point of the assertion is "the call returned/raised within the timeout instead of hanging" —
+    # the type-discrimination tests cover the carrier classification path.
     with pytest.raises(Exception):  # noqa: B017 — generic catch documents the no-hang assertion
         _run_on_loop(
             loop,
@@ -1382,7 +1367,7 @@ def test_match_template_longest_prefix_within_user_scope() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 7b — discovery via REAL streamablehttp_client + httpx.MockTransport
+# Phase 7b — discovery via REAL streamable_http_client + httpx2.MockTransport
 # (invariant 14: boundary-crossing code drives through real SDK plumbing).
 # ---------------------------------------------------------------------------
 

@@ -5978,8 +5978,16 @@ def main() -> None:
     # settings.  Created early so all subsequent init code can read from it.
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.storage import get_storage as _get_cs_storage
+    from turnstone.core.storage import storage_errors
 
-    config_store = ConfigStore(storage=_get_cs_storage(), node_id=_node_id)
+    # Settings that can't be read end the boot: every default would apply, the
+    # startup prune below among them, and a supervisor restart retries the read.
+    # Any other error is a bug and keeps its traceback.
+    try:
+        config_store = ConfigStore(storage=_get_cs_storage(), node_id=_node_id)
+    except storage_errors() as exc:
+        log.error("settings.load_failed", error=str(exc))
+        raise SystemExit(1) from exc
 
     # Warn about config.toml keys that are now managed by ConfigStore
     from turnstone.core.config import warn_migrated_settings
@@ -5994,7 +6002,7 @@ def main() -> None:
     try:
         get_resolver()
     except SecretConfigError as exc:
-        log.error("secret_refs.config_invalid: %s", exc)
+        log.error("secret_refs.config_invalid", error=str(exc))
         raise SystemExit(1) from exc
 
     # Prune stale / empty workstreams on startup
@@ -6006,17 +6014,32 @@ def main() -> None:
     # config.toml [models.*]. The server has no bootstrap endpoint of its own:
     # every definition carries its endpoint, and one whose context_window is
     # 0 is auto-detected against that endpoint here and again on hot-reload.
-    from turnstone.core.model_registry import load_model_registry
+    from turnstone.core.model_registry import (
+        ModelAuthConfigError,
+        ModelConcurrencyConfigError,
+        load_model_registry,
+    )
     from turnstone.core.storage._registry import get_storage as _get_storage
 
-    registry = load_model_registry(
-        storage=_get_storage(),
-        # A node boots even with no models configured yet: it registers and
-        # shows in the console, and models added in the admin panel hot-reload
-        # in (internal_model_reload). Requests fail cleanly until then.
-        allow_empty=True,
-        detect_context_windows=True,
-    )
+    try:
+        registry = load_model_registry(
+            storage=_get_storage(),
+            # A node boots even with no models configured yet: it registers and
+            # shows in the console, and models added in the admin panel hot-reload
+            # in (internal_model_reload). Requests fail cleanly until then.
+            allow_empty=True,
+            # Definitions that can't be read end the boot, as settings do: a
+            # config.toml-only registry would leave the node degraded until a Sync.
+            strict=True,
+            detect_context_windows=True,
+        )
+    except (ModelAuthConfigError, ModelConcurrencyConfigError) as exc:
+        # Row content a restart won't change: named, like a bad [secrets] table.
+        log.error("model_registry.config_invalid", error=str(exc))
+        raise SystemExit(1) from exc
+    except storage_errors() as exc:
+        log.error("model_registry.load_failed", error=str(exc))
+        raise SystemExit(1) from exc
 
     # The routing settings (model.default_alias, model.task_alias,
     # model.task_effort) are read where they are used, never written into the

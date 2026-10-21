@@ -19,11 +19,12 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import mcp.types as mcp_types
 import pytest
 
+from tests.conftest import make_client_session_double
 from turnstone.core.mcp_client import MCPClientManager, PoolEntryState, _AuthCapture
 
 # ---------------------------------------------------------------------------
@@ -84,10 +85,9 @@ def _http_cfg() -> dict[str, Any]:
     return {"type": "streamable-http", "url": "https://mcp.example.com/mcp", "headers": {}}
 
 
-def _make_pool_session_mock() -> AsyncMock:
-    """A ClientSession-shaped mock good enough for pool connect + discovery."""
-    session = AsyncMock()
-    session.initialize = AsyncMock()
+def _make_pool_session_mock() -> MagicMock:
+    """A ClientSession double good enough for pool connect + discovery."""
+    session = make_client_session_double()
     # None caps → resources/prompts discovery is skipped; only list_tools runs.
     session.server_capabilities = None
     session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
@@ -460,7 +460,7 @@ class TestPoolTransportOwnerLifecycle:
         loop = asyncio.new_event_loop()
         stalled = asyncio.Event()
 
-        async def _owner_stalls(*_args: Any) -> None:
+        async def _owner_stalls(*_args: Any, **_kwargs: Any) -> None:
             stalled.set()
             await asyncio.Event().wait()
 
@@ -492,12 +492,12 @@ class TestPoolTransportOwnerLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# Client-kwargs contract (bearer header + auth-capture factory)
+# HTTP client contract (bearer header + response hooks)
 # ---------------------------------------------------------------------------
 
 
-class TestPoolOwnerClientKwargs:
-    def test_client_factory_present_on_every_connection(self, running_loop_mgr) -> None:
+class TestPoolOwnerHttpClient:
+    def test_capturing_client_on_every_connection(self, running_loop_mgr) -> None:
         """Explicit and entry-owned carriers both install the hook and preserve the bearer."""
         mgr, loop, _ = running_loop_mgr
         key = ("user-1", "pool-srv")
@@ -544,4 +544,31 @@ class TestPoolOwnerClientKwargs:
                 "_reject_non_mcp",
             ]
             assert fake_b["kwargs"]["http_client"].headers["Authorization"] == "Bearer tok-aaa"
+            _run(loop, mgr._teardown_pool_entry(key))
+
+    @pytest.mark.parametrize("name", ["authorization", "AUTHORIZATION", "Authorization"])
+    def test_user_bearer_replaces_an_operator_authorization_header(
+        self, running_loop_mgr, name: str
+    ) -> None:
+        """An operator Authorization header, in any casing, gives way to the user's bearer: sent
+        beside it, the operator's would come first, and a server that reads the first one would
+        take every user for the operator's credential."""
+        mgr, loop, _ = running_loop_mgr
+        key = ("user-1", "pool-srv")
+        cfg = _http_cfg()
+        cfg["headers"] = {name: "Bearer operator-key", "X-Api-Key": "key-1"}
+        patches: dict[str, Any] = {}
+        fake = _fake_transport_and_session(patches)
+        with (
+            patch(
+                "turnstone.core.mcp_client.streamable_http_client",
+                patches["streamable_http_client"],
+            ),
+            patch("turnstone.core.mcp_client.ClientSession", patches["ClientSession"]),
+            patch.object(mgr, "_tcp_probe", new=AsyncMock()),
+        ):
+            _run(loop, _connect_under_lock(mgr, key, cfg))
+            headers = fake["kwargs"]["http_client"].headers
+            assert headers.get_list("authorization") == ["Bearer tok-aaa"]
+            assert headers["x-api-key"] == "key-1"
             _run(loop, mgr._teardown_pool_entry(key))
