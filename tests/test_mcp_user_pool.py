@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import mcp.types as mcp_types
 import pytest
 
@@ -31,6 +31,7 @@ from tests._oauth_runtime_helpers import make_oauth_context
 from tests.conftest import (
     _drain_background,
     _run_on_loop,
+    make_client_session_double,
     make_mcp_token_cipher,
     stop_loop_thread,
 )
@@ -105,7 +106,7 @@ def _make_app_state(storage: SQLiteBackend, *, cipher: Any) -> SimpleNamespace:
         mcp_oauth_metadata_cache={},
         oauth_context=make_oauth_context(
             token_store=MCPTokenStore(storage, cipher, node_id="test"),
-            http_client=MagicMock(spec=httpx.AsyncClient),
+            http_client=MagicMock(spec=httpx2.AsyncClient),
         ),
     )
 
@@ -281,8 +282,7 @@ def _fake_connect_session() -> MagicMock:
     per-test doubles would silently stop matching the connect path's
     discovery sequence as it evolves.
     """
-    fake_session = MagicMock()
-    fake_session.initialize = AsyncMock(return_value=None)
+    fake_session = make_client_session_double()
     fake_caps = mcp_types.ServerCapabilities(tools=mcp_types.ToolsCapability())
     fake_session.server_capabilities = fake_caps
     fake_session.list_tools = AsyncMock(return_value=mcp_types.ListToolsResult(tools=[]))
@@ -693,6 +693,8 @@ class TestEviction:
             mgr._rebuild_user_tool_map("u0")
 
             class _RacingSession:
+                protocol_version = "2025-11-25"
+
                 async def list_tools(self, *, params: Any = None) -> Any:
                     # The entry is fully dropped and re-created while
                     # list_tools is in flight.
@@ -859,15 +861,13 @@ class TestEviction:
         assert mgr._last_pool_notification_refresh[(key, "tools")] == 456.0
 
     def test_notification_refresh_catches_exception_group(self, running_loop_mgr) -> None:
-        """A wedged anyio transport surfaces session-op failures as
-        ``BaseExceptionGroup`` — which ``except Exception`` misses. An
-        escaping group reaches ``_spawn_background``'s failure log,
-        whose ``exc_info`` serializes the chained httpx request
-        carrying ``Authorization: Bearer <token>``. The runner must
-        swallow the group (and keep the stamp) like any other refresh
-        failure. The member below is a BaseException so the group does
-        NOT collapse to ``ExceptionGroup`` (which ``Exception`` would
-        catch) — the anyio stray-cancel shape."""
+        """A wedged anyio transport surfaces session-op failures as ``BaseExceptionGroup`` — which
+        ``except Exception`` misses. An escaping group reaches ``_spawn_background``'s failure log,
+        whose ``exc_info`` serializes the chained httpx2 request carrying
+        ``Authorization: Bearer <token>``. The runner must swallow the group (and keep the stamp)
+        like any other refresh failure. The member below is a BaseException so the group does NOT
+        collapse to ``ExceptionGroup`` (which ``Exception`` would catch) — the anyio stray-cancel
+        shape."""
         mgr, loop, _ = running_loop_mgr
         key = ("u0", "pool-srv")
 
@@ -1607,30 +1607,30 @@ class TestClassifyFailure:
         Phase 6 split ``"auth"`` into ``"auth_401"`` / ``"auth_403"``
         so the dispatcher can refresh-and-retry only on 401.
         """
-        import httpx
+        import httpx2
 
         mgr = MCPClientManager({})
-        req = httpx.Request("POST", "https://mcp.example.com/sse")
-        resp = httpx.Response(401, request=req)
-        exc = httpx.HTTPStatusError("unauthorized", request=req, response=resp)
+        req = httpx2.Request("POST", "https://mcp.example.com/sse")
+        resp = httpx2.Response(401, request=req)
+        exc = httpx2.HTTPStatusError("unauthorized", request=req, response=resp)
         assert mgr._classify_failure(exc) == "auth_401"
 
     def test_http_403_classified_as_auth_403(self) -> None:
-        import httpx
+        import httpx2
 
         mgr = MCPClientManager({})
-        req = httpx.Request("POST", "https://mcp.example.com/sse")
-        resp = httpx.Response(403, request=req)
-        exc = httpx.HTTPStatusError("forbidden", request=req, response=resp)
+        req = httpx2.Request("POST", "https://mcp.example.com/sse")
+        resp = httpx2.Response(403, request=req)
+        exc = httpx2.HTTPStatusError("forbidden", request=req, response=resp)
         assert mgr._classify_failure(exc) == "auth_403"
 
     def test_http_500_classified_as_transport(self) -> None:
-        import httpx
+        import httpx2
 
         mgr = MCPClientManager({})
-        req = httpx.Request("POST", "https://mcp.example.com/sse")
-        resp = httpx.Response(500, request=req)
-        exc = httpx.HTTPStatusError("server", request=req, response=resp)
+        req = httpx2.Request("POST", "https://mcp.example.com/sse")
+        resp = httpx2.Response(500, request=req)
+        exc = httpx2.HTTPStatusError("server", request=req, response=resp)
         assert mgr._classify_failure(exc) == "transport"
 
 
@@ -1878,11 +1878,11 @@ class TestConcurrentDispatch:
         concurrent same-key calls multiplexed on a shared
         ``ClientSession``. Phase 6 reverts that for the auth-aware path
         because the per-dispatch ``_AuthCapture`` is keyed off the
-        ``httpx.AsyncClient`` event hook — releasing the lock would let
+        ``httpx2.AsyncClient`` event hook — releasing the lock would let
         a concurrent dispatch overwrite the carrier mid-flight,
         attributing one caller's 401 to another (a security bug).
 
-        Verified by reverting ``_dispatch_pool_with_entry`` to the
+        Verified by reverting ``_dispatch_pool_with_entry_call`` to the
         Phase 5 shape (release ``open_lock`` before ``call_tool`` —
         i.e. move the ``in_flight += 1`` / ``call_tool`` / decrement
         block out of the ``async with`` body) and confirming this test
