@@ -790,6 +790,14 @@ async def text_to_speech_response(
             parse_dictionary(dictionary),
             options,
         )
+        # Cleanup grows text (units and dates become words), and the cap is what
+        # sizes the backend call and the console's wait, so it bounds the text
+        # actually synthesized as well as the text sent.
+        if len(text) > TTS_TEXT_CAP:
+            return _JSONResponse(
+                {"error": f"text too long after speech cleanup (cap {TTS_TEXT_CAP} chars)"},
+                status_code=400,
+            )
 
     if not capacity.try_admit():
         # Refused, not queued: see SpeechCapacity.  429 like the node's other
