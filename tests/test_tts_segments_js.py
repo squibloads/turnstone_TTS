@@ -150,6 +150,16 @@ function authFetch(url, opts) {
     f.reply = () => finish(resolve, { ok: true, blob: async () => "audio" });
     f.refuse = (error) => finish(resolve, { ok: false, json: async () => ({ error }) });
     f.fail = (msg) => finish(reject, new Error(msg));
+    // An HTML error page from a proxy in front (a load balancer's 504): no JSON body.
+    f.page = () => finish(resolve, { ok: false, json: async () => { throw new SyntaxError("Unexpected token <"); } });
+    // A JSON error whose body the test releases later, so a run can be replaced
+    // while the player is still reading it.
+    f.slowRefuse = (error) => {
+      let release;
+      const body = new Promise((r) => { release = () => r({ error }); });
+      finish(resolve, { ok: false, json: () => body });
+      return release;
+    };
     opts.signal.addEventListener("abort", () => { if (!ignoreAbort) finish(reject, new Error("aborted")); });
     log.fetches.push(f);
   });
@@ -742,6 +752,55 @@ console.log(JSON.stringify({ afterStale, audios: log.srcs.length, fetches: log.f
     assert out["fetches"] == 3  # b's two clips; the toggle-off click started nothing new
     assert out["active"] is None
     assert out["revoked"] == ["blob:0"]
+
+
+def test_a_newer_play_aborts_the_one_still_being_synthesized() -> None:
+    # The abort is what reaches the console and the node, which stop
+    # synthesizing a clip nobody will hear (#1414); a replaced run says nothing.
+    out = _play(
+        """
+const a = button(), b = button();
+T._playMessageTTS(msg(), a); await tick();
+const first = log.fetches[0];
+T._playMessageTTS(msg(), b); await tick();
+console.log(JSON.stringify({ aborted: first.opts.signal.aborted,
+  live: log.fetches[1].opts.signal.aborted, toasts: log.toasts }));
+"""
+    )
+    assert out == {"aborted": True, "live": False, "toasts": []}
+
+
+def test_an_error_page_that_is_not_json_still_shows_a_message() -> None:
+    out = _play(
+        """
+const btn = button();
+T._playMessageTTS(msg(), btn); await tick();
+log.fetches[0].page(); await tick(); await tick();
+console.log(JSON.stringify({ toasts: log.toasts, active: T._ttsBtnActive,
+  busy: btn.cls.has("is-busy") }));
+"""
+    )
+    assert out == {
+        "toasts": [["Speech synthesis failed", "error"]],
+        "active": None,
+        "busy": False,
+    }
+
+
+def test_replacing_a_play_while_its_error_is_read_shows_nothing() -> None:
+    # The error belongs to a run the user already replaced; showing it would
+    # blame the play that is working.
+    out = _play(
+        """
+const a = button(), b = button();
+T._playMessageTTS(msg(), a); await tick();
+const release = log.fetches[0].slowRefuse("TTS model is not loaded"); await tick();
+T._playMessageTTS(msg(), b); await tick();
+release(); await tick(); await tick();
+console.log(JSON.stringify({ toasts: log.toasts, active: T._ttsBtnActive === b }));
+"""
+    )
+    assert out == {"toasts": [], "active": True}
 
 
 def test_failed_fetches_stop_playback_and_show_a_toast() -> None:
