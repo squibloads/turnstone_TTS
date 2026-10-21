@@ -1534,6 +1534,20 @@ class TestTextToSpeech:
         create = mock_client.audio.speech.with_streaming_response.create
         assert create.call_args.kwargs["input"] == "Use SQL"
 
+    def test_the_cap_bounds_the_text_after_cleanup(self, voice_app_client):
+        # Cleanup grows text ("32GB" -> "32 gigabytes"), and the cap is what sizes
+        # the backend call and the console's wait, so it must hold for the text
+        # actually synthesized, not only for what the browser sent.
+        from turnstone.server import _TTS_TEXT_CAP
+
+        client, mock_client = voice_app_client
+        text = ("32GB " * (_TTS_TEXT_CAP // 5))[:_TTS_TEXT_CAP]
+        resp = client.post("/v1/api/tts", json={"text": text}, headers=_auth("userA"))
+        assert resp.status_code == 400
+        assert "after speech cleanup" in resp.json()["error"]
+        mock_client.audio.speech.with_streaming_response.create.assert_not_called()
+        assert client.app.state.tts.in_flight == 0
+
     def test_normalisation_can_be_disabled(self, voice_app_client):
         client, mock_client = voice_app_client
         client.app.state.config_store._values["audio.tts_normalize"] = False
