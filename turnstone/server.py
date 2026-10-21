@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import collections
 import contextlib
+import contextvars
 import functools
 import hashlib
 import json
@@ -1675,7 +1676,55 @@ async def list_available_models(request: Request) -> JSONResponse:
 
 
 _STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation clips
+
+# Longest text one synthesis request may carry.  The browser's read-aloud sends a
+# whole message in one request, so this is also the longest message it can read.
+# A hosted backend may refuse first (OpenAI's speech models take at most 4,096
+# characters), but a local backend has no limit of its own, so this one bounds
+# the work, the buffered reply and the console's wait for it.  At ~107 chars/s,
+# the slowest backend measured, a full-cap clip takes ~75 s;
+# test_the_console_outwaits_a_full_cap_clip pins the deadlines against it.
 _TTS_TEXT_CAP = 8000  # characters per synthesis request
+
+# How many clips a node synthesizes at once, each on a thread of its own.
+_TTS_MAX_CONCURRENT = 2
+
+
+class _SpeechCapacity:
+    """The node's synthesis threads, and how many of them are taken.
+
+    Each thread blocks for a whole clip, so they are a pool of their own: on the
+    default executor a few long clips would take the workers the service
+    heartbeat needs, and the console would mark a working node offline.
+
+    A play that finds every thread taken is refused rather than queued, because
+    queue time would come out of the console's wait, which a long clip needs most
+    of.  Two at once lets a play start beside a long one, and lets a user who
+    replaces a play start the new one before the old one's abort lands.  On a
+    backend that synthesizes one clip at a time, a play started beside a long one
+    waits behind it there and can still time out: after 80 s of silence at the
+    node, or at the console's 90 s.
+
+    Only the event loop admits and releases, so the count needs no lock.
+    """
+
+    def __init__(self) -> None:
+        self.executor = ThreadPoolExecutor(
+            max_workers=_TTS_MAX_CONCURRENT, thread_name_prefix="tts"
+        )
+        self.in_flight = 0
+
+    def try_admit(self) -> bool:
+        if self.in_flight >= _TTS_MAX_CONCURRENT:
+            return False
+        self.in_flight += 1
+        return True
+
+    def release(self) -> None:
+        self.in_flight -= 1
+
+    def shutdown(self) -> None:
+        self.executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
@@ -1923,6 +1972,32 @@ async def speech_to_text_stream(request: Request) -> Response:
     )
 
 
+# How often the synthesis path asks whether its caller is still there.
+_TTS_DISCONNECT_POLL_S = 1.0
+
+
+async def _abort_when_caller_leaves(request: Request, abort_ref: Any, done: asyncio.Event) -> None:
+    """Stop synthesis when the caller hangs up.
+
+    A handler is not cancelled when its peer disconnects, and a thread cannot be
+    cancelled once it is inside the SDK read.  Closing the captured stream is
+    what stops the work: ``synthesize`` publishes the response handle on
+    ``abort_ref``, so closing it makes the next read raise and the worker return
+    instead of reading a clip nobody is waiting for.  A read already waiting on a
+    silent backend notices only when bytes arrive, and before the backend sends
+    headers there is no handle yet; the backend call's own timeout bounds both.
+
+    The caller is the browser on a direct connection, or the console, which
+    closes its node request when the browser leaves (``_proxy_tts``).  Polls
+    ``is_disconnected`` once a second.
+    """
+    while not done.is_set():
+        await asyncio.sleep(_TTS_DISCONNECT_POLL_S)
+        if await request.is_disconnected():
+            abort_ref.abort()
+            return
+
+
 async def text_to_speech(request: Request) -> Response:
     """POST /v1/api/tts — synthesize assistant text into playable audio."""
     from turnstone.core.audio import (
@@ -1931,7 +2006,7 @@ async def text_to_speech(request: Request) -> Response:
         resolve_role_alias,
         synthesize,
     )
-    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
     from turnstone.core.web_helpers import read_json_or_400
 
@@ -1963,20 +2038,41 @@ async def text_to_speech(request: Request) -> Response:
     if not voice and config_store is not None:
         voice = (config_store.get("audio.tts_voice") or "").strip()
 
+    capacity: _SpeechCapacity = request.app.state.tts
+    if not capacity.try_admit():
+        # Refused, not queued: see _SpeechCapacity.  429 like the node's other
+        # capacity refusals, which the browser retries after Retry-After.
+        return JSONResponse(
+            {"error": "Speech synthesis is busy; try again shortly"},
+            status_code=429,
+            headers={"Retry-After": "5"},
+        )
+
     abort_ref = StreamAbortRef()
-    backend_auth_resolver = _audio_backend_auth_resolver(request)
+    done = asyncio.Event()
+    watcher = asyncio.create_task(_abort_when_caller_leaves(request, abort_ref, done))
     try:
-        # Blocking SDK round-trip — offload off the event loop.
-        speech = await asyncio.to_thread(
+        call = functools.partial(
             synthesize,
             registry=registry,
             alias=alias,
             text=text,
             voice=voice,
             config_store=config_store,
-            backend_auth_resolver=backend_auth_resolver,
+            backend_auth_resolver=_audio_backend_auth_resolver(request),
             cancel_ref=abort_ref,
         )
+        # Blocking SDK round-trip, off the event loop.  The context copy carries
+        # the request's log fields, as asyncio.to_thread does.
+        context = contextvars.copy_context()
+        speech = await asyncio.get_running_loop().run_in_executor(
+            capacity.executor, context.run, call
+        )
+    except DeadlineCancelledError:
+        # Only the watcher aborts during the call, so the caller has gone and
+        # nobody reads this answer.
+        log.debug("text_to_speech.caller_left")
+        return JSONResponse({"error": "Speech synthesis was cancelled"}, status_code=499)
     except BackendAuthUnavailableError:
         log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
         return JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
@@ -1987,7 +2083,12 @@ async def text_to_speech(request: Request) -> Response:
         log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
         return JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
     finally:
+        done.set()
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
         abort_ref.abort()
+        capacity.release()
 
     return Response(
         speech.audio_bytes,
@@ -2556,7 +2657,7 @@ def _deliver_notification(
     auth_headers: dict[str, str],
 ) -> None:
     """POST to channel gateway /v1/api/notify with retry."""
-    import httpx
+    import httpx2
 
     from turnstone.core.session import _notify_delivery_statuses, _notify_log_url
 
@@ -2586,7 +2687,7 @@ def _deliver_notification(
                 log.warning("notify_completion.invalid_url", **gateway_fields)
                 continue
             try:
-                resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
+                resp = httpx2.post(url, json=payload, timeout=10, headers=auth_headers)
                 if resp.status_code < 300:
                     # Verify at least one target was delivered (mirrors _exec_notify)
                     try:
@@ -5672,6 +5773,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
         if _t.is_alive():
             log.warning("server.daemon_thread_join_timeout", thread=_t.name)
     app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
+    app.state.tts.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -6124,6 +6226,9 @@ def create_app(
     app.state.judge_config = judge_config
     app.state.config_store = config_store
     app.state.advertise_url = advertise_url
+    # Built here rather than in the lifespan so every app, test apps included,
+    # runs synthesis through it; its threads start on first use.
+    app.state.tts = _SpeechCapacity()
 
     from turnstone.core.auth import LoginRateLimiter
 

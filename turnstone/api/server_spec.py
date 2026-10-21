@@ -505,10 +505,11 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/tts",
         "POST",
         "Synthesize text to speech audio for browser playback using the "
-        "configured TTS model role.  Returns audio bytes; 503 when no TTS "
-        "role is configured.",
+        "configured TTS model role.  Returns audio bytes; 429 with Retry-After "
+        "when the node is already synthesizing as many clips as it runs at once; "
+        "503 when no TTS role is configured.",
         request_model=TextToSpeechRequest,
-        error_codes=[400, 502, 503],
+        error_codes=[400, 429, 502, 503],
         tags=["Chat"],
     ),
     # --- Saved workstreams ---
