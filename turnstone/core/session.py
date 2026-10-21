@@ -40,7 +40,6 @@ from datetime import UTC, datetime, timedelta
 from html import escape as _html_escape
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Protocol, cast
 
-import httpx
 import httpx2
 
 from turnstone.core import fence
@@ -103,6 +102,7 @@ from turnstone.core.completion_recovery import (
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.images import flatten_image
 from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
@@ -9469,12 +9469,12 @@ class ChatSession:
 
         ``ui.on_error`` and the persist BOTH receive the sanitized
         text — a misconfigured ``OPENAI_BASE_URL`` of the form
-        ``https://user:pass@host`` produces an httpx ``ConnectError``
+        ``https://user:pass@host`` produces an httpx2 ``ConnectError``
         whose ``str()`` carries the credentials verbatim, and they'd
         otherwise land in (a) the dashboard via ``on_error`` and (b)
         the coord LLM's prompt via inspect/wait.
 
-        Known backend boundary exceptions (httpx read/connect timeouts,
+        Known backend boundary exceptions (httpx2 read/connect timeouts,
         OpenAI/Anthropic SDK ``APITimeoutError`` / ``APIConnectionError``
         / ``NotFoundError`` / ``AuthenticationError`` / ``RateLimitError``)
         get rewritten into operator-actionable text that includes the
@@ -9594,17 +9594,14 @@ class ChatSession:
     ) -> str | None:
         """Return an enriched message for known backend boundary errors.
 
-        Returns ``None`` for exceptions outside the recognised set so the
-        caller falls back to the bare ``f"{type(exc).__name__}: {exc}"``
-        shape.  A context-window overflow is matched first by message *text* (it
-        can arrive as several exception classes); everything else is matched by
+        Returns ``None`` for exceptions outside the recognised set so the caller falls back to the
+        bare ``f"{type(exc).__name__}: {exc}"`` shape. A context-window overflow is matched first by
+        message *text* (it can arrive as several exception classes); everything else is matched by
         class name (see the ``BACKEND_*_EXC_NAMES`` sets in
-        :mod:`turnstone.core.completion_recovery`) so the same
-        helper covers
-        HTTPX/HTTPX2 ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
-        ``APITimeoutError`` / ``APIConnectionError`` /
-        ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``,
-        and the Anthropic SDK equivalents (which share names).
+        :mod:`turnstone.core.completion_recovery`) so the same helper covers httpx2 ``ReadTimeout``
+        / ``ConnectError``, OpenAI SDK ``APITimeoutError`` / ``APIConnectionError`` /
+        ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``, and the Anthropic SDK
+        equivalents (which share names).
 
         Bad input while reading the binding-derived model label silently
         degrades to a ``"?"`` placeholder rather than failing — this helper
@@ -25520,7 +25517,7 @@ class ChatSession:
             self.ui.on_error(output)
         except Exception as e:
             # exc_info=True would let chained ``__context__`` carry an
-            # ``httpx.Request`` whose ``Authorization`` header holds the
+            # ``httpx2.Request`` whose ``Authorization`` header holds the
             # per-user bearer (Phase 7b pool dispatch path). Use
             # structured fields with ``type(e).__name__`` only.
             log.warning("mcp.resource_read_failed", uri=uri, error=type(e).__name__)
@@ -25620,7 +25617,7 @@ class ChatSession:
             self.ui.on_error(output)
         except Exception as e:
             # See ``_exec_read_resource`` for the no-``exc_info`` rationale —
-            # bearer-leak via chained ``httpx.Request`` __context__.
+            # bearer-leak via chained ``httpx2.Request`` __context__.
             log.warning("mcp.prompt_invoke_failed", name=name, error=type(e).__name__)
             output = _format_mcp_dispatch_error("MCP prompt error", e)
             mcp_error = True
@@ -26265,9 +26262,12 @@ class ChatSession:
             return call_id, msg
 
         self._current_read_files.add(resolved)
+        # Flattened as it enters the conversation, like an upload: a session stores this image
+        # as sent, and a task agent sends these parts as they are.
+        image = flatten_image(raw, max_bytes=_IMAGE_SIZE_CAP)
         content_parts: list[dict[str, Any]] = [
             {"type": "text", "text": ControllerText(f"Image file: {path} ({len(raw):,} bytes)")},
-            {"type": "image_url", "image_url": {"url": _encode_image_data_uri(raw, mime)}},
+            {"type": "image_url", "image_url": {"url": _encode_image_data_uri(image, mime)}},
         ]
 
         self._report_tool_result(call_id, "read_file", f"image ({len(raw):,} bytes)")
@@ -28429,7 +28429,7 @@ class ChatSession:
                     log.warning("notify.gateway_failed", reason="invalid_url", **gateway_fields)
                     continue
                 try:
-                    resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
+                    resp = httpx2.post(url, json=payload, timeout=10, headers=auth_headers)
                     if resp.status_code < 300:
                         # Check that at least one target was actually delivered
                         try:
@@ -29398,7 +29398,7 @@ class ChatSession:
         if kind in ("web", "table", "text", "markdown"):
             # Store text-family content as UTF-8 so legacy charsets render
             # instead of erroring "not previewable": a fetch honors the
-            # response charset (httpx ``resp.text``); local / attachment bytes
+            # response charset (httpx2 ``resp.text``); local / attachment bytes
             # go through the transcode ladder.  Web additionally gains a
             # ``<base href>`` (url targets) and a title fallback.
             text = resp.text if target_kind == "url" else transcode_text(body, mime_hint)
