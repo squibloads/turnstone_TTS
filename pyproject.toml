@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "turnstone"
-version = "1.9.0a3"
+version = "1.9.0a4"
 description = "Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."
 readme = "README.md"
 license = "Apache-2.0"
@@ -36,6 +36,11 @@ dependencies = [
     # boundary depends on the transport contract.
     "anthropic>=1,<2",
     "httpx>=0.28",
+    # Not imported: httpx (not HTTPX2) verifies TLS against this bundle, so the floor goes
+    # when httpx does. emSign ECC Root CA - G3 anchors eMudhra intermediate CAs whose keys
+    # were compromised (GHSA-6q48-6c7w-9gw2); 2026.10.18 dropped all four emSign roots, and
+    # 2026.10.19 drops only G3, keeping the three unaffected ones.
+    "certifi>=2026.10.19",
     # Direct because the provider boundary catches this exception family, the
     # Anthropic tests inject HTTPX2 clients, and the guarded URL fetch is built on
     # it; the OpenAI v3 / Anthropic v1 transitive dependency alone is not an import
@@ -80,7 +85,9 @@ Issues = "https://github.com/turnstonelabs/turnstone/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=9.0", "pytest-cov>=6.0", "slack-bolt>=1.18", "aiohttp>=3.9", "fonttools[woff]>=4.66.1,<5"]
-dev = ["ruff>=0.9", "mypy>=1.14"]
+# ruff stays equal to the ruff-pre-commit rev in .pre-commit-config.yaml, which CI's lint job runs,
+# so a local check reports what CI reports.
+dev = ["ruff==0.17.1", "mypy>=1.14"]
 discord = ["discord.py>=2.4"]
 slack = ["slack-bolt>=1.18", "aiohttp>=3.9"]
 all = ["turnstone[discord,slack]"]
@@ -113,7 +120,7 @@ include = [
   "turnstone/shared_static/*.js",
   "turnstone/shared_static/katex-0.19.0/**/*",
   "turnstone/shared_static/hljs-11.12.0/**/*",
-  "turnstone/shared_static/mermaid-12.1.0/**/*",
+  "turnstone/shared_static/mermaid-12.2.0/**/*",
   "turnstone/shared_static/hls-1.7.3/**/*",
   "turnstone/shared_static/inter-4.001.1/**/*",
   "turnstone/shared_static/jetbrains-mono-2.304/**/*",
