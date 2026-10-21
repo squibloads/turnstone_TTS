@@ -302,20 +302,17 @@ _PROXY_CLIENT_TIMEOUT_S = 30
 # How long the console waits for a node's ``tts`` answer, and only for that
 # wait: connecting, writing and the pool keep _PROXY_CLIENT_TIMEOUT_S.
 #
-# The node answers only once the whole clip is synthesized, so ordinary
-# request latency does not describe this route.  The node accepts up to
-# ``_TTS_TEXT_CAP`` (8,000) characters and the slowest backend measured —
-# Kokoro-82M on CPU — synthesizes ~107 chars/s, so a full-cap request needs
-# ~75 s.  90 s covers that with margin, and ``test_the_tts_deadline_covers_a_full_cap_clip``
-# pins the two numbers together: raising the cap past what this covers fails
-# CI instead of restoring the "Node unreachable" this replaces.
-#
-# Behind the repository's AWS ECS module the ALB inherits its 60 s default
-# idle timeout, which cuts any longer wait into an HTML 504.  A deployment
-# behind that module either raises ``idle_timeout`` or splits long text into
-# clips short enough to answer inside 60 s -- which is what the chunked
-# read-aloud client does, at ~600 characters a call.
+# The node answers only once the whole clip is synthesized, so ordinary request
+# latency does not describe this route.  The node accepts up to _TTS_TEXT_CAP
+# (8,000) characters, ~75 s at the slowest backend measured (~107 chars/s), and
+# bounds its own backend call at _TTS_BACKEND_TIMEOUT_S (80 s) so that it answers
+# first.  test_the_console_outwaits_a_full_cap_clip pins the three numbers.  A
+# proxy in front of the console has to allow this long without data; the
+# repository's AWS module sets its load balancer's idle timeout to 120 s.
 _TTS_PROXY_READ_TIMEOUT_S = 90.0
+
+# How often a forwarded ``tts`` call checks whether the browser is still there.
+_TTS_DEPARTURE_POLL_S = 1.0
 
 
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
@@ -3634,6 +3631,8 @@ async def proxy_api(request: Request) -> Response:
         )
 
     if request.method in ("POST", "PUT", "DELETE"):
+        if path == "tts":
+            return await _proxy_tts(request, server_url, path, api_prefix=api_prefix)
         return await _proxy_post(request, server_url, path, api_prefix=api_prefix)
 
     return await _proxy_get(request, server_url, f"{api_prefix}/{path}")
@@ -3718,11 +3717,45 @@ async def _proxy_post(
     except REQUEST_FAILURES as exc:
         log.debug("Proxy %s error for %r: %s", request.method, f"{api_prefix}/{path}", exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    # A busy node's 429 names its wait in Retry-After, and the browser's
+    # authFetch waits that long before retrying.  Only delta-seconds pass.
+    retry_after = resp.headers.get("retry-after", "")
     return Response(
         content=resp.content,
         status_code=resp.status_code,
         media_type=resp.headers.get("content-type", "application/json"),
+        headers=(
+            {"Retry-After": retry_after}
+            if retry_after.isascii() and retry_after.isdigit()
+            else None
+        ),
     )
+
+
+async def _proxy_tts(request: Request, server_url: str, path: str, *, api_prefix: str) -> Response:
+    """Forward a speech-synthesis call, and drop it if the browser leaves.
+
+    Starlette doesn't cancel a handler whose client has gone, so the console
+    would otherwise hold the node request until the clip is done or
+    _TTS_PROXY_READ_TIMEOUT_S passes, and the node would keep synthesizing for
+    nobody.  Cancelling the forwarded call closes the node connection, which the
+    node's own watcher turns into an abort of its backend call.
+    """
+    # Read the body first: is_disconnected() would otherwise swallow it.
+    await request.body()
+    call = asyncio.create_task(_proxy_post(request, server_url, path, api_prefix=api_prefix))
+    try:
+        while True:
+            done, _ = await asyncio.wait({call}, timeout=_TTS_DEPARTURE_POLL_S)
+            if done:
+                return call.result()
+            if await request.is_disconnected():
+                call.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await call
+                return JSONResponse({"error": "Speech synthesis was cancelled"}, status_code=499)
+    finally:
+        call.cancel()
 
 
 async def _proxy_sse(

@@ -2120,6 +2120,38 @@ class TestConsoleProxy:
             sse_args = sse_mock.await_args
             assert sse_args.args[2] == f"workstreams/{ws_id}/events"
 
+    def test_proxy_api_routes_tts_through_the_departure_watch(self, client, mock_collector):
+        """A browser that leaves a read-aloud call has to reach the node, so
+        ``tts`` goes through ``_proxy_tts``; every other POST stays on
+        ``_proxy_post``."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+
+        mock_collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "reachable": True,
+        }
+        with (
+            patch(
+                "turnstone.console.server._proxy_tts",
+                new_callable=AsyncMock,
+                return_value=Response("ok", status_code=200),
+            ) as tts_mock,
+            patch(
+                "turnstone.console.server._proxy_post",
+                new_callable=AsyncMock,
+                return_value=Response("ok", status_code=200),
+            ) as post_mock,
+        ):
+            client.post("/node/node-a/v1/api/tts", json={"text": "hi"})
+            client.post("/node/node-a/v1/api/workstreams/new", json={})
+        assert tts_mock.await_count == 1
+        assert tts_mock.await_args.args[2] == "tts"
+        assert post_mock.await_count == 1
+        assert post_mock.await_args.args[2] == "workstreams/new"
+
     def test_proxy_api_global_events_still_routes_to_sse(self, client, mock_collector):
         """The bare ``events/global`` path was the only SSE path the
         proxy recognized before the per-ws fix. Verify it still routes
@@ -3598,9 +3630,9 @@ class TestProxyTtsTimeout:
         }
 
     def test_a_differently_built_client_is_followed(self, monkeypatch):
-        # The regression this guards: rebuilding the timeout from the module
-        # constant silently reset connect/write/pool whenever a client was built
-        # with anything else (the mTLS re-create is the live example).
+        # Both proxy clients are built with _PROXY_CLIENT_TIMEOUT_S today; the
+        # derivation keeps whatever bounds a client is built with, rather than
+        # resetting connect/write/pool to that constant.
         import httpx2
 
         timeout = httpx2.Timeout(connect=7.0, read=9.0, write=11.0, pool=13.0)
@@ -3608,16 +3640,136 @@ class TestProxyTtsTimeout:
         assert (applied["connect"], applied["write"], applied["pool"]) == (7.0, 11.0, 13.0)
 
     def test_the_console_outwaits_a_full_cap_clip(self):
-        """The two numbers must stay coherent, or the node accepts text the
-        console abandons -- the bug this replaces, which shipped because the cap
-        and the wait were configured independently.
+        """The three numbers must stay in order, or the node accepts text the
+        console abandons, which is the bug this replaces.
 
-        A cap raised past what the deadline covers fails here rather than in
-        production.  ~107 chars/s is Kokoro-82M on CPU, the slowest backend
+        A full-cap clip fits inside the node's backend timeout, and that timeout
+        ends before the console stops waiting, so the node frees the call and
+        answers its own error first.  ~107 chars/s is the slowest backend
         measured, so the margin is real on anything faster.
         """
         from turnstone.console.server import _TTS_PROXY_READ_TIMEOUT_S
+        from turnstone.core.audio import _TTS_BACKEND_TIMEOUT_S
         from turnstone.server import _TTS_TEXT_CAP
 
         slowest_measured_chars_per_second = 107
-        assert _TTS_TEXT_CAP / slowest_measured_chars_per_second <= _TTS_PROXY_READ_TIMEOUT_S
+        full_cap_clip_s = _TTS_TEXT_CAP / slowest_measured_chars_per_second
+        assert full_cap_clip_s <= _TTS_BACKEND_TIMEOUT_S < _TTS_PROXY_READ_TIMEOUT_S
+
+
+class TestProxyTtsDeparture:
+    """A browser that leaves a ``tts`` call must reach the node, which only stops
+    synthesizing when its own caller, the console, hangs up."""
+
+    @staticmethod
+    def _request(client, *, gone):
+        async def _body():
+            return b'{"text": "hello"}'
+
+        async def _is_disconnected():
+            return gone()
+
+        return SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(proxy_client=client)),
+            method="POST",
+            body=_body,
+            headers={"content-type": "application/json"},
+            url=SimpleNamespace(query=""),
+            is_disconnected=_is_disconnected,
+        )
+
+    def test_a_departed_browser_cancels_the_node_call(self, monkeypatch):
+        import httpx2
+
+        from turnstone.console import server as csrv
+
+        monkeypatch.setattr(csrv, "_TTS_DEPARTURE_POLL_S", 0.01)
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+        node_saw: list[str] = []
+
+        async def _node(request):
+            node_saw.append("request")
+            try:
+                await asyncio.sleep(30)  # synthesizing
+            except asyncio.CancelledError:
+                node_saw.append("cancelled")
+                raise
+            return httpx2.Response(200, content=b"audio")
+
+        async def _run():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(_node)) as client:
+                request = self._request(client, gone=lambda: bool(node_saw))
+                return await csrv._proxy_tts(request, "http://n:1", "tts", api_prefix="v1/api")
+
+        resp = asyncio.run(_run())
+
+        assert node_saw == ["request", "cancelled"]
+        assert resp.status_code == 499
+
+    def test_a_browser_that_stays_gets_the_node_answer(self, monkeypatch):
+        import httpx2
+
+        from turnstone.console import server as csrv
+
+        monkeypatch.setattr(csrv, "_TTS_DEPARTURE_POLL_S", 0.01)
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+
+        async def _node(request):
+            await asyncio.sleep(0.05)  # a few polls' worth
+            return httpx2.Response(200, content=b"audio", headers={"content-type": "audio/mpeg"})
+
+        async def _run():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(_node)) as client:
+                request = self._request(client, gone=lambda: False)
+                return await csrv._proxy_tts(request, "http://n:1", "tts", api_prefix="v1/api")
+
+        resp = asyncio.run(_run())
+
+        assert resp.status_code == 200
+        assert resp.body == b"audio"
+
+
+class TestProxyPostRetryAfter:
+    """A busy node's 429 names its wait in Retry-After, which the browser's
+    authFetch honours, so the console has to pass it on."""
+
+    @staticmethod
+    def _post(monkeypatch, retry_after):
+        import httpx2
+
+        from turnstone.console import server as csrv
+
+        monkeypatch.setattr(csrv, "_proxy_auth_headers", lambda request: {})
+
+        async def _node(request):
+            return httpx2.Response(
+                429,
+                json={"error": "Speech synthesis is busy"},
+                headers={"Retry-After": retry_after},
+            )
+
+        async def _body():
+            return b"{}"
+
+        async def _run():
+            async with httpx2.AsyncClient(transport=httpx2.MockTransport(_node)) as client:
+                request = SimpleNamespace(
+                    app=SimpleNamespace(state=SimpleNamespace(proxy_client=client)),
+                    method="POST",
+                    body=_body,
+                    headers={"content-type": "application/json"},
+                    url=SimpleNamespace(query=""),
+                )
+                return await csrv._proxy_post(request, "http://n:1", "tts", api_prefix="v1/api")
+
+        return asyncio.run(_run())
+
+    def test_delta_seconds_pass_through(self, monkeypatch):
+        resp = self._post(monkeypatch, "5")
+        assert resp.status_code == 429
+        assert resp.headers["retry-after"] == "5"
+
+    def test_anything_else_is_dropped(self, monkeypatch):
+        resp = self._post(monkeypatch, "Wed, 21 Oct 2026 07:28:00 GMT")
+        assert resp.status_code == 429
+        assert "retry-after" not in resp.headers

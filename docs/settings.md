@@ -55,54 +55,46 @@ users to the admin Settings API.
 
 ## Speech Synthesis Limits
 
-`POST /v1/api/tts` is not a setting-driven surface. Two limits are fixed, and
-they are deliberately kept together:
+Read-aloud (`POST /v1/api/tts`) has fixed limits rather than settings:
 
 - **8,000 characters per request** (`_TTS_TEXT_CAP` in `turnstone/server.py`).
-  A longer text is refused with a 400 rather than synthesised in part. This
-  only binds on local backends: OpenAI documents a 4,096-character maximum on
-  the `input` field of its speech models, so a cloud alias refuses first.
-- **90 seconds for the console's `tts` wait** (`_TTS_PROXY_READ_TIMEOUT_S` in
-  `turnstone/console/server.py`). The node answers only once the whole clip is
-  synthesized, so ordinary request latency does not describe this route. At the
-  slowest backend measured — Kokoro-82M on CPU, ~107 chars/s — a full-cap clip
-  needs about 75 seconds. A test pins the two numbers together, so raising the
-  cap past what the deadline covers fails CI.
+  Read-aloud sends a whole message in one request, so this is also the longest
+  message it can read; a longer one is refused with a 400. A hosted backend may
+  refuse first: OpenAI's speech models take at most 4,096 characters.
+- **90 seconds for the console's wait** for a node's answer
+  (`_TTS_PROXY_READ_TIMEOUT_S` in `turnstone/console/server.py`), longer than
+  other forwarded requests get, because the node answers only once the whole
+  clip is synthesized. At ~107 characters a second, the slowest backend
+  measured, a full-length clip takes about 75 seconds.
+- **80 seconds of silence from the speech backend** (`_TTS_BACKEND_TIMEOUT_S` in
+  `turnstone/core/audio.py`), with no retries, so the node gives up and answers
+  with its own error before the console stops waiting. A transient backend
+  error fails the play; playing it again retries. A test keeps the three
+  numbers in order.
+- **Two clips at once per node** (`_TTS_MAX_CONCURRENT` in
+  `turnstone/server.py`), each on a synthesis thread of its own, so long clips
+  can't take the threads the node's other work needs. A third play is refused
+  with 429 and `Retry-After`, which the browser waits out and retries twice,
+  rather than queued, since queue time would come out of the console's 90
+  seconds. The limit is per node and shared by every user. On a backend that
+  synthesizes one clip at a time, a play started beside a long one waits behind
+  it and can still time out: after 80 seconds of silence at the node, or at the
+  console's 90 seconds.
 
-Only the read wait is extended. Connecting, writing, and the pool keep the
-proxy client's shared bound, and every other forwarded request is unchanged.
+A play the user replaces with another, or whose pane or tab closes, cancels its
+request. The console passes that on to the node, which closes the backend call
+and stops at the backend's next chunk: about two seconds after the browser
+leaves, on a backend that streams. A backend that goes silent, before its
+headers or between chunks, holds the play's slot until it sends again, at most
+80 seconds.
 
-### The wait is only as long as the shortest hop in front of it
+### Proxies in front of the console or a node
 
-The console's deadline is not the only one in the path. A load balancer or
-ingress between the browser and the console closes an idle connection on its
-own schedule, and it measures silence, not total duration: from its side the
-connection is quiet for the whole synthesis. The repository's AWS ECS module
-(`deploy/terraform/modules/aws-ecs/alb.tf`) sets no `idle_timeout`, so the ALB
-inherits the AWS default of **60 seconds**, and a longer wait is cut into an
-HTML 504 the UI cannot parse.
-
-Two consequences for operators:
-
-- Behind that module, raise the ALB `idle_timeout`, or keep each request short
-  enough to answer inside 60 seconds — roughly 6,400 characters at the rate
-  above.
-- Prefer short clips. Read-aloud splits a reply into ~600-character pieces and
-  starts playing the first while the rest render, so no single request
-  approaches either limit. That is the intended shape for long text; the cap
-  exists to bound a single request, not to be raised for long ones.
-
-### Concurrency
-
-A node synthesizes at most `_TTS_MAX_CONCURRENT` (2) clips at once and refuses
-further requests with 503 + `Retry-After` rather than queueing them. Queue time
-is spent from the same wait as synthesis, so a queued clip at the cap would
-time out and appear as "Node unreachable" — the failure this design removes.
-The node also holds each finished clip in memory twice while it is in flight
-(the SDK buffer and the response body), so the limit bounds memory as well as
-work. Note that a local CPU backend serves roughly seven continuous listeners
-at ~14 chars/s of playback against ~107 chars/s of synthesis, so concurrency
-above that does not add throughput.
+A load balancer, ingress or reverse proxy times out on silence, not on total
+duration, and the connection is silent for the whole synthesis. It has to allow
+more than 90 seconds without data on this route, or a long clip ends in an HTML
+504 instead of audio. The repository's AWS ECS module sets its load balancer's
+`idle_timeout` to 120 seconds; some ingress controllers default to 60.
 
 ---
 

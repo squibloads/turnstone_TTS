@@ -779,9 +779,20 @@ frozen.
   only once the whole clip is synthesized, so a slow or local backend outlasted the console's
   shared 30-second proxy timeout and the user saw a connection error for a node that was working
   fine. The console now allows 90 seconds for the `tts` answer and only for that wait: connecting,
-  writing, and the pool keep the shared bound, and every other forwarded request is unchanged.
-  The deadline is derived from the proxy client's own timeout rather than rebuilt from a constant,
-  so a client constructed with different bounds keeps them.
+  writing, and the pool keep the shared bound, and every other forwarded request is unchanged. A
+  proxy in front of the console has to allow 90 seconds without data on this route; the AWS ECS
+  module's load balancer now allows 120 (its `idle_timeout` was the 60-second default), and the
+  browser shows a readable error when a proxy answers with an HTML page instead.
+- **Speech synthesis no longer ties up the node, or keeps going for nobody (#1424).** Each clip
+  held a worker from the pool the service heartbeat shares, so a few slow clips could make the
+  console mark a working node offline. The backend call was retried twice, each time for the
+  whole clip, and synthesis ran to the end after the caller had left. A node now synthesizes at
+  most two clips at once, on threads of its own, and refuses a third with 429 and `Retry-After`;
+  the console now passes a node's `Retry-After` on, and the browser waits it out and retries. The
+  backend call is one attempt, bounded at 80 seconds of silence, so a transient backend error now
+  fails the play. A play that is replaced, or whose pane or tab closes, cancels its request, and
+  the console passes the departure on, so the node stops reading the clip at the backend's next
+  chunk.
 - **Channel bots no longer start conversations on the wrong model before they have fetched the
   channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
   once, every conversation started meanwhile took the setting as unset and ran for good on the

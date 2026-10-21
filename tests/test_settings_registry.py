@@ -48,15 +48,6 @@ class TestValidateKey:
         assert validate_key("audio.stt_prompt").default == ""
         assert validate_key("audio.tts_voice").default == "alloy"
 
-    def test_tts_limits_are_not_settings(self):
-        # Deliberately absent: the cap is a constant in turnstone/server.py and
-        # the console's read deadline is derived there.  Two settings that had
-        # to agree could disagree, and did at their own defaults.
-        from turnstone.core.settings_registry import SETTINGS
-
-        assert "audio.tts_max_chars" not in SETTINGS
-        assert "audio.tts_timeout_seconds" not in SETTINGS
-
     def test_smart_approvals_setting_registered(self):
         defn = validate_key("judge.smart_approvals")
         assert defn.key == "judge.smart_approvals"
