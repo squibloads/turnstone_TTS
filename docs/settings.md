@@ -19,6 +19,23 @@ At runtime, `ConfigStore` loads all settings from storage into an in-memory
 cache. Reads are lock-free dict lookups on an immutable snapshot. Writes acquire
 a lock, persist to storage, and swap the cache atomically.
 
+A node or console that can't read its settings at startup logs
+`settings.load_failed` and exits instead of running on the registry defaults,
+and a node that can't read its model definitions logs
+`model_registry.load_failed` and exits the same way. A supervisor restart (the
+shipped systemd unit's `Restart=on-failure`, a Compose restart policy,
+Kubernetes) retries the read. A reload that fails later keeps the settings that
+last loaded.
+
+The console seeds a setting from its `TURNSTONE_<SECTION>_<KEY>` environment
+variable (`TURNSTONE_TLS_ENABLED` for `tls.enabled`) while nothing is stored for
+it; a stored value, from the Settings tab or an earlier seed, wins. An empty
+variable counts as unset. Every other such variable is checked first, even one
+whose setting is stored: one its setting refuses (a bool takes `true`, `1`,
+`yes`, `false`, `0` or `no`) is logged as `config.seed_refused`, and the console
+exits without seeding any of them. A seed that can't be written is logged as
+`config.seed_failed` and ends startup too.
+
 ---
 
 ## Precedence
