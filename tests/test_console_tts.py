@@ -24,6 +24,7 @@ from tests._coord_test_helpers import _AuthMiddleware, _FakeConfigStore
 from turnstone.console.server import list_available_models, list_tts_styles, text_to_speech
 from turnstone.core.audio import AudioBackendError, AudioUnavailableError, SpeechResult
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+from turnstone.core.web_helpers import SpeechCapacity
 
 
 class _Registry:
@@ -65,6 +66,18 @@ def _registry() -> _Registry:
     )
 
 
+_capacities: list[SpeechCapacity] = []
+
+
+@pytest.fixture(autouse=True)
+def _shut_down_tts_threads():
+    # Each client's console owns synthesis threads; the leak guard wants them
+    # gone by teardown, as the console's own shutdown does.
+    yield
+    while _capacities:
+        _capacities.pop().shutdown()
+
+
 def _client(
     *,
     settings: dict[str, str] | None = None,
@@ -82,6 +95,8 @@ def _client(
     app.state.config_store = _FakeConfigStore(dict(_SETTINGS if settings is None else settings))
     app.state.coord_registry = _registry() if registry == "default" else registry
     app.state.auth_storage = storage
+    app.state.tts = SpeechCapacity()
+    _capacities.append(app.state.tts)
     client = TestClient(app)
     client.headers.update({"X-Test-User": "userA", "X-Test-Perms": ""})
     return client
@@ -268,13 +283,39 @@ def test_exactly_cap_text_is_accepted() -> None:
     assert resp.status_code == 200
 
 
-def test_cap_follows_the_tts_max_chars_setting() -> None:
-    # Same per-request setting the node reads, so one Settings change governs both.
-    resp = _client(settings={**_SETTINGS, "audio.tts_max_chars": "10"}).post(
-        "/v1/api/tts", json={"text": "x" * 11}
-    )
-    assert resp.status_code == 400
-    assert resp.json() == {"error": "text too long (cap 10 chars)"}
+def test_a_play_is_refused_while_both_threads_are_taken() -> None:
+    # The console synthesizes coordinator replies itself, so it carries the same
+    # bound as a node: refused, not queued, with the wait the browser honours.
+    client = _client()
+    capacity = client.app.state.tts
+    assert capacity.try_admit() and capacity.try_admit()
+    with patch("turnstone.core.audio.synthesize", return_value=_speech()) as synth:
+        resp = client.post("/v1/api/tts", json={"text": "hi"})
+    assert resp.status_code == 429
+    assert resp.headers["retry-after"] == "5"
+    synth.assert_not_called()
+
+
+def test_a_failed_synthesis_gives_its_slot_back() -> None:
+    client = _client()
+    with patch("turnstone.core.audio.synthesize", side_effect=AudioBackendError("boom")):
+        assert client.post("/v1/api/tts", json={"text": "hi"}).status_code == 502
+    assert client.app.state.tts.in_flight == 0
+
+
+def test_synthesis_runs_on_the_consoles_own_threads() -> None:
+    # Not the default executor, whose workers the console's own I/O needs.
+    import threading
+
+    seen: list[str] = []
+
+    def _synth(**_kw: Any) -> SpeechResult:
+        seen.append(threading.current_thread().name)
+        return _speech()
+
+    with patch("turnstone.core.audio.synthesize", side_effect=_synth):
+        assert _client().post("/v1/api/tts", json={"text": "hi"}).status_code == 200
+    assert seen and seen[0].startswith("tts")
 
 
 def test_text_is_normalized_for_speech_like_the_node() -> None:
