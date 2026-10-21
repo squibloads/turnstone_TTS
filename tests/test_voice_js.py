@@ -32,8 +32,6 @@ const VOICE_SETTING_GROUPS = [
     keys: [
       "audio.tts_voice",
       "audio.tts_playback_rate",
-      "audio.tts_max_chars",
-      "audio.tts_timeout_seconds",
       "audio.tts_style",
       "audio.tts_pronunciations",
     ],
@@ -211,8 +209,6 @@ const values = [
   value("audio.stt_dictionary_correct", false),
   value("audio.tts_voice", "alloy"),
   value("audio.tts_playback_rate", 1.25, "storage"),
-  value("audio.tts_max_chars", 8000, "storage"),
-  value("audio.tts_timeout_seconds", 30),
   value("audio.tts_normalize", true),
   value("audio.tts_style", "social"),
   value("audio.tts_pronunciations", "SQL = sequel"),
@@ -225,8 +221,6 @@ const items = _voiceSettingsFrom(values, [
   schema("audio.stt_dictionary_correct", {type: "bool", default: true}),
   schema("audio.tts_voice"),
   schema("audio.tts_playback_rate", {type: "float", default: 1.0}),
-  schema("audio.tts_max_chars", {type: "int", default: 8000, min_value: 1, max_value: 50000}),
-  schema("audio.tts_timeout_seconds", {type: "int", default: 30, min_value: 1, max_value: 600}),
   schema("audio.tts_normalize", {type: "bool", default: true}),
   schema("audio.tts_style"),
   schema("audio.tts_pronunciations"),
@@ -238,8 +232,6 @@ assert.deepEqual(items.map((item) => item.key), [
   "audio.stt_dictionary_correct",
   "audio.tts_voice",
   "audio.tts_playback_rate",
-  "audio.tts_max_chars",
-  "audio.tts_timeout_seconds",
   "audio.tts_style",
   "audio.tts_pronunciations",
   "audio.zz_future",
@@ -257,7 +249,6 @@ assert.equal(byKey["audio.tts_normalize"], undefined, "the cleanup master switch
 assert.equal(byKey["audio.stt_prompt"].source, "storage");
 assert.equal(byKey["audio.stt_prompt"].description, "audio.stt_prompt description");
 assert.equal(byKey["audio.stt_prompt"].help, "audio.stt_prompt help");
-assert.equal(byKey["audio.tts_max_chars"].max_value, 50000);
 assert.equal(byKey["audio.tts_pronunciations"].multiline, true);
 assert.deepEqual(byKey["audio.tts_style"].choices, ["", "Professional", "Social", "Plain"]);
 assert.equal(byKey["audio.tts_style"].value, "Social", "case-insensitive match, canonical spelling");

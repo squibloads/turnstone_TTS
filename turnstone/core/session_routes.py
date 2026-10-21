@@ -36,7 +36,7 @@ import contextlib
 import functools
 import re
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from starlette.responses import JSONResponse
@@ -419,6 +419,11 @@ class AttachmentUploadHelpers:
         [str, str, bytes],
         tuple[str | None, str | None, UploadRejection | None],
     ]
+    # The surface's uploads flatten their images one at a time, the rest waiting on the event
+    # loop (see attachments.gated_upload_content).  An asyncio lock serves the one loop that first
+    # waits on it, as a server process has: a test that sends requests through it concurrently
+    # must run them on one loop, through an entered TestClient.
+    flatten_gate: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @dataclass(frozen=True)
@@ -3209,6 +3214,7 @@ def make_create_handler(
 
         from turnstone.core.attachments import (
             IMAGE_SIZE_CAP,
+            any_upload_needs_flattening,
             validate_and_save_uploaded_files,
         )
         from turnstone.core.auth import require_any_permission
@@ -3711,17 +3717,25 @@ def make_create_handler(
         try:
             attachment_ids: list[str] = []
             if uploaded_files:
-                saved_ids, save_err = cast(
-                    "tuple[list[str], JSONResponse | None]",
-                    await _finish_before_unwind(
-                        asyncio.to_thread(
-                            validate_and_save_uploaded_files,
-                            uploaded_files,
-                            ws.id,
-                            uid,
-                        )
-                    ),
+                # Saving flattens the images, so when one may need it, the save takes the
+                # surface's flatten gate and waits for it on the loop, as an upload does (see
+                # gated_upload_content).
+                helpers = cfg.attachment_helpers
+                gated = helpers is not None and await asyncio.to_thread(
+                    any_upload_needs_flattening, uploaded_files
                 )
+                async with helpers.flatten_gate if helpers and gated else contextlib.nullcontext():
+                    saved_ids, save_err = cast(
+                        "tuple[list[str], JSONResponse | None]",
+                        await _finish_before_unwind(
+                            asyncio.to_thread(
+                                validate_and_save_uploaded_files,
+                                uploaded_files,
+                                ws.id,
+                                uid,
+                            )
+                        ),
+                    )
                 if save_err is not None:
                     return save_err
                 attachment_ids = saved_ids
@@ -6344,7 +6358,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
 
     async def upload(request: Request) -> Response:
         from turnstone.core.attachment_buffer import get_attachment_buffer
-        from turnstone.core.attachments import PDF_SIZE_CAP
+        from turnstone.core.attachments import PDF_SIZE_CAP, gated_upload_content
         from turnstone.core.web_helpers import read_multipart_file_or_400
 
         # The file-classification policy (sniff order, per-kind caps, allowlists)
@@ -6354,6 +6368,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
         if cfg.attachment_helpers is None:
             return JSONResponse({"error": "attachment_helpers missing"}, status_code=500)
         classify = cfg.attachment_helpers.classify_upload
+        flatten_gate = cfg.attachment_helpers.flatten_gate
 
         err_gate = await _gate(request)
         if err_gate is not None:
@@ -6383,6 +6398,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
                 status_code=rejection.status,
             )
         assert kind is not None and mime is not None  # success ⟹ both set
+        content = await gated_upload_content(kind, data, flatten_gate)
 
         # Stage in the per-node upload buffer (content-addressed: the id is the
         # content hash, so re-uploading identical bytes is idempotent).  The
@@ -6394,7 +6410,7 @@ def make_attachment_handlers(cfg: SessionEndpointConfig) -> AttachmentHandlers:
             filename=filename,
             mime_type=mime,
             kind=kind,
-            content=data,
+            content=content,
         )
         return JSONResponse(
             {
