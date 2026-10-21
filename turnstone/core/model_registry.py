@@ -709,8 +709,8 @@ class ModelRegistry:
                 raise ModelClientConstructionError(str(exc)) from exc
             except Exception as exc:
                 # SDK construction can fail on environment problems the
-                # config never sees — e.g. httpx resolving a CA-bundle
-                # path that a venv rebuild deleted (FileNotFoundError).
+                # config never sees — e.g. an ``SSL_CERT_FILE`` naming a
+                # bundle that has since been deleted (FileNotFoundError).
                 # Routes map ValueError to a 503 with the message;
                 # anything else surfaces as an opaque 500, so re-type
                 # here where the alias is known.  The message text is
@@ -1357,6 +1357,36 @@ def _coerce_context_window(raw: Any, alias: str) -> int:
     return max(0, value)
 
 
+def _coerce_override[N: (int, float)](
+    raw: Any,
+    convert: Callable[[Any], N],
+    alias: str,
+    field: str,
+    *,
+    low: N,
+    high: N | None = None,
+) -> N | None:
+    """Read a definition's ``temperature`` or ``max_tokens``; garbage becomes unset.
+
+    A value that isn't a number, or falls outside the range the console accepts, is
+    logged and left unset, as config.toml's overrides are: the definition still
+    loads, and unset means the global default. The console refuses such a value
+    when it saves one, so only a direct write to the table stores it.
+    """
+    if raw is None:
+        return None
+    value: N | None
+    try:
+        value = convert(raw)
+    except (TypeError, ValueError, OverflowError):
+        value = None
+    # NaN fails every comparison, so the range check refuses it too.
+    if value is None or not low <= value or (high is not None and not value <= high):
+        log.warning("model_registry.override_invalid", alias=alias, field=field, value=raw)
+        return None
+    return value
+
+
 def _probe_context_window(cfg: ModelConfig) -> tuple[int | None, str]:
     """Ask *cfg*'s own endpoint for its window.
 
@@ -1613,10 +1643,10 @@ def load_model_registry(
     re-raises instead of degrading to a config.toml-only registry.
     Callers that hot-reload an existing registry need this so a transient
     DB outage doesn't silently drop every DB-sourced alias when the
-    truncated result is applied via ``ModelRegistry.reload``.  Callers
-    that build a fresh registry from scratch (CLI, lifespan startup) want
-    the default behaviour — boot succeeds with a config-only fallback
-    rather than crashing on a flaky DB.
+    truncated result is applied via ``ModelRegistry.reload``.  The node's
+    boot passes it too, so a supervisor restart retries the read instead
+    of the node running degraded until a Sync (#1406).  The CLI, doctor
+    and the console's coordinator bootstrap keep the config-only fallback.
 
     ``allow_empty``: when True, returns an empty registry instead of raising
     when no models are defined anywhere.  Server entry points pass this so a
@@ -1720,8 +1750,12 @@ def load_model_registry(
                 # 0 = auto-detect, resolved per definition below
                 row_ctx = _coerce_context_window(row.get("context_window"), alias)
                 # Per-model sampling overrides (None = use global default)
-                row_temperature = row.get("temperature")
-                row_max_tokens = row.get("max_tokens")
+                row_temperature = _coerce_override(
+                    row.get("temperature"), float, alias, "temperature", low=0.0, high=2.0
+                )
+                row_max_tokens = _coerce_override(
+                    row.get("max_tokens"), int, alias, "max_tokens", low=1
+                )
                 row_reasoning_effort = row.get("reasoning_effort")
                 # Per-model reasoning flags. Defaults match the dataclass so a
                 # pre-052 row missing these columns degrades gracefully.
@@ -1755,8 +1789,8 @@ def load_model_registry(
                     provider=row_provider,
                     capabilities=caps,
                     source="db",
-                    temperature=float(row_temperature) if row_temperature is not None else None,
-                    max_tokens=int(row_max_tokens) if row_max_tokens is not None else None,
+                    temperature=row_temperature,
+                    max_tokens=row_max_tokens,
                     reasoning_effort=row_reasoning_effort
                     if row_reasoning_effort is not None
                     else None,

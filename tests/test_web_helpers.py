@@ -51,7 +51,7 @@ class TestVersionHtml:
     def test_vendored_mermaid_skipped(self):
         from turnstone.core.web_helpers import version_html
 
-        html = '<script src="/shared/mermaid-12.1.0/mermaid.min.js"></script>'
+        html = '<script src="/shared/mermaid-12.2.0/mermaid.min.js"></script>'
         result = version_html(html)
         assert result == html  # unchanged
 
@@ -386,7 +386,7 @@ class TestMultipartBodyBudget:
 
     async def _send(self, path: str, size: int) -> tuple[int, int]:
         """POST a ``size``-byte file in chunks; return the status and bytes pulled."""
-        import httpx
+        import httpx2
 
         boundary = "budget-boundary"
         parts = [
@@ -407,8 +407,8 @@ class TestMultipartBodyBudget:
                 pulled += len(part)
                 yield part
 
-        transport = httpx.ASGITransport(app=self._app())
-        async with httpx.AsyncClient(
+        transport = httpx2.ASGITransport(app=self._app())
+        async with httpx2.AsyncClient(
             transport=transport, base_url="http://app.example.com"
         ) as http:
             resp = await http.post(

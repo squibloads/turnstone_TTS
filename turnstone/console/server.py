@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-import httpx
+import httpx2
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
@@ -47,6 +47,7 @@ from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.console.coordinator_client import _serialize_messages, load_task_envelope
+from turnstone.console.log_preview import bounded_body_preview, bounded_stream_preview
 from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
 from turnstone.console.schedule_timing import (
@@ -72,6 +73,7 @@ from turnstone.core.avatar_routes import (
     upload_own_avatar_picture,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
+from turnstone.core.http_failures import REQUEST_FAILURES
 from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
 from turnstone.core.mcp_oauth import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
@@ -297,78 +299,23 @@ _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 # proxy client's granular Timeout is a separate contract.
 _PROXY_CLIENT_TIMEOUT_S = 30
 
+# How long the console waits for a node's ``tts`` answer, and only for that
+# wait: connecting, writing and the pool keep _PROXY_CLIENT_TIMEOUT_S.
+#
+# The node answers only once the whole clip is synthesized, so ordinary request
+# latency does not describe this route.  The node accepts up to _TTS_TEXT_CAP
+# (8,000) characters, ~75 s at the slowest backend measured (~107 chars/s), and
+# bounds its own backend call at _TTS_BACKEND_TIMEOUT_S (80 s) so that it answers
+# first.  test_the_console_outwaits_a_full_cap_clip pins the three numbers.  A
+# proxy in front of the console has to allow this long without data; the
+# repository's AWS module sets its load balancer's idle timeout to 120 s.
+_TTS_PROXY_READ_TIMEOUT_S = 90.0
 
-def _proxy_tts_timeout(request: Request) -> float | None:
-    """The ``audio.tts_timeout_seconds`` setting, or None to keep the pool's timeout.
-
-    The node's ``tts`` route answers only when the whole clip is synthesized, so
-    a long reply on a local backend outlasts ``_PROXY_CLIENT_TIMEOUT_S``.  Read
-    per request; an unusable value falls back to the shared timeout.
-    """
-    config_store = getattr(request.app.state, "config_store", None)
-    if config_store is None:
-        return None
-    try:
-        value = float(config_store.get("audio.tts_timeout_seconds"))
-    except (TypeError, ValueError):
-        return None
-    return value if 0 < value < float("inf") else None
+# How often a forwarded ``tts`` call checks whether the browser is still there.
+_TTS_DEPARTURE_POLL_S = 1.0
 
 
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
-
-
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
-async def _bounded_stream_preview(response: httpx.Response, cap: int = 200) -> str:
-    """Streaming counterpart of :func:`_bounded_body_preview`.
-
-    Iterates ``response.aiter_bytes`` up to ``cap * 1.3`` bytes (enough
-    for ``cap`` chars post-UTF-8 decode) so a compromised / oversized
-    upstream can't force the proxy to buffer an arbitrary error page
-    just to populate a preview.  Shares the control-char scrub with
-    the non-streaming helper so the output shape is identical across
-    sites.
-    """
-    preview_chunks: list[bytes] = []
-    read = 0
-    byte_cap = int(cap * 1.3) + 1
-    try:
-        async for chunk in response.aiter_bytes():
-            if not chunk:
-                continue
-            remaining = byte_cap - read
-            if remaining <= 0:
-                break
-            preview_chunks.append(chunk[:remaining])
-            read += len(preview_chunks[-1])
-            if read >= byte_cap:
-                break
-    except Exception:
-        return "<unreadable>"
-    decoded = b"".join(preview_chunks).decode("utf-8", "replace")
-    return _CONTROL_CHAR_RE.sub(" ", decoded)[:cap]
-
-
-def _bounded_body_preview(text: str | bytes, cap: int = 200) -> str:
-    """Return a body preview for 4xx logs capped at ``cap`` chars.
-
-    Body is already in memory on a non-streaming httpx response; this
-    helper exists so every call-site produces the same shape.
-
-    Control characters (CR, LF, NUL, ...) are replaced with spaces
-    before the cap: the preview flows into both ``log.warning`` records
-    and the operator-facing 503 ``collector_scope_error`` body, and
-    upstream-controlled newlines in either surface would let a
-    compromised node forge additional log lines or masquerade as
-    embedded remediation text.
-    """
-    if not text:
-        return ""
-    if isinstance(text, bytes):
-        text = text.decode("utf-8", "replace")
-    return _CONTROL_CHAR_RE.sub(" ", text)[:cap]
 
 
 def _dispatch_failed(node_id: str) -> JSONResponse:
@@ -836,7 +783,7 @@ class _NodeDashboardCache:
         self,
         node_id: str,
         server_url: str,
-        client: httpx.AsyncClient,
+        client: httpx2.AsyncClient,
         headers: dict[str, str],
     ) -> dict[str, Any] | None:
         now = time.monotonic()
@@ -861,7 +808,7 @@ class _NodeDashboardCache:
                     headers=headers,
                     timeout=2.0,
                 )
-            except (httpx.HTTPError, TimeoutError):
+            except (*REQUEST_FAILURES, TimeoutError):
                 resp = None
             if resp is not None:
                 status = resp.status_code
@@ -886,7 +833,7 @@ class _NodeDashboardCache:
                         node_id,
                         status,
                         server_url,
-                        _bounded_body_preview(resp.text),
+                        bounded_body_preview(resp.content),
                     )
                     return None
             self._cache[node_id] = (time.monotonic(), payload)
@@ -984,7 +931,7 @@ async def _fetch_live_block(
     server_url = _get_server_url(request, row_node_id)
     if not server_url:
         return None
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     # Route through the per-node dashboard cache — N concurrent
     # cluster_ws_detail calls to children on the same node collapse
     # to one upstream GET per 2s TTL window instead of N full
@@ -1001,7 +948,7 @@ async def _fetch_live_block(
                 headers=_proxy_auth_headers(request),
                 timeout=2.0,
             )
-        except (httpx.HTTPError, TimeoutError):
+        except (*REQUEST_FAILURES, TimeoutError):
             return None
         status = resp.status_code
         if 400 <= status < 500:
@@ -1013,14 +960,14 @@ async def _fetch_live_block(
                 row_node_id,
                 status,
                 server_url,
-                _bounded_body_preview(resp.text),
+                bounded_body_preview(resp.content),
             )
             return None
         if not (200 <= status < 300):
             return None
         try:
             raw = resp.json()
-        except (ValueError, httpx.HTTPError):
+        except (ValueError, *REQUEST_FAILURES):
             return None
         payload = raw if isinstance(raw, dict) else None
     if payload is None:
@@ -1909,7 +1856,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         "project_id": project_id,
     }
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     node_url = f"{server_url.rstrip('/')}/v1/api/workstreams/new"
     try:
@@ -1928,7 +1875,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             )
         else:
             resp = await client.post(node_url, json=ws_body, headers=headers)
-    except httpx.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
         return _dispatch_failed(node_id)
 
@@ -1948,7 +1895,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     # actionable attach-denied 403 and factory-misconfig 503 are also masked
     # to 502 — a deliberate leak boundary; do NOT surface 403/503 here without
     # re-checking the leak. Branch on the explicit success range (not
-    # raise_for_status) so a future httpx that lets a 3xx through still cannot
+    # raise_for_status) so a future httpx2 that lets a 3xx through still cannot
     # reach the 2xx json parse. Guard BOTH body reads (a 204 / non-JSON 2xx
     # would otherwise raise a JSONDecodeError → console 500 → operator retry →
     # orphan/duplicate ws).
@@ -1968,7 +1915,7 @@ async def create_workstream(request: Request) -> JSONResponse:
                 "Workstream dispatch to %s: unparseable %s success body: %s",
                 node_id,
                 resp.status_code,
-                _bounded_body_preview(resp.content),
+                bounded_body_preview(resp.content),
             )
             return _dispatch_failed(node_id)
         return JSONResponse(
@@ -2033,7 +1980,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         "Workstream dispatch to %s failed: node status %s: %s",
         node_id,
         resp.status_code,
-        _bounded_body_preview(resp.content),
+        bounded_body_preview(resp.content),
     )
     return _dispatch_failed(node_id)
 
@@ -2090,7 +2037,7 @@ async def route_create(request: Request) -> Response:
 
     raw_content_type = request.headers.get("content-type") or ""
     is_multipart = raw_content_type.lower().startswith("multipart/form-data")
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     pin = False
     body: dict[str, Any] = {}
@@ -2219,7 +2166,7 @@ async def route_create(request: Request) -> Response:
                 content=raw_body,
                 headers=upstream_headers,
             )
-        except httpx.HTTPError:
+        except REQUEST_FAILURES:
             return _record_route(
                 request,
                 "create",
@@ -2357,7 +2304,7 @@ async def route_create(request: Request) -> Response:
                 resp = await client.post(
                     f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
                 )
-            except httpx.HTTPError:
+            except REQUEST_FAILURES:
                 return _record_route(
                     request,
                     "create",
@@ -2475,7 +2422,7 @@ async def route_create(request: Request) -> Response:
             log.warning(
                 "route_create.invalid_success_body node=%s body=%s",
                 ref.node_id,
-                _bounded_body_preview(resp.content),
+                bounded_body_preview(resp.content),
             )
             return _record_route(request, "create", 502, t0, _dispatch_failed(ref.node_id))
         destination_ws_id = raw_data.get("ws_id")
@@ -2611,7 +2558,7 @@ async def route_attachment_proxy(request: Request) -> Response:
     if request.url.query:
         upstream_path += f"?{request.url.query}"
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     upstream_headers: dict[str, str] = dict(headers)
     if request.method in ("POST", "PUT", "DELETE"):
@@ -2626,7 +2573,7 @@ async def route_attachment_proxy(request: Request) -> Response:
                 content=body,
                 headers=upstream_headers,
             )
-        except httpx.HTTPError:
+        except REQUEST_FAILURES:
             return _record_route(
                 request,
                 method,
@@ -2640,7 +2587,7 @@ async def route_attachment_proxy(request: Request) -> Response:
     else:
         try:
             resp = await client.get(f"{ref.url}{upstream_path}", headers=upstream_headers)
-        except httpx.HTTPError:
+        except REQUEST_FAILURES:
             return _record_route(
                 request,
                 method,
@@ -2676,7 +2623,7 @@ async def route_attachment_proxy(request: Request) -> Response:
     )
 
 
-def _lease_refusal_holder(resp: httpx.Response) -> str | None:
+def _lease_refusal_holder(resp: httpx2.Response) -> str | None:
     """The holder a node's owner-lease refusal names ("" when unknown); None otherwise."""
     if resp.status_code != WorkstreamLeaseHeldError.status_code:
         return None
@@ -2690,12 +2637,12 @@ def _lease_refusal_holder(resp: httpx.Response) -> str | None:
     return holder if isinstance(holder, str) else ""
 
 
-def _is_lease_refusal(resp: httpx.Response) -> bool:
+def _is_lease_refusal(resp: httpx2.Response) -> bool:
     """A node refused because another process owns the workstream's lease."""
     return _lease_refusal_holder(resp) is not None
 
 
-async def _prepare_reroute(router: ConsoleRouter, resp: httpx.Response, ref: NodeRef) -> bool:
+async def _prepare_reroute(router: ConsoleRouter, resp: httpx2.Response, ref: NodeRef) -> bool:
     """Ready a re-route after a 404 or a lease refusal; False when it cannot move.
 
     A 404 may come from stale membership or overrides, so refresh first. A
@@ -2725,9 +2672,9 @@ async def _resend_if_route_moved(
     verb: str,
     t0: float,
     ref: NodeRef,
-    resp: httpx.Response,
-    send: Callable[[NodeRef], Awaitable[httpx.Response]],
-) -> tuple[NodeRef, httpx.Response] | Response:
+    resp: httpx2.Response,
+    send: Callable[[NodeRef], Awaitable[httpx2.Response]],
+) -> tuple[NodeRef, httpx2.Response] | Response:
     """Re-route once after ``resp`` and resend when the route moved.
 
     The caller decides which responses warrant this. Returns the node and
@@ -2754,7 +2701,7 @@ async def _resend_if_route_moved(
         return ref, resp
     try:
         return new_ref, await send(new_ref)
-    except httpx.HTTPError:
+    except REQUEST_FAILURES:
         return _record_route(
             request,
             verb,
@@ -3000,14 +2947,14 @@ async def route_proxy(request: Request) -> Response:
     path = request.url.path
     upstream_path = path.replace("/api/route/", "/api/", 1)
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     http_method = request.method
     try:
         resp = await client.request(
             http_method, f"{ref.url}{upstream_path}", json=body, headers=headers
         )
-    except httpx.HTTPError:
+    except REQUEST_FAILURES:
         return _record_route(
             request,
             verb,
@@ -3140,12 +3087,12 @@ async def route_workstream_delete(request: Request) -> Response:
             JSONResponse({"error": "routing failed"}, status_code=503),
         )
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     upstream_url = f"{ref.url}/v1/api/workstreams/{ws_id}/delete"
     try:
         resp = await client.post(upstream_url, json=body, headers=headers)
-    except httpx.HTTPError:
+    except REQUEST_FAILURES:
         return _record_route(
             request,
             "delete",
@@ -3389,7 +3336,7 @@ async def route_workstream_live(request: Request) -> Response:
             JSONResponse({"error": "routing failed"}, status_code=503),
         )
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
 
     async def _active_rows(route_ref: NodeRef) -> tuple[list[Any] | None, Response | None]:
@@ -3398,7 +3345,7 @@ async def route_workstream_live(request: Request) -> Response:
                 f"{route_ref.url}/v1/api/workstreams",
                 headers=headers,
             )
-        except httpx.HTTPError:
+        except REQUEST_FAILURES:
             return None, JSONResponse(
                 {"error": f"upstream node {route_ref.node_id} unreachable"},
                 status_code=502,
@@ -3413,7 +3360,7 @@ async def route_workstream_live(request: Request) -> Response:
 
         try:
             payload = resp.json()
-        except (ValueError, httpx.HTTPError):
+        except (ValueError, *REQUEST_FAILURES):
             payload = None
         rows = payload.get("workstreams") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
@@ -3482,35 +3429,35 @@ async def proxy_index(request: Request) -> Response:
     if not server_url:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     safe_node = urllib.parse.quote(node_id, safe="")
     prefix = f"/node/{safe_node}"
     try:
         resp = await client.get(f"{server_url}/", headers=_proxy_auth_headers(request))
-        if resp.status_code < 200 or resp.status_code >= 300:
-            log.debug("Upstream %s returned status %s", node_id, resp.status_code)
-            return JSONResponse(
-                {"error": "Upstream server error", "status_code": resp.status_code},
-                status_code=resp.status_code,
-            )
-        page = resp.text
-        # Rewrite static asset paths
-        page = page.replace('href="/static/', f'href="{prefix}/static/')
-        page = page.replace('src="/static/', f'src="{prefix}/static/')
-        page = page.replace('href="/shared/', f'href="{prefix}/shared/')
-        page = page.replace('src="/shared/', f'src="{prefix}/shared/')
-        # Inject the proxy shim (prefix rewriting + back-to-console) after
-        # <body>.  prefix is built from a node_id already validated against
-        # _VALID_NODE_ID, so json.dumps is the only escaping the JS literal
-        # needs.
-        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
-        page = page.replace("<body>", "<body><script>" + shim_js + "</script>", 1)
-        html_resp = HTMLResponse(page)
-        html_resp.headers["Cache-Control"] = "no-cache"
-        return html_resp
-    except httpx.HTTPError as exc:
+    except REQUEST_FAILURES as exc:
         log.debug("Proxy index error for %s: %s", node_id, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    if resp.status_code < 200 or resp.status_code >= 300:
+        log.debug("Upstream %s returned status %s", node_id, resp.status_code)
+        return JSONResponse(
+            {"error": "Upstream server error", "status_code": resp.status_code},
+            status_code=resp.status_code,
+        )
+    page = resp.text
+    # Rewrite static asset paths
+    page = page.replace('href="/static/', f'href="{prefix}/static/')
+    page = page.replace('src="/static/', f'src="{prefix}/static/')
+    page = page.replace('href="/shared/', f'href="{prefix}/shared/')
+    page = page.replace('src="/shared/', f'src="{prefix}/shared/')
+    # Inject the proxy shim (prefix rewriting + back-to-console) after
+    # <body>.  prefix is built from a node_id already validated against
+    # _VALID_NODE_ID, so json.dumps is the only escaping the JS literal
+    # needs.
+    shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
+    page = page.replace("<body>", "<body><script>" + shim_js + "</script>", 1)
+    html_resp = HTMLResponse(page)
+    html_resp.headers["Cache-Control"] = "no-cache"
+    return html_resp
 
 
 def _proxy_static_request_headers(request: Request) -> dict[str, str]:
@@ -3523,7 +3470,7 @@ def _proxy_static_request_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def _proxy_static_response(resp: httpx.Response, path: str) -> Response:
+def _proxy_static_response(resp: httpx2.Response, path: str) -> Response:
     """Preserve upstream validators and apply the local static cache policy."""
     cache_control = "no-store"
     if resp.status_code in (200, 304):
@@ -3553,16 +3500,16 @@ async def _proxy_static_mount(request: Request, mount: str) -> Response:
         return _static_proxy_error("Node not found", 404)
 
     encoded_path = "/".join(urllib.parse.quote(segment, safe="") for segment in path.split("/"))
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     try:
         resp = await client.get(
             f"{server_url}/{mount}/{encoded_path}",
             headers=_proxy_static_request_headers(request),
         )
-        return _proxy_static_response(resp, path)
-    except httpx.HTTPError as exc:
-        log.debug("Proxy %s error for %s/%s: %s", mount, node_id, path, exc)
+    except REQUEST_FAILURES as exc:
+        log.debug("Proxy %s error for %r: %s", mount, f"{node_id}/{path}", exc)
         return _static_proxy_error("Node unreachable", 502)
+    return _proxy_static_response(resp, path)
 
 
 async def proxy_static(request: Request) -> Response:
@@ -3684,6 +3631,8 @@ async def proxy_api(request: Request) -> Response:
         )
 
     if request.method in ("POST", "PUT", "DELETE"):
+        if path == "tts":
+            return await _proxy_tts(request, server_url, path, api_prefix=api_prefix)
         return await _proxy_post(request, server_url, path, api_prefix=api_prefix)
 
     return await _proxy_get(request, server_url, f"{api_prefix}/{path}")
@@ -3714,63 +3663,99 @@ _PROXY_PASS_HEADERS = (
 )
 
 
-def _proxy_pass_headers(resp: httpx.Response) -> dict[str, str]:
+def _proxy_pass_headers(resp: httpx2.Response) -> dict[str, str]:
     return {h: resp.headers[h] for h in _PROXY_PASS_HEADERS if h in resp.headers}
 
 
 async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
     """Forward a GET request to the target server."""
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     target = f"{server_url}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
     try:
         resp = await client.get(target, headers=_proxy_auth_headers(request))
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-            headers=_proxy_pass_headers(resp),
-        )
-    except httpx.HTTPError as exc:
-        log.debug("Proxy GET error for %s: %s", target, exc)
+    except REQUEST_FAILURES as exc:
+        log.debug("Proxy GET error for %r: %s", target, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+        headers=_proxy_pass_headers(resp),
+    )
 
 
 async def _proxy_post(
     request: Request, server_url: str, path: str, *, api_prefix: str = "api"
 ) -> Response:
     """Forward a non-GET request (POST/PUT/DELETE) to the target server."""
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
     target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
+    headers = {"Content-Type": content_type}
+    headers.update(_proxy_auth_headers(request))
+    # The tts wait is extended from the client's own timeout rather than
+    # rebuilt from a constant, so connect/write/pool keep whatever bound the
+    # pool was actually constructed with (startup, or the mTLS re-create).
+    timeout = (
+        httpx2.Timeout(**{**client.timeout.as_dict(), "read": _TTS_PROXY_READ_TIMEOUT_S})
+        if path == "tts"
+        else client.timeout
+    )
     try:
-        headers = {"Content-Type": content_type}
-        headers.update(_proxy_auth_headers(request))
-        extra: dict[str, Any] = {}
-        if path == "tts":
-            tts_timeout = _proxy_tts_timeout(request)
-            if tts_timeout is not None:
-                # Only the wait for the clip; connecting and the pool keep the shared bound.
-                extra["timeout"] = httpx.Timeout(_PROXY_CLIENT_TIMEOUT_S, read=tts_timeout)
         resp = await client.request(
             request.method,
             target,
             content=body,
             headers=headers,
-            **extra,
+            timeout=timeout,
         )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-        )
-    except httpx.HTTPError as exc:
-        log.debug("Proxy %s error for %s/%s: %s", request.method, api_prefix, path, exc)
+    except REQUEST_FAILURES as exc:
+        log.debug("Proxy %s error for %r: %s", request.method, f"{api_prefix}/{path}", exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    # A busy node's 429 names its wait in Retry-After, and the browser's
+    # authFetch waits that long before retrying.  Only delta-seconds pass.
+    retry_after = resp.headers.get("retry-after", "")
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+        headers=(
+            {"Retry-After": retry_after}
+            if retry_after.isascii() and retry_after.isdigit()
+            else None
+        ),
+    )
+
+
+async def _proxy_tts(request: Request, server_url: str, path: str, *, api_prefix: str) -> Response:
+    """Forward a speech-synthesis call, and drop it if the browser leaves.
+
+    Starlette doesn't cancel a handler whose client has gone, so the console
+    would otherwise hold the node request until the clip is done or
+    _TTS_PROXY_READ_TIMEOUT_S passes, and the node would keep synthesizing for
+    nobody.  Cancelling the forwarded call closes the node connection, which the
+    node's own watcher turns into an abort of its backend call.
+    """
+    # Read the body first: is_disconnected() would otherwise swallow it.
+    await request.body()
+    call = asyncio.create_task(_proxy_post(request, server_url, path, api_prefix=api_prefix))
+    try:
+        while True:
+            done, _ = await asyncio.wait({call}, timeout=_TTS_DEPARTURE_POLL_S)
+            if done:
+                return call.result()
+            if await request.is_disconnected():
+                call.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await call
+                return JSONResponse({"error": "Speech synthesis was cancelled"}, status_code=499)
+    finally:
+        call.cancel()
 
 
 async def _proxy_sse(
@@ -3800,7 +3785,7 @@ async def _proxy_sse(
     if request.url.query:
         target += f"?{request.url.query}"
 
-    sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
+    sse_client: httpx2.AsyncClient = request.app.state.proxy_sse_client
     sse_auth: dict[str, str]
     if use_service_auth:
         proxy_token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
@@ -3848,30 +3833,32 @@ async def _proxy_sse(
                 "GET",
                 target,
                 headers=upstream_headers,
-                timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
+                timeout=httpx2.Timeout(connect=10, read=None, write=5, pool=None),
             ) as response:
                 if response.status_code != 200:
                     status = response.status_code
-                    body_preview = await _bounded_stream_preview(response)
+                    body_preview = await bounded_stream_preview(response)
                     # Non-200 from a service-auth-backed SSE path is
                     # operator-actionable: 4xx = scope/tenant drift,
                     # 5xx = upstream outage.  Raise the log floor to
                     # WARNING so it surfaces in ops logs; the browser
                     # also receives the error event for UX.
                     log.warning(
-                        "proxy.sse.non_200 status=%d url=%s body=%s",
+                        "proxy.sse.non_200 status=%d url=%r body=%s",
                         status,
                         target,
                         body_preview,
                     )
                     yield f"event: error\ndata: Upstream returned status {status}\n\n".encode()
                     return
+                # No per-chunk disconnect check: under ASGI spec < 2.4, which uvicorn reports for
+                # HTTP, the StreamingResponse cancels this generator when the browser goes away,
+                # which closes the upstream stream. Under 2.4 or later the response learns of the
+                # disconnect only when a send fails, at the next upstream byte.
                 async for chunk in response.aiter_bytes():
-                    if await request.is_disconnected():
-                        return
                     yield chunk
-        except httpx.HTTPError:
-            log.debug("SSE proxy stream ended for %s", target)
+        except REQUEST_FAILURES:
+            log.debug("SSE proxy stream ended for %r", target)
 
     return StreamingResponse(
         raw_stream(),
@@ -5323,7 +5310,7 @@ async def _first_safe_candidate(services: list[dict[str, Any]] | None) -> tuple[
         log.warning("collector_scope_probe.candidate_refused node=%s", nid)
 
 
-async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncClient) -> None:
+async def _verify_collector_service_scope(app: Starlette, client: httpx2.AsyncClient) -> None:
     """Probe one upstream node to confirm the collector token's scopes.
 
     The console's :class:`ClusterCollector` authenticates to upstream
@@ -5392,7 +5379,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
             headers=headers,
             timeout=_PROBE_TIMEOUT_SECONDS,
         )
-    except (httpx.HTTPError, TimeoutError) as exc:
+    except (*REQUEST_FAILURES, TimeoutError) as exc:
         log.warning(
             "collector_scope_probe.transient_error node=%s url=%s — %s",
             probe_node,
@@ -5406,7 +5393,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
         # accepted and the handler got as far as the node_id check.
         log.info("collector_scope_probe.ok node=%s url=%s", probe_node, probe_target)
         return
-    body_preview = _bounded_body_preview(resp.text)
+    body_preview = bounded_body_preview(resp.content)
     if 400 <= status < 500:
         # 403 = missing ``service`` scope on the collector token; 401 =
         # JWT rejected outright (secret mismatch / audience drift).
@@ -5414,7 +5401,7 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
         # fixes it.  Upstream body is attacker-controllable so we
         # delimit it explicitly in the 503 error text; the preview
         # already passed through the control-char scrub in
-        # _bounded_body_preview.
+        # bounded_body_preview.
         app.state.collector_scope_error = (
             f"collector token rejected by {probe_node} ({probe_target}): "
             f"HTTP {status} — upstream_body=<<<{body_preview}>>>. "
@@ -6036,12 +6023,16 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     storage = getattr(app.state, "auth_storage", None)
     config_store = None
     if storage:
-        try:
-            from turnstone.core.config_store import ConfigStore
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.storage import storage_errors
 
+        # Settings that can't be read end startup rather than run the console
+        # on every default; a supervisor restart retries the read.
+        try:
             config_store = ConfigStore(storage)
-        except Exception:
-            log.warning("Failed to initialise ConfigStore", exc_info=True)
+        except storage_errors() as exc:
+            log.error("settings.load_failed: %s", exc)
+            raise SystemExit(1) from exc
     app.state.config_store = config_store
 
     # Initialize rule registry for configurable judge rules
@@ -6063,17 +6054,17 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     _proxy_ssl = _tls_mgr.get_client_ssl_context() if _tls_mgr and _tls_mgr.ca_initialized else None
     _proxy_verify: Any = _proxy_ssl if _proxy_ssl else True
 
-    app.state.proxy_client = httpx.AsyncClient(
+    app.state.proxy_client = httpx2.AsyncClient(
         timeout=_PROXY_CLIENT_TIMEOUT_S,
-        limits=httpx.Limits(
+        limits=httpx2.Limits(
             max_connections=fan_out + 50,
             max_keepalive_connections=min(fan_out // 4, 100),
         ),
         verify=_proxy_verify,
     )
-    app.state.proxy_sse_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
-        limits=httpx.Limits(
+    app.state.proxy_sse_client = httpx2.AsyncClient(
+        timeout=httpx2.Timeout(connect=5, read=30, write=5, pool=5),
+        limits=httpx2.Limits(
             max_connections=1100, max_keepalive_connections=100, keepalive_expiry=30
         ),
         verify=_proxy_verify,
@@ -6171,7 +6162,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
         except Exception:
             log.warning("Failed to register console service", exc_info=True)
 
-    # TLS: init CA, issue console certs, start renewal
+    # TLS: init CA, issue console certs, start renewal. main() exits when the CA
+    # can't start; a failure here is logged and the console keeps serving, since
+    # nodes still enroll through that CA, and a restart retries.
     tls_mgr = getattr(app.state, "tls_manager", None)
     if tls_mgr is not None:
         try:
@@ -6213,28 +6206,33 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
             if client_ctx:
                 await app.state.proxy_client.aclose()
                 await app.state.proxy_sse_client.aclose()
-                app.state.proxy_client = httpx.AsyncClient(
+                app.state.proxy_client = httpx2.AsyncClient(
                     timeout=_PROXY_CLIENT_TIMEOUT_S,
-                    limits=httpx.Limits(
+                    limits=httpx2.Limits(
                         max_connections=app.state.fan_out_limit + 50,
                         max_keepalive_connections=min(app.state.fan_out_limit // 4, 100),
                     ),
                     verify=client_ctx,
                 )
-                app.state.proxy_sse_client = httpx.AsyncClient(
-                    timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
-                    limits=httpx.Limits(
+                app.state.proxy_sse_client = httpx2.AsyncClient(
+                    timeout=httpx2.Timeout(connect=5, read=30, write=5, pool=5),
+                    limits=httpx2.Limits(
                         max_connections=1100,
                         max_keepalive_connections=100,
                         keepalive_expiry=30,
                     ),
                     verify=client_ctx,
                 )
-                # Upgrade collector httpx client for mTLS node polling
+                # Upgrade collector httpx2 client for mTLS node polling
                 app.state.collector.upgrade_tls(tls_verify=client_ctx)
                 log.info("tls.proxy_clients.upgraded")
         except Exception:
-            log.warning("TLS initialization failed — continuing without TLS", exc_info=True)
+            log.warning(
+                "tls.console_setup_failed: the console's certificate, renewal or mTLS clients "
+                "didn't start; it keeps serving, but can't reach nodes that require mTLS until "
+                "it restarts",
+                exc_info=True,
+            )
 
     # Coordinator workstream plumbing.  Lazy — failure here is non-fatal;
     # the coordinator endpoints return 503 with a remediation message
@@ -7636,7 +7634,7 @@ async def admin_list_watches(request: Request) -> JSONResponse:
         return err
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -7677,7 +7675,7 @@ async def admin_list_watches(request: Request) -> JSONResponse:
 _VALID_WATCH_ID = re.compile(r"^[a-fA-F0-9]+$")
 
 # Max concurrent outbound requests when fanning out to cluster nodes.
-# Must stay below the httpx pool limit (set in _lifespan) to leave
+# Must stay below the httpx2 pool limit (set in _lifespan) to leave
 # headroom for non-fan-out proxy traffic (UI proxying, SSE streams).
 _NODE_FAN_OUT_LIMIT = 200  # fallback; prefer cluster.node_fan_out_limit from storage
 
@@ -7711,7 +7709,7 @@ async def admin_cancel_watch(request: Request) -> Response:
     if not server_url:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = {"Content-Type": "application/json"}
     headers.update(_proxy_auth_headers(request))
     try:
@@ -7720,13 +7718,13 @@ async def admin_cancel_watch(request: Request) -> Response:
             content=b"{}",
             headers=headers,
         )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json"),
-        )
-    except httpx.HTTPError:
+    except REQUEST_FAILURES:
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type", "application/json"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -10322,7 +10320,7 @@ async def _publish_config_change(request: Request) -> None:
     collector = getattr(request.app.state, "collector", None)
     if not collector:
         return
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -11012,7 +11010,7 @@ def _mcp_headers_error(headers: dict[Any, Any]) -> str | None:
     """Why *headers* cannot go out on an MCP server's requests, or None when they can.
 
     Names must be HTTP tokens and values printable ASCII with no space or tab at either end:
-    httpx refuses to send anything else, so the server could never connect, and its error would
+    httpx2 refuses to send anything else, so the server could never connect, and its error would
     quote the value. Shared like :func:`_mcp_url_error`. The message names a valid header, never
     its value, and never an invalid name, which can be a pasted ``Name: value`` line.
     """
@@ -11632,7 +11630,7 @@ async def _collect_mcp_status(
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -12503,7 +12501,7 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -12519,7 +12517,7 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
                     headers=headers,
                     timeout=30,
                 )
-                # A non-2xx reply is a failed reload, not a reached node (httpx
+                # A non-2xx reply is a failed reload, not a reached node (httpx2
                 # does not raise on status); surface it as an error so _run warns.
                 resp.raise_for_status()
                 return node_id, resp.json()
@@ -12683,7 +12681,7 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
     """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
     safe_name = urllib.parse.quote(name, safe="")
@@ -12700,7 +12698,7 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
                     headers=headers,
                     timeout=30,
                 )
-                # A non-2xx reply is a failed action, not a reached node (httpx
+                # A non-2xx reply is a failed action, not a reached node (httpx2
                 # does not raise on status); surface it as an error to the operator.
                 resp.raise_for_status()
                 return node_id, resp.json()
@@ -13814,7 +13812,7 @@ async def _collect_model_status(
     """Query all nodes for model status. Returns {node_id: {alias: info}}."""
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -14085,7 +14083,7 @@ async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:
     """Tell all nodes to re-read model definitions from DB and rebuild registry."""
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
-    client: httpx.AsyncClient = request.app.state.proxy_client
+    client: httpx2.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
@@ -14601,7 +14599,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     if body.get("max_tokens") is not None:
         try:
             max_tokens = int(body["max_tokens"])
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             return JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
         if max_tokens < 1:
             return JSONResponse({"error": "max_tokens must be >= 1"}, status_code=400)
@@ -14942,7 +14940,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         else:
             try:
                 mt_val = int(raw_mt)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 return JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
             if mt_val < 1:
                 return JSONResponse({"error": "max_tokens must be >= 1"}, status_code=400)
@@ -17486,24 +17484,55 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
     Only seeds known settings from the registry to avoid storing garbage.
     Uses config_store.set() for proper validation, serialization, and
     cache invalidation.
-    """
-    from turnstone.core.settings_registry import SETTINGS
 
+    An empty value counts as unset, as a Compose ``${X:-}`` passthrough of an
+    unset variable gives. Every other value is checked before anything is
+    written: one its setting refuses is logged and the console exits with
+    nothing seeded, so a mistyped value never leaves its setting at the
+    default. A storage error while seeding is logged with its key and exits
+    too. A value shadowed by a ``console-startup`` row (#1413) is reported,
+    since the operator set the variable to change it.
+    """
+    from turnstone.core.settings_registry import SETTINGS, serialize_value, validate_value
+    from turnstone.core.storage import storage_errors
+
+    seeds: list[tuple[str, str, str, str]] = []
+    refused = False
     for key in SETTINGS:
         env_name = "TURNSTONE_" + key.replace(".", "_").upper()
         env_val = os.environ.get(env_name)
-        if env_val is None:
-            continue
-        # Only seed if not already stored (check raw storage to avoid
-        # config_store cache, which may not reflect DB state yet)
-        existing = storage.get_system_setting(key)
-        if existing is not None:
+        if env_val is None or not env_val.strip():
             continue
         try:
-            config_store.set(key, env_val, changed_by="env")
+            seeds.append((key, env_name, env_val, serialize_value(validate_value(key, env_val))))
+        except ValueError as exc:
+            log.error("config.seed_refused: %s from %s: %s", key, env_name, exc)
+            refused = True
+    if refused:
+        raise SystemExit(1)
+    for key, env_name, env_val, serialized in seeds:
+        # Only seed if not already stored (check raw storage to avoid
+        # config_store cache, which may not reflect DB state yet)
+        try:
+            existing = storage.get_system_setting(key)
+            if existing is None:
+                config_store.set(key, env_val, changed_by="env")
+        except storage_errors() as exc:
+            log.error("config.seed_failed: %s from %s: %s", key, env_name, exc)
+            raise SystemExit(1) from exc
+        if existing is None:
             log.info("config.seeded_from_env: %s from %s", key, env_name)
-        except Exception:
-            log.warning("config.seed_failed: %s from %s", key, env_name, exc_info=True)
+        elif (
+            existing.get("changed_by") == "console-startup" and existing.get("value") != serialized
+        ):
+            log.warning(
+                "config.env_ignored: %s is stored as %s, so %s is not applied; reset %s in the "
+                "Settings tab to apply it",
+                key,
+                existing.get("value"),
+                env_name,
+                key,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -18582,12 +18611,26 @@ def main() -> None:
             _advertise_host = _socket.gethostname()
         console_url = f"http://{_advertise_host}:{args.port}"
     if auth_storage:
-        try:
-            from turnstone.core.config_store import ConfigStore
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.storage import storage_errors
 
+        # Settings that can't be read end startup rather than run the console on
+        # every default; a supervisor restart retries.
+        try:
             _cs = ConfigStore(auth_storage)
-            # Seed ConfigStore from env vars (TURNSTONE_{SECTION}_{KEY})
-            _seed_config_from_env(_cs, auth_storage)
+        except storage_errors() as exc:
+            log.error("settings.load_failed: %s", exc)
+            raise SystemExit(1) from exc
+        # Seed ConfigStore from env vars (TURNSTONE_{SECTION}_{KEY})
+        _seed_config_from_env(_cs, auth_storage)
+
+        # Once TLS is enabled, a console that can't load or create its CA exits
+        # rather than serve without the ACME responder nodes enroll through (a node
+        # that can't enroll falls back to plain HTTP), and a supervisor restart
+        # retries. The lifespan issues the console's own certificate, and logs a
+        # failure there and serves on. Nothing is written back: nodes read
+        # tls.enabled as stored, and unset reads as off (#1413).
+        try:
             if _cs.get("tls.enabled"):
                 from turnstone.console.tls import TLSManager
 
@@ -18606,30 +18649,9 @@ def main() -> None:
                 # / docs/tls.md); rewriting the scheme to https here would
                 # advertise an ACME URL nodes can't reach.
                 log.info("TLS enabled")
-        except Exception:
-            log.warning("TLS initialization failed", exc_info=True)
-            tls_mgr = None
-
-        # Sync TLS state to ConfigStore so server nodes see the correct value.
-        # Three cases:
-        # 1. TLS succeeded → write true
-        # 2. TLS not configured (DB false/unset) → write false (definitive)
-        # 3. TLS configured (DB true) but init failed → don't overwrite
-        #    (transient failure shouldn't permanently disable TLS)
-        try:
-            db_enabled = _cs.get("tls.enabled")
-            if tls_mgr is not None:
-                if not db_enabled:
-                    _cs.set("tls.enabled", True, changed_by="console-startup")
-            elif db_enabled:
-                log.warning(
-                    "tls.enabled is true in ConfigStore but TLS init failed — "
-                    "server nodes will attempt TLS and fall back to plain HTTP"
-                )
-            else:
-                _cs.set("tls.enabled", False, changed_by="console-startup")
-        except Exception:
-            log.debug("Failed to sync TLS state to ConfigStore", exc_info=True)
+        except Exception as exc:
+            log.error("tls.init_failed: %s", exc, exc_info=True)
+            raise SystemExit(1) from exc
 
     app = create_app(
         collector=collector,
@@ -18650,7 +18672,9 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    # lifespan="on": a lifespan that can't start (its settings can't load) ends the
+    # process instead of leaving it serving without one.
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", lifespan="on")
 
 
 if __name__ == "__main__":

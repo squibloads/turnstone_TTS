@@ -13,12 +13,11 @@ Interaction model
 * **DMs**: every message is routed freely, no slash command needed.
 
 Events are consumed from the server's per-workstream SSE endpoint
-(``GET /v1/api/workstreams/{ws_id}/events``) using httpx-sse. Inbound
-messages are sent directly to server nodes via HTTP
-(``POST /v1/api/workstreams/{ws_id}/send``).
+(``GET /v1/api/workstreams/{ws_id}/events``) using httpx2's SSE support. Inbound messages are sent
+directly to server nodes via HTTP (``POST /v1/api/workstreams/{ws_id}/send``).
 
 Install dependencies:
-    pip install slack-bolt httpx httpx-sse
+    pip install 'turnstone[slack]'
 """
 
 from __future__ import annotations
@@ -30,13 +29,14 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
-import httpx
+import httpx2
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
 from turnstone.channels._config import MAX_NOTIFY_TRACKING
 from turnstone.channels._formatter import chunk_message
 from turnstone.channels._routing import (
+    MODEL_LOOKUP_FAILED_REPLY,
     ChannelRouter,
     get_cycle_entry,
     model_unavailable_reply,
@@ -283,8 +283,9 @@ class TurnstoneSlackBot:
         self.config = config
         self._server_url = server_url.rstrip("/")
         self._console_url = console_url.rstrip("/") if console_url else ""
-        self._api_token = api_token
-        self._token_factory = server_token_factory
+        # Each SSE connection to a server node authenticates through this. A static token goes
+        # the same way, so the shared client holds no credential.
+        self._token_factory = server_token_factory or ((lambda: api_token) if api_token else None)
         self.storage = storage
 
         self.router = ChannelRouter(
@@ -322,13 +323,8 @@ class TurnstoneSlackBot:
         # to chat at the baseline message rate.
         self._link_buckets: OrderedDict[str, deque[float]] = OrderedDict()
 
-        headers: dict[str, str] = {}
-        if api_token and not server_token_factory:
-            headers["Authorization"] = f"Bearer {api_token}"
-
-        self._http_client = httpx.AsyncClient(
-            headers=headers,
-            timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
+        self._http_client = httpx2.AsyncClient(
+            timeout=httpx2.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
         )
 
         self._app = AsyncApp(token=config.bot_token)
@@ -450,6 +446,20 @@ class TurnstoneSlackBot:
         if not await self._require_linked(slack_channel, user_id):
             return
 
+        # The channel adapter model (the Roles tab's), else the server default.
+        # Read it before touching the current session, so a failed read leaves
+        # that session in place instead of archiving it for one that can't start.
+        try:
+            channel_model = await self.router.get_channel_default_alias()
+        except Exception:
+            log.warning("slack.channel_model_lookup_failed", exc_info=True)
+            await self._client.chat_postEphemeral(
+                channel=slack_channel,
+                user=user_id,
+                text=MODEL_LOOKUP_FAILED_REPLY,
+            )
+            return
+
         existing = self._channel_sessions.get((slack_channel, user_id))
         if existing is not None:
             old_ws_id, old_thread_ts = existing
@@ -491,9 +501,8 @@ class TurnstoneSlackBot:
                 channel_type="slack",
                 channel_id=route.to_channel_id(),
                 name=f"slack-{slack_channel[:8]}",
-                # The channel adapter model (the Roles tab's), else the server
-                # default; a model that isn't loaded fails the create.
-                model=await self.router.get_channel_default_alias(),
+                # A model that isn't loaded fails the create.
+                model=channel_model,
                 client_type="chat",
             )
         except Exception as exc:
@@ -892,7 +901,9 @@ class TurnstoneSlackBot:
                 channel_type="slack",
                 channel_id=route.to_channel_id(),
                 name=f"slack-dm-{user_id[:8]}",
-                model=await self.router.get_channel_default_alias(),
+                # Looked up only when this starts or forks a conversation: a DM
+                # to a live one doesn't need it.
+                model=self.router.get_channel_default_alias,
                 client_type="chat",
             )
             await self.subscribe_ws(ws_id, route.to_channel_id())

@@ -9,12 +9,13 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from tests._helpers import wait_until
 from tests.test_server_authz import _auth
 from tests.test_server_authz import app_client as app_client
+from turnstone.api.server_schemas import ListAvailableModelsResponse
 from turnstone.channels._routing import ChannelRouter
 from turnstone.core.storage import get_storage
 from turnstone.sdk.server import AsyncTurnstoneServer
@@ -106,8 +107,8 @@ async def test_restart_retains_association_and_recovers_history(app_client, plat
 
     await bot.router.aclose()
     await bot._http_client.aclose()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=client.app),
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=client.app),
         base_url="http://server.example",
         headers=_auth("owner"),
     ) as http:
@@ -544,6 +545,7 @@ async def test_slack_close_conflict_refreshes_cache_so_next_restart_converges(
 
     router._server.close_workstream = close
     router._server.create_workstream = AsyncMock(return_value=MagicMock(ws_id="new-session"))
+    router._server.list_models = AsyncMock(return_value=ListAvailableModelsResponse())
     try:
         for _ in range(2):
             await bot._on_slash_command(

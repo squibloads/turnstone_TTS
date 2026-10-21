@@ -19,6 +19,23 @@ At runtime, `ConfigStore` loads all settings from storage into an in-memory
 cache. Reads are lock-free dict lookups on an immutable snapshot. Writes acquire
 a lock, persist to storage, and swap the cache atomically.
 
+A node or console that can't read its settings at startup logs
+`settings.load_failed` and exits instead of running on the registry defaults,
+and a node that can't read its model definitions logs
+`model_registry.load_failed` and exits the same way. A supervisor restart (the
+shipped systemd unit's `Restart=on-failure`, a Compose restart policy,
+Kubernetes) retries the read. A reload that fails later keeps the settings that
+last loaded.
+
+The console seeds a setting from its `TURNSTONE_<SECTION>_<KEY>` environment
+variable (`TURNSTONE_TLS_ENABLED` for `tls.enabled`) while nothing is stored for
+it; a stored value, from the Settings tab or an earlier seed, wins. An empty
+variable counts as unset. Every other such variable is checked first, even one
+whose setting is stored: one its setting refuses (a bool takes `true`, `1`,
+`yes`, `false`, `0` or `no`) is logged as `config.seed_refused`, and the console
+exits without seeding any of them. A seed that can't be written is logged as
+`config.seed_failed` and ends startup too.
+
 ---
 
 ## Precedence
@@ -33,6 +50,51 @@ Settings resolution differs between entry points:
 The server's `apply_config()` ignores config.toml sections that overlap with
 ConfigStore. A startup warning is logged for each overlapping key, directing
 users to the admin Settings API.
+
+---
+
+## Speech Synthesis Limits
+
+Read-aloud (`POST /v1/api/tts`) has fixed limits rather than settings:
+
+- **8,000 characters per request** (`_TTS_TEXT_CAP` in `turnstone/server.py`).
+  Read-aloud sends a whole message in one request, so this is also the longest
+  message it can read; a longer one is refused with a 400. A hosted backend may
+  refuse first: OpenAI's speech models take at most 4,096 characters.
+- **90 seconds for the console's wait** for a node's answer
+  (`_TTS_PROXY_READ_TIMEOUT_S` in `turnstone/console/server.py`), longer than
+  other forwarded requests get, because the node answers only once the whole
+  clip is synthesized. At ~107 characters a second, the slowest backend
+  measured, a full-length clip takes about 75 seconds.
+- **80 seconds of silence from the speech backend** (`_TTS_BACKEND_TIMEOUT_S` in
+  `turnstone/core/audio.py`), with no retries, so the node gives up and answers
+  with its own error before the console stops waiting. A transient backend
+  error fails the play; playing it again retries. A test keeps the three
+  numbers in order.
+- **Two clips at once per node** (`_TTS_MAX_CONCURRENT` in
+  `turnstone/server.py`), each on a synthesis thread of its own, so long clips
+  can't take the threads the node's other work needs. A third play is refused
+  with 429 and `Retry-After`, which the browser waits out and retries twice,
+  rather than queued, since queue time would come out of the console's 90
+  seconds. The limit is per node and shared by every user. On a backend that
+  synthesizes one clip at a time, a play started beside a long one waits behind
+  it and can still time out: after 80 seconds of silence at the node, or at the
+  console's 90 seconds.
+
+A play the user replaces with another, or whose pane or tab closes, cancels its
+request. The console passes that on to the node, which closes the backend call
+and stops at the backend's next chunk: about two seconds after the browser
+leaves, on a backend that streams. A backend that goes silent, before its
+headers or between chunks, holds the play's slot until it sends again, at most
+80 seconds.
+
+### Proxies in front of the console or a node
+
+A load balancer, ingress or reverse proxy times out on silence, not on total
+duration, and the connection is silent for the whole synthesis. It has to allow
+more than 90 seconds without data on this route, or a long clip ends in an HTML
+504 instead of audio. The repository's AWS ECS module sets its load balancer's
+`idle_timeout` to 120 seconds; some ingress controllers default to 60.
 
 ---
 
@@ -284,6 +346,7 @@ initialization:
 | `model` | default_alias, auth_audience_allowlist, auth_fail_closed, temperature, max_tokens, reasoning_effort, task_alias, task_effort |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, approval_timeout_seconds, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
+| `audio` | stt_model_alias, stt_prompt, tts_model_alias, tts_voice |
 | `server` | workstream_idle_timeout, max_workstreams |
 | `cluster` | node_fan_out_limit, mcp_max_servers |
 | `mcp` | config_path, registry_url, oauth_allow_private_network |

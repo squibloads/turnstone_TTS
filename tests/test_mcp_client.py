@@ -24,6 +24,7 @@ from turnstone.core.mcp_client import (
     InvalidCatalogError,
     MCPClientManager,
     MCPShutdownError,
+    _AuthCapture,
     _db_servers_to_config,
     _is_dead_transport,
     _mcp_to_openai,
@@ -3032,12 +3033,10 @@ class TestCircuitBreaker:
         assert mgr._static_servers["test"].session is None
         assert mgr._consecutive_failures.get("test", 0) == 1
 
-    def test_session_terminated_mcperror_evicts_and_trips_circuit(self):
-        """Regression: when the MCP SERVER restarts and loses its session map, our
-        held mcp-session-id is stale; the server returns HTTP 404 and the SDK
-        surfaces MCPError(code=32600, 'Session terminated'). That is NOT a healthy
-        protocol rejection — the session must be evicted so the next dispatch
-        reconnects with a fresh initialize; reusing it 404s forever (restart-hang)."""
+    def test_forwarded_positive_32600_keeps_the_session(self):
+        """A server's error with the positive code 32600, the 1.x SDK's stand-in for a lost session
+        that a proxy built on it can still forward, is an ordinary protocol error: the session is
+        kept and the breaker does not count it."""
         from mcp import MCPError
 
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
@@ -3047,20 +3046,19 @@ class TestCircuitBreaker:
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         mock_future = MagicMock()
-        # Exactly what the streamable-http SDK injects on a 404 stale session.
         mock_future.result.side_effect = MCPError(code=32600, message="Session terminated")
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
             pytest.raises(MCPError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
-        assert mgr._static_servers["test"].session is None
-        assert mgr._consecutive_failures.get("test", 0) == 1
+        assert mgr._static_servers["test"].session is mock_session
+        assert mgr._consecutive_failures.get("test", 0) == 0
 
-    def test_httpx_connect_error_evicts_session(self):
-        """A dead underlying httpx connection (server down mid-call) is transport
-        death, not a protocol rejection — evict so the next call reconnects."""
-        import httpx
+    def test_httpx2_connect_error_evicts_session(self):
+        """A dead underlying connection (server down mid-call) is transport death, not a protocol
+        rejection — evict so the next call reconnects."""
+        import httpx2
 
         mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
         mock_session = MagicMock()
@@ -3069,20 +3067,19 @@ class TestCircuitBreaker:
         mgr._loop = MagicMock()
         mgr._tool_map["mcp__test__ping"] = ("test", "ping")
         mock_future = MagicMock()
-        mock_future.result.side_effect = httpx.ConnectError("connection refused")
+        mock_future.result.side_effect = httpx2.ConnectError("connection refused")
         with (
             patch("asyncio.run_coroutine_threadsafe", new=_dispatch_stub(mock_future)),
-            pytest.raises(httpx.ConnectError),
+            pytest.raises(httpx2.ConnectError),
         ):
             mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
         assert mgr._static_servers["test"].session is None
         assert mgr._consecutive_failures.get("test", 0) == 1
 
     def test_connection_closed_mcperror_evicts_and_trips_circuit(self):
-        """Regression: when the SDK's ``post_writer`` swallows the transport
-        error, a dead connection surfaces as ``MCPError(CONNECTION_CLOSED)``.
-        Unlike a genuine protocol rejection, this MUST evict + trip the
-        breaker so the next dispatch reconnects instead of looping."""
+        """Regression: a request that fails in transit reaches the caller as
+        ``MCPError(CONNECTION_CLOSED)``. Unlike a genuine protocol rejection, this MUST evict and
+        trip the breaker so the next dispatch reconnects instead of looping."""
         from mcp import MCPError
         from mcp.types import CONNECTION_CLOSED
 
@@ -3235,13 +3232,15 @@ class TestIsDeadTransport:
 
         assert _is_dead_transport(MCPError(code=CONNECTION_CLOSED, message="connection closed"))
 
-    def test_sdk_session_terminated_is_dead(self):
-        """The streamable-http SDK synthesizes EXACTLY code=32600 /
-        'Session terminated' when a held mcp-session-id 404s after a server
-        restart — keyed off the code so it survives a message reword."""
+    def test_lost_session_is_dead_by_its_recorded_status(self):
+        """A server that restarted and dropped its session map answers the held session with a
+        404, which the response hook records. The SDK reports it as a -32600 error: the server's
+        own, such as 'Session not found', or its 'Session terminated' stand-in when the 404 has no
+        JSON-RPC body. The recorded status makes it dead, not the code or the message."""
         from mcp import MCPError
 
-        assert _is_dead_transport(MCPError(code=32600, message="Session terminated"))
+        lost = MCPError(code=mcp_types.INVALID_REQUEST, message="Session terminated")
+        assert _is_dead_transport(lost, capture=_AuthCapture(status=404))
 
     def test_app_session_not_found_is_not_dead(self):
         """#2 regression: a HEALTHY session-owning MCP server (game/shell)
@@ -3253,13 +3252,13 @@ class TestIsDeadTransport:
         assert not _is_dead_transport(MCPError(code=-32603, message="Backend session not found"))
 
     def test_app_session_terminated_message_is_not_dead(self):
-        """#8 regression: the message is application-controlled and is NOT matched
-        — only the SDK's synthesized code 32600 is. A healthy session-owning
-        server that returns a protocol error whose message is EXACTLY 'Session
-        terminated' (or a superstring) with a normal code stays breaker-safe."""
+        """#8 regression: the message is application-controlled and is NOT matched; only a recorded
+        HTTP status marks a lost session. A healthy session-owning server that returns a protocol
+        error whose message is EXACTLY 'Session terminated' (or a superstring) stays
+        breaker-safe."""
         from mcp import MCPError
 
-        # Exact SDK message but an app protocol code (not 32600) — must NOT be dead.
+        # The SDK's own stand-in for a lost session, but with no recorded 404 — must NOT be dead.
         assert not _is_dead_transport(
             MCPError(code=mcp_types.INVALID_REQUEST, message="Session terminated")
         )
@@ -3268,48 +3267,55 @@ class TestIsDeadTransport:
             MCPError(code=-32603, message="Player session terminated by host")
         )
 
+    def test_a_forwarded_positive_32600_is_not_dead(self):
+        """The positive code 32600 was the 1.x SDK's stand-in for a lost session, and a proxy built
+        on that SDK can still forward it. With no recorded 404 it is an ordinary protocol error."""
+        from mcp import MCPError
+
+        assert not _is_dead_transport(MCPError(code=32600, message="Session terminated"))
+
     def test_plain_protocol_mcperror_is_not_dead(self):
         from mcp import MCPError
 
         assert not _is_dead_transport(MCPError(code=-32601, message="method not found"))
 
-    def test_httpx_read_timeout_is_dead(self):
+    def test_httpx2_read_timeout_is_dead(self):
         """#7: an idle read timeout on a long-lived streamable-http stream is
         the dominant idle-death mode — and is NOT a builtin TimeoutError, so it
         must be caught here or it falls through to a healthy 'other'."""
-        import httpx
+        import httpx2
 
-        assert not issubclass(httpx.ReadTimeout, TimeoutError)  # premise guard
-        assert _is_dead_transport(httpx.ReadTimeout("read timed out"))
+        assert not issubclass(httpx2.ReadTimeout, TimeoutError)  # premise guard
+        assert _is_dead_transport(httpx2.ReadTimeout("read timed out"))
 
-    def test_httpx_pool_timeout_is_not_dead(self):
+    def test_httpx2_pool_timeout_is_not_dead(self):
         """PoolTimeout is connection-pool saturation, NOT a dead connection:
         evicting the session can't relieve pool pressure and would trip the
         shared breaker for all users under transient load. The Connect/Read/Write
         timeouts (a dead/hung connection) stay dead."""
-        import httpx
+        import httpx2
 
-        assert not _is_dead_transport(httpx.PoolTimeout("pool exhausted"))
-        assert _is_dead_transport(httpx.WriteTimeout("write timed out"))
+        assert not _is_dead_transport(httpx2.PoolTimeout("pool exhausted"))
+        assert _is_dead_transport(httpx2.WriteTimeout("write timed out"))
 
-    def test_httpx_read_error_is_dead(self):
-        """#8: a connection that dies mid-read surfaces as httpx.ReadError (a
-        NetworkError sibling of the already-handled ConnectError)."""
-        import httpx
+    def test_httpx2_read_error_is_dead(self):
+        """#8: a connection that dies mid-read surfaces as httpx2.ReadError (a NetworkError sibling
+        of the already-handled ConnectError)."""
+        import httpx2
 
-        assert _is_dead_transport(httpx.ReadError("peer reset"))
+        assert _is_dead_transport(httpx2.ReadError("peer reset"))
 
-    def test_httpx_write_error_is_dead(self):
-        import httpx
+    def test_httpx2_write_error_is_dead(self):
+        import httpx2
 
-        assert _is_dead_transport(httpx.WriteError("broken pipe"))
+        assert _is_dead_transport(httpx2.WriteError("broken pipe"))
 
-    def test_httpx_local_protocol_error_is_not_dead(self):
+    def test_httpx2_local_protocol_error_is_not_dead(self):
         """LocalProtocolError is OUR bug (a malformed request we built), not a
         dead peer — it must NOT be mistaken for transport death."""
-        import httpx
+        import httpx2
 
-        assert not _is_dead_transport(httpx.LocalProtocolError("bad header"))
+        assert not _is_dead_transport(httpx2.LocalProtocolError("bad header"))
 
     def test_anyio_closed_resource_is_dead(self):
         import anyio
@@ -3429,8 +3435,8 @@ class TestStaticNotificationRefresh:
         assert not mgr._static_refresh_pending
 
     def test_handler_ignores_non_list_changed_messages(self, running_loop_mgr) -> None:
-        """Non-ServerNotification messages (RequestResponder / Exception)
-        must schedule nothing — no stamp, no marker, no task."""
+        """A message that is not a ``*/list_changed`` notification (here a bare mock) must schedule
+        nothing — no stamp, no marker, no task."""
         mgr, loop, _thread = running_loop_mgr
         handler = mgr._make_static_notification_handler("srv")
 
@@ -3532,15 +3538,13 @@ class TestStaticNotificationRefresh:
         assert "srv" in mgr._last_error
 
     def test_notification_refresh_catches_exception_group(self, running_loop_mgr) -> None:
-        """A wedged anyio transport surfaces session-op failures as
-        ``BaseExceptionGroup`` — which ``except Exception`` misses. An
-        escaping group reaches ``_spawn_background``'s failure log, whose
-        ``exc_info`` serializes the chained httpx request carrying the
-        CONFIGURED bearer for ``auth_type=static`` servers. The runner
-        must swallow the group (and keep the stamp) like any other
-        refresh failure. The member below is a BaseException so the group
-        does NOT collapse to ``ExceptionGroup`` (which ``Exception``
-        would catch) — the anyio stray-cancel shape."""
+        """A wedged anyio transport surfaces session-op failures as ``BaseExceptionGroup`` — which
+        ``except Exception`` misses. An escaping group reaches ``_spawn_background``'s failure log,
+        whose ``exc_info`` serializes the chained httpx2 request carrying the CONFIGURED bearer for
+        ``auth_type=static`` servers. The runner must swallow the group (and keep the stamp) like
+        any other refresh failure. The member below is a BaseException so the group does NOT
+        collapse to ``ExceptionGroup`` (which ``Exception`` would catch) — the anyio stray-cancel
+        shape."""
         mgr, loop, _thread = running_loop_mgr
 
         async def _seed() -> None:
@@ -4879,12 +4883,11 @@ class TestCBAutoReconnectRefresh:
         assert session is new_session
 
     def test_auto_reconnect_retrieves_and_logs_refresh_failure(self, running_loop_mgr):
-        """A refresh failure must be logged INSIDE ``_refresh_server_logged``
-        (type + message, no ``exc_info``) — not by the done-callback, whose
-        ``exc_info`` log serializes the chained ``httpx.Request`` carrying the
-        configured bearer for ``auth_type=static`` servers, and not abandoned
-        for asyncio to report as "Task exception was never retrieved" at GC
-        time (the closed-file CI spew)."""
+        """A refresh failure must be logged INSIDE ``_refresh_server_logged`` (type + message, no
+        ``exc_info``) — not by the done-callback, whose ``exc_info`` log serializes the chained
+        ``httpx2.Request`` carrying the configured bearer for ``auth_type=static`` servers, and not
+        abandoned for asyncio to report as "Task exception was never retrieved" at GC time (the
+        closed-file CI spew)."""
         import threading as _threading
 
         mgr, _loop, _thread = running_loop_mgr
@@ -4946,13 +4949,12 @@ class TestCBAutoReconnectRefresh:
 class TestStaticHealthLoop:
     """Autonomous static-server reconnect + liveness.
 
-    The SDK gives up reconnecting after 2 attempts on one transport and never on
-    the others (verified: mcp 1.28.1), and every other Turnstone reconnect path
-    is dispatch- or operator-driven — so a static server that dies while idle
-    stays dead. This loop is the missing autonomous trigger: it reconnects
-    disconnected servers on a capped, jittered, forever backoff and pings
-    connected ones, evicting a dead-but-idle session (which nothing else would
-    notice) so it is reconnected.
+    The SDK never re-establishes a session: it only retries its GET stream and resumes a request's
+    SSE stream, each a bounded 2-attempt burst (verified: mcp 2.3.0). Every other Turnstone
+    reconnect path is dispatch- or operator-driven, so a static server that dies while idle stays
+    dead. This loop is the missing autonomous trigger: it reconnects disconnected servers on a
+    capped, jittered, forever backoff and pings connected ones, evicting a dead-but-idle session
+    (which nothing else would notice) so it is reconnected.
     """
 
     # -- backoff policy ------------------------------------------------------
@@ -5135,14 +5137,14 @@ class TestStaticHealthLoop:
         assert due > now  # rescheduled, not "reconnect asap"
 
     def test_ping_one_pool_timeout_does_not_evict(self, running_loop_mgr) -> None:
-        """``httpx.PoolTimeout`` is pool saturation, not a dead session — evicting
-        wouldn't relieve it and would trip the shared breaker under load; the ping
-        rescheduled instead (``_is_dead_transport`` deliberately excludes it)."""
-        import httpx
+        """``httpx2.PoolTimeout`` is pool saturation, not a dead session — evicting wouldn't relieve
+        it and would trip the shared breaker under load; the ping rescheduled instead
+        (``_is_dead_transport`` deliberately excludes it)."""
+        import httpx2
 
         mgr, loop, _ = running_loop_mgr
         sess = MagicMock()
-        sess.send_ping = AsyncMock(side_effect=httpx.PoolTimeout("pool saturated"))
+        sess.send_ping = AsyncMock(side_effect=httpx2.PoolTimeout("pool saturated"))
         _seed_static_state(mgr, "up", session=sess)
         now = time.monotonic()
         due = _run_on_loop(loop, mgr._static_ping_one("up", now))
@@ -6348,8 +6350,8 @@ class TestMcpV2ProtocolFeatures:
         handshake_sess.send_discover.assert_not_awaited()
 
     def test_call_tool_with_header_retry_relists_and_retries_once(self, running_loop_mgr) -> None:
-        """On HEADER_MISMATCH (-32023) at 2026-07-28, _call_tool_with_header_retry refreshes
-        tools/list once and retries call_tool."""
+        """On HEADER_MISMATCH at 2026-07-28, _call_tool_with_header_retry refreshes tools/list
+        once and retries call_tool."""
         from mcp.shared.exceptions import MCPError
         from mcp.types import HEADER_MISMATCH, CallToolResult, TextContent
 
@@ -6731,17 +6733,16 @@ class TestMcpV2ProtocolFeatures:
         from turnstone.core.mcp_client import (
             _AuthCapture,
             _ErrorAnswerError,
-            _make_capturing_http_factory,
+            _make_capturing_http_client,
             _negotiate_session,
         )
 
         _, loop, _ = running_loop_mgr
         capture = _AuthCapture()
         fired = asyncio.Event()
-        factory = _make_capturing_http_factory(capture, fired)
 
         async def _exercise() -> None:
-            async with factory() as client:
+            async with _make_capturing_http_client(capture, fired) as client:
                 load_body = client.event_hooks["request"][1]
                 hook = client.event_hooks["response"][0]
                 reject_non_mcp = client.event_hooks["response"][1]
@@ -6758,7 +6759,8 @@ class TestMcpV2ProtocolFeatures:
                 assert capture.status is None
                 assert not fired.is_set()
 
-                # Pre-negotiation JSON-RPC error with id=null on server/discover is rewritten with request id
+                # A pre-negotiation JSON-RPC error with id=null on server/discover is rewritten
+                # with the request's id.
                 null_id_resp = httpx2.Response(
                     200,
                     headers={"content-type": "application/json"},
@@ -6782,7 +6784,8 @@ class TestMcpV2ProtocolFeatures:
                 session.initialize.assert_awaited_once()
                 assert capture.negotiated is True
 
-                # On initialize (not server/discover), id=null JSON-RPC error DOES raise _ErrorAnswerError
+                # On initialize (not server/discover), a JSON-RPC error with id=null DOES raise
+                # _ErrorAnswerError.
                 capture.negotiated = False
                 init_req = httpx2.Request(
                     "POST",
@@ -6807,21 +6810,20 @@ class TestMcpV2ProtocolFeatures:
         """On a stateless 2026-07-28 HTTP connection (no Mcp-Session-Id header), an HTTP 404
         carrying JSON-RPC METHOD_NOT_FOUND (-32601) does not latch capture.status or fired_event,
         whereas a bare HTTP 404 does."""
-        import httpx
+        import httpx2
 
-        from turnstone.core.mcp_client import _AuthCapture, _make_capturing_http_factory
+        from turnstone.core.mcp_client import _AuthCapture, _make_capturing_http_client
 
         _, loop, _ = running_loop_mgr
         capture = _AuthCapture(negotiated=True)
         fired = asyncio.Event()
-        factory = _make_capturing_http_factory(capture, fired)
 
         async def _exercise() -> None:
-            async with factory() as client:
+            async with _make_capturing_http_client(capture, fired) as client:
                 hook = client.event_hooks["response"][0]
-                req = httpx.Request("POST", "https://mcp.example.com/mcp")
+                req = httpx2.Request("POST", "https://mcp.example.com/mcp")
                 # 2026-07-28 HTTP 404 with JSON-RPC METHOD_NOT_FOUND (-32601)
-                rpc_404 = httpx.Response(
+                rpc_404 = httpx2.Response(
                     404,
                     headers={"content-type": "application/json"},
                     content=(
@@ -6835,7 +6837,7 @@ class TestMcpV2ProtocolFeatures:
                 assert not fired.is_set()
 
                 # Bare HTTP 404 (broken route / proxy) DOES latch capture.status = 404
-                bare_404 = httpx.Response(
+                bare_404 = httpx2.Response(
                     404,
                     headers={"content-type": "text/plain"},
                     content=b"404 Not Found",
@@ -6892,7 +6894,8 @@ class TestMcpV2ProtocolFeatures:
         )
         assert session.read_resource.await_count == 2
 
-        # u1 receives ResourceUpdatedNotification -> u1's private entry is evicted, u2's is untouched
+        # u1 receives ResourceUpdatedNotification -> u1's private entry is evicted, u2's is
+        # untouched.
         upd = ResourceUpdatedNotification(
             params=ResourceUpdatedNotificationParams(uri="file:///me.json")
         )
@@ -6933,7 +6936,8 @@ class TestMcpV2ProtocolFeatures:
         )
         assert session.read_resource.await_count == 4
 
-        # remove_server_sync purges _response_cache_store entries, _resource_subscriptions, and _server_log_levels
+        # remove_server_sync purges _response_cache_store entries, _resource_subscriptions, and
+        # _server_log_levels.
         mgr.set_resource_subscriptions("pool-srv", ["file:///me.json"])
         mgr.set_log_level("warning", server_name="pool-srv")
         mgr.remove_server_sync("pool-srv")
@@ -7180,7 +7184,8 @@ class TestMcpV2ProtocolFeatures:
 
         asyncio.run(_check_empty_ack())
 
-        # Verify _park_transport_owner unwinds initial sub_stack on relisten_requested before relisten()
+        # Verify _park_transport_owner unwinds the initial sub_stack on relisten_requested, before
+        # relisten().
         events: list[str] = []
 
         class _InitialSub:
@@ -7403,7 +7408,7 @@ class TestMcpV2ProtocolFeatures:
         assert len(calls) == 3
 
     def test_record_and_evict_ignores_sdk_result_validation_errors(self) -> None:
-        """UnexpectedClaimedResult and output-schema RuntimeError do not trip the circuit breaker."""
+        """UnexpectedClaimedResult and an output-schema RuntimeError don't trip the breaker."""
         from mcp.client.extension import UnexpectedClaimedResult
 
         mgr = MCPClientManager({})

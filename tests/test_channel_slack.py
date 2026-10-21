@@ -86,14 +86,14 @@ def _make_bot() -> tuple[object, MagicMock, MagicMock]:
     client.conversations_history = AsyncMock(return_value={"ok": True, "messages": []})
     client.views_open = AsyncMock(return_value={"ok": True})
 
-    # Patch httpx.AsyncClient so each test doesn't open a real client that
-    # leaks an unclosed-warning at GC time.  The bot's _http_client is only
-    # used by the SDK router (which we replace with a MagicMock below), so
-    # an AsyncMock standin is enough for every test that uses this factory.
+    # Patch httpx2.AsyncClient so each test doesn't open a real client that leaks an
+    # unclosed-warning at GC time.  The bot's _http_client is only used by the SSE listener (which
+    # we replace with an AsyncMock below), so an AsyncMock standin is enough for every test that
+    # uses this factory.
     with (
         patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
         patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
-        patch("turnstone.channels.slack.bot.httpx.AsyncClient", return_value=AsyncMock()),
+        patch("turnstone.channels.slack.bot.httpx2.AsyncClient", return_value=AsyncMock()),
     ):
         bot = TurnstoneSlackBot(
             config,
@@ -830,7 +830,7 @@ class TestWsEventDispatch:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -913,7 +913,7 @@ class TestWsEventDispatch:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -1057,7 +1057,7 @@ class TestNotificationTracking:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient"),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -1078,7 +1078,7 @@ class TestNotificationTracking:
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient"),
             patch(
-                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                "turnstone.channels.slack.bot.httpx2.AsyncClient",
                 return_value=AsyncMock(),
             ),
         ):
@@ -1399,15 +1399,38 @@ class TestChannelModel:
 
         assert router.get_or_create_workstream.await_args.kwargs["model"] == "slack-model"
 
-    def test_dm_creates_on_the_channel_model(self) -> None:
+    def test_dm_passes_the_channel_model_lookup_uncalled(self) -> None:
+        # #1377: the router looks the model up only when the DM starts or forks
+        # a conversation, so a DM to a live one never waits on it or fails with it.
         bot, router, _ = _make_bot()
-        router.get_channel_default_alias = AsyncMock(return_value="slack-model")
         router.get_or_create_workstream = AsyncMock(return_value=("ws-dm", True))
 
         event = _make_slack_event(channel="D12345", channel_type="im", thread_ts="")
         _run(bot._on_message(event, AsyncMock()))  # type: ignore[attr-defined]
 
-        assert router.get_or_create_workstream.await_args.kwargs["model"] == "slack-model"
+        model = router.get_or_create_workstream.await_args.kwargs["model"]
+        assert model is router.get_channel_default_alias
+        router.get_channel_default_alias.assert_not_awaited()
+
+    def test_slash_command_that_cannot_look_up_the_model_keeps_the_session(self) -> None:
+        # #1377: the lookup runs before the current session is archived, so a
+        # failed one leaves that session in place and says so.
+        from turnstone.channels._routing import MODEL_LOOKUP_FAILED_REPLY
+        from turnstone.sdk._types import TurnstoneAPIError
+
+        bot, router, client = _make_bot()
+        router.get_channel_default_alias = AsyncMock(side_effect=TurnstoneAPIError(503, "down"))
+        key, session = ("C01SAPU5414", "U777"), ("ws-old", "1000.000001")
+        bot._channel_sessions[key] = session  # type: ignore[attr-defined]
+
+        body = {"channel_id": "C01SAPU5414", "user_id": "U777", "text": ""}
+        _run(bot._on_slash_command(AsyncMock(), body))  # type: ignore[attr-defined]
+
+        router.close_workstream.assert_not_awaited()
+        client.chat_postMessage.assert_not_awaited()
+        router.get_or_create_workstream.assert_not_awaited()
+        assert client.chat_postEphemeral.await_args.kwargs["text"] == MODEL_LOOKUP_FAILED_REPLY
+        assert bot._channel_sessions[key] == session  # type: ignore[attr-defined]
 
     def test_slash_command_says_the_model_is_not_available(self) -> None:
         from turnstone.channels._routing import MODEL_UNAVAILABLE_REPLY
@@ -1445,3 +1468,47 @@ class TestChannelModel:
         _run(bot._on_message(event, say))  # type: ignore[attr-defined]
 
         assert say.await_args.kwargs["text"] == "Sorry, something went wrong routing your message."
+
+
+def test_a_static_token_rides_the_sse_connection_not_the_shared_client(monkeypatch):
+    """The bot's shared client carries no credential; each SSE connection adds the server
+    token itself, as it does with a rotating token."""
+    import functools
+
+    import httpx2
+
+    from turnstone.channels.slack.bot import TurnstoneSlackBot
+    from turnstone.channels.slack.config import SlackConfig
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx2.Response(404)
+
+    monkeypatch.setattr(
+        "turnstone.channels.slack.bot.httpx2.AsyncClient",
+        functools.partial(httpx2.AsyncClient, transport=httpx2.MockTransport(handler)),
+    )
+    with (
+        patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
+        patch("turnstone.channels.slack.bot.AsyncWebClient", MagicMock()),
+    ):
+        bot = TurnstoneSlackBot(
+            SlackConfig(bot_token="xoxb-test", app_token="xapp-test"),
+            server_url="http://localhost:8080",
+            storage=MagicMock(),
+            api_token="static-token",
+        )
+
+    async def listen():
+        try:
+            await asyncio.wait_for(bot._sse_listener("abcdef0123456789", "C1"), 2)
+        finally:
+            await bot.router.aclose()
+            await bot._http_client.aclose()
+
+    assert "authorization" not in bot._http_client.headers
+    _run(listen())
+    assert [r.url.path for r in requests] == ["/v1/api/workstreams/abcdef0123456789/events"]
+    assert requests[0].headers["authorization"] == "Bearer static-token"
