@@ -69,19 +69,6 @@ DEFAULT_APPROVAL_TIMEOUT_SECONDS = 0
 TOOL_TRUNCATION_MAX_CHARS = 16 * 1024 * 1024
 
 
-# Speech-synthesis limits.  The node and the console fall back to these when the
-# stored value is unusable, so the registry default and the fallback cannot drift.
-DEFAULT_TTS_MAX_CHARS = 8000
-DEFAULT_TTS_TIMEOUT_SECONDS = 30
-MAX_TTS_TIMEOUT_SECONDS = 600
-# The node synthesizes a request whole and does not stop when the caller gives
-# up, so the text cap is bounded by what a slow backend finishes inside the
-# longest timeout: Kokoro-82M on CPU ran ~107 chars/s, so 50,000 takes ~470 s.
-# The clip is held whole on the way back (the console buffers the node's reply,
-# peaking near twice the clip), so memory per request grows with the cap too.
-MAX_TTS_MAX_CHARS = 50_000
-
-
 def _build_registry() -> dict[str, SettingDef]:
     """Build the settings registry from declarative definitions."""
     defs: list[SettingDef] = [
@@ -491,7 +478,7 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Controls how many nodes the console queries in parallel during "
             "fan-out operations (watch listing, MCP status, reload notifications). "
             "Higher values speed up large-cluster admin operations at the cost of "
-            "more concurrent connections. The httpx proxy pool is sized to match "
+            "more concurrent connections. The console's proxy connection pool is sized to match "
             "this value (requires console restart to take effect).",
         ),
         SettingDef(
@@ -688,38 +675,6 @@ def _build_registry() -> dict[str, SettingDef]:
             "alloy. Change it when the voice is wrong, unavailable, or another one suits the "
             "team better.",
             reference_url=VOICE_DOCS_URL + "#voice-identifier",
-        ),
-        SettingDef(
-            "audio.tts_max_chars",
-            "int",
-            DEFAULT_TTS_MAX_CHARS,
-            "Longest text one speech request may synthesize (characters)",
-            "audio",
-            min_value=1,
-            max_value=MAX_TTS_MAX_CHARS,
-            strict_int=True,
-            help="A message longer than this is refused with an error instead of being read "
-            "aloud. Raise it together with audio.tts_timeout_seconds: the whole clip is "
-            "synthesized before playback starts, so longer text needs a longer wait. The "
-            "default is 8000 characters; the maximum is 50000. Raise it only for a model "
-            "fast enough to finish a longer clip within the timeout.",
-            reference_url=VOICE_DOCS_URL + "#longest-speech-request",
-        ),
-        SettingDef(
-            "audio.tts_timeout_seconds",
-            "int",
-            DEFAULT_TTS_TIMEOUT_SECONDS,
-            "How long the console waits for a node to synthesize speech (seconds)",
-            "audio",
-            min_value=1,
-            max_value=MAX_TTS_TIMEOUT_SECONDS,
-            strict_int=True,
-            help="Playback through the console waits for the node to return the complete "
-            "audio clip, which can take far longer than an ordinary request on a slow or "
-            "local speech backend. Every other request the console forwards keeps the "
-            "proxy's shared timeout. The default is 30 seconds (maximum 600). Raise it when "
-            "long clips time out on a slow backend; lower it to fail fast.",
-            reference_url=VOICE_DOCS_URL + "#synthesis-timeout",
         ),
         SettingDef(
             "audio.tts_normalize",
