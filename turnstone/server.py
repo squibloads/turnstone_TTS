@@ -1684,8 +1684,12 @@ def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str |
 
 
 async def _authorize_ws_access(request: Request, ws_id: str) -> JSONResponse | None:
-    """Adapt :func:`_require_ws_access` to the shared STT helpers' async callable."""
-    _user_id, err = _require_ws_access(request, ws_id)
+    """Adapt :func:`_require_ws_access` to the shared STT helpers' async callable.
+
+    The check can read storage, so it runs off the event loop, as upstream's
+    own handlers do since #1416.
+    """
+    _user_id, err = await asyncio.to_thread(_require_ws_access, request, ws_id)
     return err
 
 
@@ -1924,7 +1928,7 @@ async def command(request: Request) -> JSONResponse:
     if not cmd:
         return JSONResponse({"error": "Empty command"}, status_code=400)
     mgr = request.app.state.workstreams
-    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
+    _owner, err = await asyncio.to_thread(_require_ws_access, request, str(ws_id or ""), mgr=mgr)
     if err:
         return err
 
