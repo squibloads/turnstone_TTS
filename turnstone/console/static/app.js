@@ -1245,10 +1245,26 @@ function _refreshVoiceLauncher(readSetting) {
   _paintLauncherVisibility();
 }
 
+// Voice sessions this page has just launched, by ws_id.  The coordinator pane
+// opens voice mode listening only for a session found here, and takes it out
+// as it does, so the mic is live only right after a deliberate launch.  It is
+// page memory on purpose: a reload, a browser restoring the tab or a redeploy
+// starts with an empty set, and the session comes back with voice mode off
+// instead of as a microphone nobody remembers is open.
+const _freshVoiceLaunches = new Set();
+
+// True once per launched session; read by the pane through TS_APP.
+function takeVoiceLaunch(wsId) {
+  const was = _freshVoiceLaunches.has(wsId);
+  _freshVoiceLaunches.delete(wsId);
+  return was;
+}
+
 // Create the voice coordinator and open it exactly like a normal create.  No
 // open-time pane hint is passed: the coordinator pane factory does not accept
-// one (shell.js drops openPane's `extra`), so the persona IS the handshake —
-// a voice-persona coordinator starts in voice mode inside the pane.  `opts`
+// one (shell.js drops openPane's `extra`), so the launch record above is the
+// handshake: a voice session this page just created starts in voice mode
+// inside the pane.  `opts`
 // carries the Voice tab's optional opening line plus the composer's busy/error
 // hooks; the one-click empty submit stays valid.
 function startVoiceSession(opts) {
@@ -1266,7 +1282,11 @@ function startVoiceSession(opts) {
     task: (opts.task || "").trim(),
     errEl: opts.errEl || document.getElementById("home-coord-error"),
     setBusy: opts.setBusy || function () {},
-    onSuccess: opts.onSuccess,
+    // Runs before the pane opens, so the pane finds the record when it mounts.
+    onSuccess: function (res) {
+      if (res && res.data && res.data.ws_id) _freshVoiceLaunches.add(res.data.ws_id);
+      if (typeof opts.onSuccess === "function") opts.onSuccess(res);
+    },
   });
 }
 
@@ -2814,6 +2834,7 @@ function _ensureSSE() {
 // still starts the Tier-1 stream on both fresh login and refresh-with-cookie,
 // so that path is unchanged.
 window.TS_APP = window.TS_APP || {};
+window.TS_APP.takeVoiceLaunch = takeVoiceLaunch;
 // --- Rail seam (Tier-1) ---
 // The shell's rail.js reads cluster state + nav actions through this surface and
 // re-renders whenever renderFromState fires onRender.  app.js keeps owning

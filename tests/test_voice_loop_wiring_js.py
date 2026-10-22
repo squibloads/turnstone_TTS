@@ -90,6 +90,7 @@ _VOICE_STATE = "\n".join(
         _decl(r"let voiceSetup = [^;]*;", "let voiceSetup = undefined;"),
         _decl(r"let voiceDoneProbe = [^;]*;", "let voiceDoneProbe = undefined;"),
         _decl(r"let voiceAutoStop = [^;]*;", "let voiceAutoStop = undefined;"),
+        _decl(r"let voiceIdleMuteSeconds = [^;]*;", "let voiceIdleMuteSeconds = undefined;"),
         _decl(
             r"const voiceControls = _buildVoiceControls\(\);",
             "const voiceControls = { button: new El('button'), status: new El('div') };",
@@ -185,10 +186,27 @@ let autoStop = true;            // audio.stt_auto_stop on the same probe
 let voiceSetting = true;          // audio.voice_mode_enabled on the STT config probe
 let personaRows = [];             // GET /v1/api/workstreams rows
 let probeDown = false;            // a failed settings probe must default to on
+let idleMuteSeconds = 60;         // audio.voice_idle_mute_seconds on the same probe
+const launched = new Set();       // sessions the launcher started in this page
+window.TS_APP = {
+  takeVoiceLaunch(id) { const was = launched.has(id); launched.delete(id); return was; },
+};
+// Timers the pane hands the loop: recorded, never run by themselves.
+const loopTimers = [];
+const realSetTimeout = setTimeout;
+globalThis.setTimeout = (fn, ms) => {
+  if (ms >= 1000) { const t = { fn, ms, cleared: false }; loopTimers.push(t); return t; }
+  return realSetTimeout(fn, ms);
+};
+const realClearTimeout = clearTimeout;
+globalThis.clearTimeout = (t) => {
+  if (t && typeof t === "object" && "cleared" in t) { t.cleared = true; return; }
+  realClearTimeout(t);
+};
 function authFetch(url) {
   if (url === "/v1/api/stt/config") {
     if (probeDown) return Promise.reject(new Error("down"));
-    return Promise.resolve({ ok: true, json: async () => ({ auto_stop: autoStop, voice_mode_enabled: voiceSetting }) });
+    return Promise.resolve({ ok: true, json: async () => ({ auto_stop: autoStop, voice_mode_enabled: voiceSetting, voice_idle_mute_seconds: idleMuteSeconds }) });
   }
   if (url === "/v1/api/workstreams") {
     return Promise.resolve({ ok: true, json: async () => ({ workstreams: personaRows }) });
@@ -265,6 +283,7 @@ def test_the_button_appears_only_with_both_roles_and_the_setting_on() -> None:
         _show()
         + """
 voiceSetting = true; personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: false });     // dictation alone does not offer hands-free
 """
         + _settle()
@@ -293,6 +312,7 @@ def test_the_setting_being_off_hides_the_button_even_with_both_roles() -> None:
         + """
 voiceSetting = false;
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -324,6 +344,7 @@ def test_a_voice_persona_starts_listening_and_another_persona_does_not() -> None
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 voiceSetting = true;
 _applyVoiceRoles({ stt: true, tts: true });
 """
@@ -373,6 +394,7 @@ def test_a_transcript_calls_the_send_path_with_the_composer_text() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -396,6 +418,7 @@ def test_a_second_insertion_is_not_appended_by_the_pane() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -413,6 +436,7 @@ def test_a_refused_send_does_not_leave_the_loop_waiting() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -432,6 +456,7 @@ def test_busy_edges_reach_the_loop_and_close_the_mic() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -454,6 +479,7 @@ def test_the_run_done_returns_the_loop_to_listening_after_the_turn_settles() -> 
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -481,6 +507,7 @@ def test_a_stream_run_without_done_stands_voice_mode_down() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -505,6 +532,7 @@ def test_a_stream_run_with_empty_heard_plays_the_finished_reply() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -540,6 +568,7 @@ def test_a_cancelled_playback_returns_to_listening_not_off() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -566,6 +595,7 @@ def test_a_sent_spoken_turn_starts_the_pending_handoff() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -588,6 +618,7 @@ def test_the_first_reply_audio_ends_the_pending_handoff() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -613,6 +644,7 @@ def test_a_turn_that_ends_without_a_reply_clears_the_pending_handoff() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -635,6 +667,7 @@ def test_a_typed_turn_does_not_start_the_strip_handoff() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -654,6 +687,7 @@ def test_turning_voice_mode_off_clears_the_pending_handoff() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -674,6 +708,7 @@ def test_leaving_the_pane_disables_the_loop_and_closes_the_mic() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -743,6 +778,7 @@ def test_a_turn_running_at_open_keeps_the_mic_shut_until_it_settles() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 busy = true;                                   // another tab's turn is running
 _applyVoiceRoles({ stt: true, tts: true });
 """
@@ -767,6 +803,7 @@ def test_an_empty_reply_ends_in_listening_instead_of_looping() -> None:
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -805,6 +842,7 @@ def test_rendering_history_with_voice_mode_on_does_not_speak_old_replies() -> No
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -831,6 +869,7 @@ def test_a_pending_reply_reference_is_not_replayed_by_a_history_render() -> None
     out = _run(
         """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """
         + _settle()
@@ -867,6 +906,7 @@ console.log(JSON.stringify({ first, afterRender: ttsLog.plays.length, awaiting: 
 def _voice_on() -> str:
     return """
 personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
 _applyVoiceRoles({ stt: true, tts: true });
 """ + _settle()
 
@@ -972,3 +1012,103 @@ console.log(JSON.stringify({ cls: mic.button.classList.contains("is-muted"),
     )
     assert out["on"] is False
     assert out["cls"] is False and out["pressed"] == "false"
+
+
+# ---------------------------------------------------------------------------
+# Off unless just launched; the quiet-minute mic mute
+# ---------------------------------------------------------------------------
+
+
+def test_a_restored_voice_session_opens_with_voice_mode_off() -> None:
+    # A reload, a browser restoring the tab, or a redeploy: the page did not
+    # just launch this session, so it must not come back as a live mic.
+    out = _run(
+        """
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+console.log(JSON.stringify({ offered: voiceBtn.style.display, mode: voiceModeOn,
+  started: mic.started, pressed: voiceBtn.attrs["aria-pressed"] }));
+"""
+    )
+    assert out == {"offered": "", "mode": False, "started": 0, "pressed": "false"}
+
+
+def test_a_launch_turns_voice_mode_on_once() -> None:
+    out = _run(
+        """
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+const first = { mode: voiceModeOn, started: mic.started, left: launched.size };
+_voiceTurnOff();
+voiceSetup = null; voiceLoop = null; voiceDoneProbe = null;
+_applyVoiceRoles({ stt: true, tts: true });   // the same pane re-derives its offer
+"""
+        + _settle()
+        + """
+console.log(JSON.stringify({ first, again: voiceModeOn }));
+"""
+    )
+    assert out["first"] == {"mode": True, "started": 1, "left": 0}
+    assert out["again"] is False
+
+
+def test_a_page_without_the_launcher_bridge_opens_off() -> None:
+    out = _run(
+        """
+window.TS_APP = undefined;
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+console.log(JSON.stringify({ mode: voiceModeOn, started: mic.started }));
+"""
+    )
+    assert out == {"mode": False, "started": 0}
+
+
+def test_the_idle_mute_setting_reaches_the_loop_and_mutes_the_mic() -> None:
+    out = _run(
+        """
+idleMuteSeconds = 45;
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+const armed = loopTimers.filter((t) => !t.cleared).map((t) => t.ms);
+loopTimers.filter((t) => !t.cleared)[0].fn();
+console.log(JSON.stringify({ armed, muted: voiceLoop.muted, mode: voiceModeOn,
+  stopped: mic.stopped, status: voiceStatusEl.textContent,
+  micPressed: mic.button.attrs["aria-pressed"] }));
+"""
+    )
+    assert out["armed"] == [45000]
+    assert out["muted"] is True and out["mode"] is True
+    assert out["stopped"] >= 1
+    assert out["micPressed"] == "true"
+    assert "press the mic" in out["status"].lower()
+
+
+def test_an_idle_mute_of_zero_never_arms() -> None:
+    out = _run(
+        """
+idleMuteSeconds = 0;
+personaRows = [{ ws_id: "coord-1", persona: "voice" }];
+launched.add("coord-1");
+_applyVoiceRoles({ stt: true, tts: true });
+"""
+        + _settle()
+        + """
+console.log(JSON.stringify({ armed: loopTimers.length, mode: voiceModeOn }));
+"""
+    )
+    assert out == {"armed": 0, "mode": True}
