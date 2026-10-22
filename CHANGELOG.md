@@ -272,6 +272,13 @@ frozen.
 - **Read-aloud keeps playing when the tab is hidden** — it used to stop, because hiding the tab
   closes the live stream and the stream teardown also stopped the audio. It now stops on Stop,
   when the conversation is rebuilt from history, and when the pane is closed.
+- **The denial nudge no longer waits out `memory.nudge_cooldown` (#924).** The note asking the
+  model whether a rejected tool call reflects a lasting preference now follows each batch a person
+  rejects; the cooldown spaces only the correction and completion nudges and the coordinator's
+  open-task reminder. A rejection during a wake-driven turn gets no note, and it used to start the
+  cooldown anyway, so a rejection in the next `memory.nudge_cooldown` seconds got none either. In
+  the CLI, an approval prompt left unanswered (its input closed, or Ctrl+D) no longer counts as a
+  person's rejection, also when a tool policy refused another call in the same batch.
 - **A console exits when it can't start the TLS certificate authority it has enabled, or when a
   setting's `TURNSTONE_*` variable holds a value the setting refuses (#1406)** *(BREAKING)* — a
   failed CA load (a storage error, a corrupt row) used to leave the console running without TLS
@@ -648,6 +655,11 @@ frozen.
 
 ### Removed
 
+- **The tool-error memory nudge is gone (#1454).** A failed tool call no longer gets "A tool just
+  returned an error. Before retrying, check your memories" after its result; the model gets the
+  error result alone. Persisted `tool_error` turns in existing transcripts still render.
+  `turnstone.core.memory.count_structured_memories`, `turnstone.core.metacognition.should_nudge`
+  and the `memory_count` keyword of `nudge_allowed` are removed.
 - **The `[model] fallback` failover chain is gone (#1359)** *(BREAKING)* — a turn whose model failed
   to answer after its retries was tried again on each alias in config.toml's `[model].fallback`
   list, healthy backends first, possibly on another provider; the turn now fails on its own model
@@ -1303,6 +1315,84 @@ frozen.
   uploads, open only to coordinator admins, have no rate limit. Images already in a conversation
   are left as they are, so it keeps sending what it sent and its history and cached prompt prefix
   don't change; attach such an image again to have it flattened.
+- **`web_fetch` refuses images and other binary content instead of extracting from it (#1452).** A
+  fetched body that wasn't a PDF was decoded as text, and an image's bytes decoded to characters
+  that were largely replacement characters: a 23 KB JPEG became 22,395 characters, 10,883 of them
+  U+FFFD. The result wasn't empty, so the extraction model was asked about it and answered from the
+  noise or made an answer up. `web_fetch` now returns an error naming the content's type and size
+  (for example `an image (image/png, 3,081 bytes)`) and makes no extraction call. A PNG, JPEG, GIF
+  or WebP image is recognised by its bytes; other content is binary when the first 8,192 characters
+  of its decoded text hold a NUL character. The error names the media type the server declared
+  when it is well formed. UTF-16 text still reads as text when it declares its byte order
+  (`utf-16le` or `utf-16be`), and when it starts with a byte order mark, which now outranks the
+  declared charset, as in browsers. A page served with its `Content-Type` in capitals, such as
+  `text/HTML`, now has its markup stripped like any other. A PDF that begins with the PDF header
+  is handled as before; one with bytes before its header, which was never recognised as a PDF, is
+  now refused as binary when its first 8,192 characters hold a NUL, as compressed content nearly
+  always does, instead of being decoded as text.
+- **A coordinator's task list survives a storage read that fails during a `tasks` call (#1416).**
+  A task add after a failed read saved its one task over the stored list, and a reorder with no
+  ids saved an empty list; an update or remove answered "task not found" and a list answered that
+  there were no tasks. Every `tasks` action now tells the model that the stored list couldn't be
+  read and nothing was changed, and to retry. The tasks pane's read answers 503 when it fails, so
+  the pane keeps the list it last showed instead of emptying. A list nested too deeply to parse
+  now reads as corrupt, like any other unparseable list: the pane shows it empty and changes to it
+  are refused.
+- **A server node no longer reports a workstream it can't read as missing.** A node route that
+  checks access to a workstream, such as its history, close or send, answers 503 with the code
+  `workstream_unreadable` instead of 404 "Workstream not found" when it has to read the
+  workstream's row and the read fails. Slack and Discord took that 404 for an already-closed
+  workstream and unlinked the channel; they now report the error and keep the link. The console's
+  route proxy tries the node that holds the workstream on the coded 503, as it does on a 404. When
+  that retry can't refresh the cluster's membership or resolve the workstream's route, the proxy
+  answers 503 instead of passing on a 404 it couldn't check. A failed membership read there, or on
+  any routed request while the console knows no live node, answers 503 instead of a plain-text
+  500. The node's API spec and reference list the coded 503.
+- **Every coordinator route checks a coordinator the same way, an outage included.** The console's
+  coordinator routes share one access check. When a coordinator isn't loaded and its row can't be
+  read, the check answers the same 404 "coordinator not found" as for an id that names nothing, so
+  a storage outage can't be used to tell which ids name coordinators in a private project. The
+  routes coordinators share with other workstreams, such as history, answered that read with a 500
+  before.
+- **Coordinator tools report a failed read instead of a missing or changed child.**
+  `wait_for_workstream` ends with an error to retry when it can't read its children's states or
+  token counts; it used to report them as not among the coordinator's children, or as changed since
+  the caller's snapshot. A send, close, cancel or delete whose ownership check can't read the child
+  answers an error to retry instead of "no workstream matching". When the list of the coordinator's
+  children can't be read, an id that has to be checked against it gets an error to retry, and an
+  error that only shows the list as a hint leaves it out instead of showing it empty.
+  `inspect_workstream` reports a failed read of a child's history, or of a finished child's close
+  reason and last error, as an error to retry instead of an empty history or a child with neither,
+  and a failed read of the child itself now says to retry instead of quoting the storage error. It
+  leaves a child's live token count out when the persisted count can't be read, instead of showing
+  0. A `wait_for_workstream` result for an errored child whose last error can't be read has
+  `message: null`, as for any message the wait couldn't read, instead of the child's last assistant
+  turn. `list_nodes` answers an error to retry when it can't read which nodes are live, instead of
+  offering every node that ever registered, and says to retry instead of quoting the storage error
+  when it can't read their metadata. A stored node value nested too deeply to parse is listed raw
+  instead of failing the whole listing. `close_all_children` reports a reply it can't read as an
+  error instead of "closed 0". That error, and a spawn whose reply carries no ws_id, tell the model
+  to check `list_workstreams` before retrying, since the children may already have changed, and
+  `list_workstreams` says to retry instead of quoting the storage error when it can't read them. A
+  coordinator reopened while its children can't be read no longer takes them for none:
+  `close_all_children` answers an error to retry instead of "closed 0", and a cancel records that
+  it couldn't reach them instead of cascading to nobody.
+- **Other reads that fail say so instead of looking empty.** The coordinator metrics route answers
+  503 when one of its reads fails, where it reported zeros that read as a healthy, idle
+  coordinator. The cluster detail route answers 503 when it can't read the message tail it was
+  asked for, instead of an empty tail. History and export answer 503 instead of 404 when their own
+  row read fails after the access check passed, and history answers 503 when it can't read a saved
+  workstream's settings, where it showed stored reasoning that the model's settings may hide. The
+  coordinator page's tasks and children panes say they couldn't be loaded, instead of "no tasks
+  yet" or "no children spawned yet", until one of their loads succeeds; children that live updates
+  add in the meantime are marked as only part of the list. The cluster node detail route answers
+  503 when it can't read the node's metadata, instead of showing none.
+- **Inspecting a child and checking access on a node cost less.** `inspect_workstream` reads the
+  messages it returns, plus some slack, instead of the child's whole history and its attachments,
+  and asks the console for no message tail it would discard. On a server node, the access check
+  behind send, speech to text and the command route reads the workstream's row in a worker thread,
+  so a slow database no longer stalls every request on the node. The console's create proxy and
+  node detail route read storage in a worker thread too.
 
 ### Security
 
