@@ -1720,7 +1720,7 @@ async def speech_to_text(request: Request) -> JSONResponse:
     ws_id = request.path_params.get("ws_id", "")
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
-    _user_id, err = _require_ws_access(request, ws_id)
+    _user_id, err = await asyncio.to_thread(_require_ws_access, request, ws_id)
     if err:
         return err
 
@@ -1810,7 +1810,7 @@ async def speech_to_text_stream(request: Request) -> Response:
     ws_id = request.path_params.get("ws_id", "")
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
-    _user_id, err = _require_ws_access(request, ws_id)
+    _user_id, err = await asyncio.to_thread(_require_ws_access, request, ws_id)
     if err:
         return err
 
@@ -2117,7 +2117,7 @@ async def command(request: Request) -> JSONResponse:
     if not cmd:
         return JSONResponse({"error": "Empty command"}, status_code=400)
     mgr = request.app.state.workstreams
-    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
+    _owner, err = await asyncio.to_thread(_require_ws_access, request, str(ws_id or ""), mgr=mgr)
     if err:
         return err
 
