@@ -323,6 +323,8 @@ def test_spawn_exec_treats_missing_ws_id_on_success_path_as_error(coord_session)
     item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "hi"}))
     _call_id, output = sess._exec_spawn_workstream(item)
     assert "no ws_id" in output
+    # The child may exist, so the model checks before it retries.
+    assert "check with list_workstreams before retrying" in output
     assert ui.tool_results[-1][3] is True  # is_error
 
 
@@ -826,7 +828,6 @@ def test_a_queued_message_ends_a_real_wait_and_reaches_the_model(
         stack.enter_context(patch.object(sess, "_update_token_table"))
         stack.enter_context(patch.object(sess, "_print_status_line"))
         stack.enter_context(patch.object(sess, "_emit_state"))
-        stack.enter_context(patch.object(sess, "_visible_memory_count", return_value=0))
         stack.enter_context(patch("turnstone.core.session.save_message"))
         sess._title_generated = True
         sender.start()
@@ -1494,6 +1495,45 @@ def test_tasks_exec_reorder_surfaces_permutation_error(coord_session):
     assert "error" in parsed
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param({"action": "list"}, id="list"),
+        pytest.param({"action": "add", "title": "new"}, id="add"),
+        pytest.param({"action": "update", "task_id": "tsk_x", "status": "done"}, id="update"),
+        pytest.param({"action": "remove", "task_id": "tsk_x"}, id="remove"),
+        pytest.param({"action": "reorder", "task_ids": []}, id="reorder"),
+    ],
+)
+def test_tasks_exec_reports_a_failed_read_to_the_model(
+    coord_session, tmp_path, monkeypatch, sqlite_backend_factory, args
+):
+    """#1416 through the real client: a failed storage read reaches the
+    model as an error saying nothing changed, and the stored list stays."""
+    from tests.test_coordinator_client import _make_read_client
+
+    sess, _coord, ui = coord_session
+    st = sqlite_backend_factory(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    sess._coord_client = _make_read_client(st)
+    sess._coord_client.tasks_add("coord-1", title="first")
+    read_stored = st.load_workstream_config
+    stored = read_stored("coord-1")["tasks"]
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("storage down")
+
+    monkeypatch.setattr(st, "load_workstream_config", _broken)
+    _, output = sess._exec_tasks(sess._prepare_tool(_tc("tasks", args)))
+
+    assert output == (
+        f"Error: tasks {args['action']} failed: the stored task list could not be read; "
+        "no task was changed. Retry after storage recovers."
+    )
+    assert ui.tool_results[-1][3] is True  # reported as an error
+    assert read_stored("coord-1")["tasks"] == stored
+
+
 def test_tasks_exec_remove_passes_client_dict_through(coord_session):
     """The client returns a dict; exec must pass it through without
     synthesising a generic 'not found' message that would mask corrupt-
@@ -1707,6 +1747,18 @@ def test_spawn_batch_exec_surfaces_per_item_errors_in_denied(coord_session):
     assert len(body["denied"]) == 1
     assert body["denied"][0]["idx"] == 1
     assert "skill not found" in body["denied"][0]["reason"]
+
+
+def test_spawn_batch_exec_says_a_child_without_a_ws_id_may_exist(coord_session):
+    """A success-shaped reply with no ``ws_id`` leaves the child's existence
+    unknown, so its denied row says to check before retrying."""
+    sess, coord, _ui = coord_session
+    coord.spawn.return_value = {"name": "n", "node_id": "node-auto", "status": 200}
+    item = sess._prepare_tool(_tc("spawn_batch", {"children": _three_children()}))
+    _call_id, output = sess._exec_spawn_batch(item)
+    denied = json.loads(output)["denied"]
+    assert [d["idx"] for d in denied] == [0, 1, 2]
+    assert all("check with list_workstreams before retrying" in d["reason"] for d in denied)
 
 
 def test_spawn_batch_exec_stops_spawning_after_cancel(coord_session):
@@ -2012,6 +2064,23 @@ def test_close_all_children_exec_surfaces_client_exception(coord_session):
     item = sess._prepare_tool(_tc("close_all_children", {}))
     _call_id, output = sess._exec_close_all_children(item)
     assert "boom" in output
+    assert ui.tool_results[-1][3] is True
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [{"raw": "[]", "status": 200}, {"status": "ok", "closed": ["c-1"]}],
+    ids=["unparsed", "missing-lists"],
+)
+def test_close_all_children_exec_reports_an_unreadable_reply_as_an_error(coord_session, reply):
+    """A reply the client couldn't read as the route's object says nothing
+    about which children closed, so it is an error, not "closed 0"."""
+    sess, coord, ui = coord_session
+    coord.close_all_children.return_value = reply
+    item = sess._prepare_tool(_tc("close_all_children", {}))
+    _call_id, output = sess._exec_close_all_children(item)
+    assert output.startswith("Error: the close_all_children reply could not be read")
+    assert "check them with list_workstreams before retrying" in output
     assert ui.tool_results[-1][3] is True
 
 
