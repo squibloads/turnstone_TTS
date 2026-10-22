@@ -770,6 +770,23 @@ def _build_registry() -> dict[str, SettingDef]:
             reference_url=VOICE_DOCS_URL + "#voice-mode",
         ),
         SettingDef(
+            "audio.voice_idle_mute_seconds",
+            "int",
+            60,
+            "Turn the voice-mode microphone off after this long without speech (seconds)",
+            "audio",
+            min_value=0,
+            max_value=3600,
+            strict_int=True,
+            help="A voice session left open is a live microphone: it would hear the next "
+            "thing said in the room, to a colleague or another model, and send it as an "
+            "instruction. After this many seconds with the mic open and no speech heard, "
+            "voice mode turns its own microphone off. Voice mode stays on and replies still "
+            "play; press the mic to listen again. Time spent waiting for or playing a reply "
+            "does not count. The default is 60 seconds; 0 never turns it off.",
+            reference_url=VOICE_DOCS_URL + "#idle-microphone",
+        ),
+        SettingDef(
             "audio.voice_announce_reports",
             "bool",
             False,
