@@ -31,6 +31,14 @@
 //  but never opens the mic: `listening` reports as `muted` instead.  That lets
 //  the user talk to someone else while waiting for a job without the session
 //  hearing it.  Only `disable()` clears it.
+//
+//  idleMuteMs (default 0 = never) mutes the loop itself after that long with
+//  the mic open and nothing heard, through the same switch, then calls
+//  onIdleMute().  A forgotten session is otherwise a live microphone that
+//  will hear the next thing said in the room and send it as an instruction.
+//  Only time the mic is actually open counts: detected speech restarts it,
+//  and thinking, speaking or a mic still waiting on a busy turn do not count.
+//  setTimer/clearTimer default to setTimeout/clearTimeout (injected in tests).
 // ===========================================================================
 
 // The status strings live in the pane: this module only names the states.
@@ -42,6 +50,12 @@ export function createVoiceLoop(opts) {
     typeof opts.stopListening === "function" ? opts.stopListening : () => {};
   const send = typeof opts.send === "function" ? opts.send : () => {};
   const setStatus = typeof opts.setStatus === "function" ? opts.setStatus : () => {};
+  const onIdleMute = typeof opts.onIdleMute === "function" ? opts.onIdleMute : () => {};
+  const idleMuteMs = Number(opts.idleMuteMs) > 0 ? Number(opts.idleMuteMs) : 0;
+  const setTimer =
+    typeof opts.setTimer === "function" ? opts.setTimer : (fn, ms) => setTimeout(fn, ms);
+  const clearTimer =
+    typeof opts.clearTimer === "function" ? opts.clearTimer : (t) => clearTimeout(t);
 
   let state = "off";
   // The coordinator's own turn state, mirrored from setBusy.  Completion of a
@@ -59,6 +73,30 @@ export function createVoiceLoop(opts) {
   let micPending = false;
   // The user's mic switch; see the header.  Independent of `state`.
   let muted = false;
+  // The quiet-minute countdown, armed only while the mic is open.  `idleSeq`
+  // lets a callback that was already queued when its timer was cleared see
+  // that it is stale and do nothing.
+  let idleTimer = null;
+  let idleSeq = 0;
+
+  function clearIdle() {
+    idleSeq++;
+    if (idleTimer !== null) clearTimer(idleTimer);
+    idleTimer = null;
+  }
+
+  function armIdle() {
+    clearIdle();
+    if (!idleMuteMs) return;
+    const seq = idleSeq;
+    idleTimer = setTimer(() => {
+      if (seq !== idleSeq) return;
+      idleTimer = null;
+      if (state !== "listening" || muted || micPending) return;
+      setMuted(true);
+      onIdleMute();
+    }, idleMuteMs);
+  }
 
   function resetTurn() {
     replyRun = false;
@@ -85,6 +123,8 @@ export function createVoiceLoop(opts) {
     }
     setStatus("listening");
     micPending = startListening() === false;
+    if (micPending) clearIdle();
+    else armIdle();
   }
 
   function enter(next) {
@@ -99,6 +139,7 @@ export function createVoiceLoop(opts) {
   // turn (half-duplex), and that a clip is discarded rather than sent.
   function leaveListening() {
     if (state !== "listening" && state !== "transcribing") return;
+    clearIdle();
     micPending = false;
     stopListening();
   }
@@ -126,6 +167,7 @@ export function createVoiceLoop(opts) {
     // Discard anything in flight: disabling the mode must never send a clip
     // the user had already walked away from.  After this the state is off, so
     // every later callback is ignored.
+    clearIdle();
     stopListening();
     state = "off";
     busy = false;
@@ -189,6 +231,7 @@ export function createVoiceLoop(opts) {
     if (micPending && state === "listening") {
       micPending = false;
       if (startListening() === false) micPending = true;
+      else armIdle();
       return;
     }
     maybeFinish();
@@ -225,6 +268,7 @@ export function createVoiceLoop(opts) {
     muted = next;
     if (state !== "listening" && state !== "transcribing") return;
     if (muted) {
+      clearIdle();
       stopListening();
       micPending = false;
       state = "listening";
@@ -246,7 +290,10 @@ export function createVoiceLoop(opts) {
     if (state === "off") return;
     if (muted) return;
     if (next === "transcribing") {
-      if (state === "listening") enter("transcribing");
+      if (state === "listening") {
+        clearIdle();
+        enter("transcribing");
+      }
       return;
     }
     if (next === "idle" && state === "transcribing") {
