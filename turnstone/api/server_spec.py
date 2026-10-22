@@ -216,7 +216,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         response_model=SendResponse,
         # 409: cross_user_interjection (shipped with the multi-user work;
         # the spec had drifted behind the implementation).
-        error_codes=[400, 404, 409],
+        error_codes=[400, 404, 409, 503],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -230,7 +230,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         ),
         request_model=DequeueRequest,
         response_model=StatusResponse,
-        error_codes=[400, 404],
+        error_codes=[400, 404, 503],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -239,7 +239,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Approve or deny a tool call",
         request_model=ApproveRequest,
         response_model=ApproveResponse,
-        error_codes=[400, 404, 409],
+        error_codes=[400, 404, 409, 503],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -261,7 +261,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         request_model=CancelRequest,
         request_required=False,
         response_model=CancelResponse,
-        error_codes=[400, 404],
+        error_codes=[400, 404, 503],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -328,7 +328,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
                 schema_type="integer",
             ),
         ],
-        error_codes=[404],
+        error_codes=[404, 503],
         tags=["Streaming"],
     ),
     EndpointSpec(
@@ -373,14 +373,14 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/{ws_id}/title",
         "POST",
         "Set workstream title manually",
-        error_codes=[400, 409],
+        error_codes=[400, 409, 503],
         tags=["Workstreams"],
     ),
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/refresh-title",
         "POST",
         "Regenerate workstream title via LLM",
-        error_codes=[404],
+        error_codes=[404, 503],
         tags=["Workstreams"],
     ),
     EndpointSpec(
@@ -462,7 +462,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "enumerate workstream existence; a 403 indicates a scope/auth "
         "failure from the middleware layer.",
         response_model=UploadAttachmentResponse,
-        error_codes=[400, 403, 404, 409, 413],
+        error_codes=[400, 403, 404, 409, 413, 503],
         tags=["Attachments"],
     ),
     EndpointSpec(
@@ -471,7 +471,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "List the caller's pending (unconsumed) attachments for this "
         "workstream.  Ownership failures are masked as 404.",
         response_model=ListAttachmentsResponse,
-        error_codes=[403, 404],
+        error_codes=[403, 404, 503],
         tags=["Attachments"],
     ),
     EndpointSpec(
@@ -479,7 +479,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "GET",
         "Return raw bytes of an attachment with its stored Content-Type.  "
         "Ownership failures are masked as 404.",
-        error_codes=[403, 404],
+        error_codes=[403, 404, 503],
         tags=["Attachments"],
     ),
     EndpointSpec(
@@ -487,7 +487,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "DELETE",
         "Remove a pending attachment (consumed attachments return 404).  "
         "Ownership failures are also masked as 404.",
-        error_codes=[403, 404],
+        error_codes=[403, 404, 503],
         tags=["Attachments"],
     ),
     # --- Voice I/O ---

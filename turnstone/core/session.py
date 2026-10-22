@@ -9,6 +9,7 @@ to receive events and handle approval prompts.
 from __future__ import annotations
 
 import base64
+import codecs
 import collections
 import concurrent.futures
 import contextlib
@@ -129,7 +130,6 @@ from turnstone.core.media_materialization import (
 from turnstone.core.memory import (
     acquire_memory_index_snapshot,
     clear_last_error,
-    count_structured_memories,
     find_structured_memory_scopes,
     get_attachments,
     get_skill_by_name,
@@ -173,7 +173,6 @@ from turnstone.core.metacognition import (
     sanitize_display,
     sanitize_name,
     sanitize_payload,
-    should_nudge,
     task_too_long_message,
     task_unrenderable_message,
 )
@@ -2533,6 +2532,29 @@ def _document_text_budget_chars(
     return min(scaled, hard_char_cap) if hard_char_cap is not None else scaled
 
 
+# A NUL among the first 8192 characters of a fetched body's decoded text marks
+# it as binary.  read_file applies the same test to a file's first 8192 bytes;
+# web_fetch applies it after decoding, so UTF-16 text, whose bytes hold NULs,
+# still reads as text when it starts with a byte order mark or declares its
+# byte order (utf-16le or utf-16be).
+_WEB_FETCH_BINARY_SNIFF_CHARS = 8192
+
+# A media type as RFC 6838 names it: ``type/subtype``, each part a letter or
+# digit followed by at most 126 letters, digits or ``!#$&-^_.+``.
+_MEDIA_TYPE_RE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}")
+
+
+def _declared_media_type(content_type: str) -> str | None:
+    """Return the bare media type a ``Content-Type`` value declares, or ``None``.
+
+    Parameters are dropped and the type is lowercased.  A value that isn't a
+    well-formed ``type/subtype`` gives ``None``, so an error naming the type
+    can't carry other header text into the model's context.
+    """
+    declared = content_type.split(";", 1)[0].strip().lower()
+    return declared if _MEDIA_TYPE_RE.fullmatch(declared) else None
+
+
 _RERANK_TIMEOUT_CAP_S = 15.0  # reranking <=50 short docs is fast; cap so a hung
 # endpoint falls back to BM25 in seconds, not up to tools.timeout (120s default).
 # Per-turn memory rerank makes the long timeout a turn-stall hazard.
@@ -3587,17 +3609,15 @@ class ChatSession:
         #   - "wake" entries drain ONLY via ``deliver_wake_nudge_from_queue``
         #     (the coordinator idle nudges); invisible to every other seam
         #     and dropped — never demoted — on abandoned generations
-        # Cooldown timestamps live separately in ``_metacog_state`` for
-        # ``should_nudge`` gating.
+        # Cooldown timestamps live separately in ``_metacog_state``: read by
+        # ``nudge_allowed``, written by ``record_nudge`` once a nudge is queued.
         self._metacog_state: dict[str, float] = {}
         self._nudge_queue = NudgeQueue()
-        # Wake-trigger plumbing: ``deliver_wake_nudge_from_queue`` sets
-        # this tag while sending a synthetic empty user turn so that
-        # ``_check_metacognitive_nudge`` and the ``_queue_*_advisory``
-        # producers short-circuit (the wake's nudge text contains
-        # trigger words like "don't" that would otherwise re-fire
-        # correction nudges on top of it) and so the synthesized user
-        # message gets stamped ``_source`` for audit / replay distinction.
+        # Wake-trigger plumbing: ``deliver_wake_nudge_from_queue`` sets this tag while sending a
+        # synthetic empty user turn so that ``_plan_metacognitive_nudge`` (belt-and-braces: the
+        # empty input matches no detector) and the ``_queue_*_advisory`` producers short-circuit,
+        # and so the synthesized user message gets stamped ``_source`` for audit / replay
+        # distinction.
         self._wake_source_tag: str = ""
         # True between an abandoned generation (cancel / interrupt /
         # fatal error) and the next real (non-wake) ``send`` — the
@@ -10638,14 +10658,14 @@ class ChatSession:
             raise GenerationCancelled()
 
     def _check_generation_admission(self, my_generation: int) -> None:
-        """Fence pre-turn setup against Stop, force-successor, and close.
+        """Fence generation-owned work against Stop, force-successor, and close.
 
-        This deliberately does not dispatch through ``_check_cancelled``.
-        That later cooperative probe is an established lightweight-session
-        test seam and also includes task-agent-local cancellation.  The setup
-        path needs the narrower, non-overridable session ownership invariant:
-        once a generation loses its event, number, or publication latch it may
-        not bind an actor, refresh configuration, or admit a user row.
+        This deliberately does not dispatch through ``_check_cancelled``. That later cooperative
+        probe is an established lightweight-session test seam and also includes task-agent-local
+        cancellation. Pre-turn setup and tool-result admission need the narrower, non-overridable
+        session ownership invariant: once a generation loses its event, number, or publication
+        latch it may not bind an actor, refresh configuration, admit a user row, or admit the
+        results of the tools it ran.
         """
 
         if (
@@ -13612,23 +13632,10 @@ class ChatSession:
                         f"{unexpected_ids}"
                     )
 
-                # Tool-error nudge: queues an advisory for the next drain pass.
-                has_tool_error = any(self._tool_error_flags.get(tc_id) for tc_id, _ in results)
-                needs_tool_error_memory = self._nudges_enabled("tool_error") and has_tool_error
-                tool_error_memory_count = (
-                    self._visible_memory_count() if needs_tool_error_memory else 0
-                )
-                apply_post_execute_advisories = functools.partial(
-                    self._apply_post_execute_advisories,
-                    has_tool_error=has_tool_error,
-                    tool_error_memory_count=tool_error_memory_count,
-                )
-                if not self._publish_for_generation(
-                    my_generation,
-                    apply_post_execute_advisories,
-                    allow_cancelled=False,
-                ):
-                    raise GenerationCancelled()
+                # A Stop, close or successor that landed while the tools ran: admit none of their
+                # results. ``_check_cancelled`` never reads the publication latch, and close
+                # installs that latch before it sets the cancel event; this fence refuses on either.
+                self._check_generation_admission(my_generation)
 
                 # Map tool_call_id → tool name for logging
                 # Providers may pad a name with whitespace; dispatch strips it,
@@ -14348,12 +14355,11 @@ class ChatSession:
     def _drain_pending_advisories(self) -> None:
         """Drop the abandoned generation's advisory nudges — not external events.
 
-        Tool-channel nudges (``tool_error``, ``denial``)
-        queued earlier in this batch and user-channel nudges
-        (``correction``, …) queued during ``_check_metacognitive_nudge``
-        are commentary ABOUT the generation being abandoned (cancel,
-        KeyboardInterrupt, unexpected exception) — they drop so nothing
-        stale bleeds into the next send's tool loop or user turn.
+        Tool-channel advisories (``denial``, ``skill_hint``) queued earlier in this batch and
+        user-channel nudges (``correction``, …) that ``_plan_metacognitive_nudge`` planned for this
+        send are commentary ABOUT the generation being abandoned (cancel, KeyboardInterrupt,
+        unexpected exception) — they drop so nothing stale bleeds into the next send's tool loop or
+        user turn.
 
         ``"any"``-channel entries survive but are DEMOTED to ``"quiet"``:
         those are external events (``watch_triggered``,
@@ -18956,11 +18962,10 @@ class ChatSession:
           ``priority`` so the UI can frame important interjections
           distinctly.  Cancel / exception / no-tool-call paths drain the
           queue as a real user row instead (Seams 2 and 3).
-        - **Metacognitive tool-channel nudges** (``tool_error`` /
-          ``denial``) and any-channel nudges
-          (``watch_triggered`` / ``idle_children``) — drained on the last
-          result.  ``meta`` carries the producer's optional fields
-          (e.g. ``watch_triggered``'s ``watch_name``).
+        - **Tool-channel advisories** (``denial`` / ``skill_hint``) and any-channel nudges
+          (``watch_triggered`` / ``background_shell_exit``) — drained on the last result.
+          ``meta`` carries the producer's optional fields (e.g. ``watch_triggered``'s
+          ``watch_name``).
 
         Empty when no advisories apply (common case).  Guard findings
         attach per-result; queued messages and metacognitive nudges drain
@@ -19037,9 +19042,7 @@ class ChatSession:
                 # retractions accumulate against ids nothing will restore.
                 self._close_pop_window(popped)
 
-            # Metacognitive tool-channel drain.  Queued by
-            # ``_queue_tool_advisory`` from the tool_error / denial
-            # paths just before this loop.
+            # Drain tool-channel advisories queued by the denial and skill-hint paths.
             for nt, text, meta in self._nudge_queue.drain(TOOL_DRAIN):
                 specs.append((nt, text, dict(meta) if meta else {}))
 
@@ -19289,9 +19292,6 @@ class ChatSession:
             jc_live = self._judge_cfg
             if judge_cancel and jc_live and jc_live.cancel_on_approval:
                 judge_cancel.set()
-        denial_memory_count = (
-            self._visible_memory_count() if not approved and self._nudges_enabled("denial") else 0
-        )
         # The post-gate state transition and denial advisory are one owner
         # publication.  Stop/close/force may win while the gate is parked; in
         # that case the witness wakes it, but the old worker must not repaint a
@@ -19361,27 +19361,19 @@ class ChatSession:
                                     else "Denied by user"
                                 )
                     user_feedback = None  # feedback is in the denial_msg
-                    # The nudge says the user rejected a call: only when a person did,
-                    # not when tool policies refused it or nobody answered in time
-                    # (``_refused_by``).
+                    # The nudge says the user rejected a call: only when a person did, not when
+                    # tool policies refused it, nobody answered in time, or a CLI prompt had no
+                    # input left to answer with (``_refused_by``).
                     person_rejected = any(
                         item.get("denied") and not item.get("_refused_by") for item in items
                     )
-                    if (
-                        person_rejected
-                        and self._nudges_enabled("denial")
-                        and should_nudge(
-                            "denial",
-                            self._metacog_state,
-                            message_count=len(self.messages),
-                            memory_count=denial_memory_count,
-                            cooldown_secs=self._mem_cfg.nudge_cooldown,
-                        )
-                    ):
-                        # Tool channel, not user: the denial is a response to THIS
-                        # batch, so the nudge rides ``_collect_advisories`` with
-                        # the denied tool results rather than reaching a later
-                        # user-message seam.
+                    if person_rejected and self._nudges_enabled("denial"):
+                        # Tool channel, not user: the denial is a response to THIS batch, so the
+                        # nudge rides ``_collect_advisories`` with the denied tool results rather
+                        # than reaching a later user-message seam. No cooldown (#924): each nudge
+                        # follows a rejection a person made, and ``_queue_tool_advisory`` does
+                        # nothing during a wake turn, so a stamp taken there would silence the next
+                        # real rejection's nudge.
                         self._queue_tool_advisory("denial", format_nudge("denial"))
 
             if not self._commit_for_generation(
@@ -21209,31 +21201,6 @@ class ChatSession:
             hint += " Project scope is read-only."
         return hint
 
-    def _visible_memory_count(self, access: _MemoryAccess | None = None) -> int:
-        """Count memories visible to this session.
-
-        Coord sessions are isolated to their own coord-scope namespace —
-        they don't see global / workstream / user rows.  The orchestration
-        role doesn't need user-context memory and pulling those rows in
-        would also surface memories from sibling interactive sessions
-        (same user, different workstream) into the coord's system
-        message, which the coord shouldn't be reasoning over.  A voice
-        coordinator is isolated the same way, to the ``voice`` namespace
-        instead of the coordinator one.
-        """
-        resolved = access or self._memory_access()
-        total = 0
-        for scope, scope_id in self._visible_scopes(resolved):
-            try:
-                total += count_structured_memories(
-                    scope=scope,
-                    scope_id=scope_id,
-                    acting_principal_id=resolved.principal_id,
-                )
-            except Exception:
-                log.warning("Failed to count structured memories", exc_info=True)
-        return total
-
     def _visible_scopes(self, access: _MemoryAccess | None = None) -> list[tuple[str, str]]:
         """Return the (scope, scope_id) pairs visible to this session.
 
@@ -21395,19 +21362,6 @@ class ChatSession:
             notices.append(f"{invalid} legacy entries need authored descriptions")
         return f"\nNotice: {'; '.join(notices)}." if notices else ""
 
-    def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
-        """Check if a metacognitive nudge should fire for *user_message*.
-
-        Called *before* the user turn is appended to ``self.messages``, so
-        ``msg_count`` includes the about-to-be-appended message.
-
-        Returns ``(nudge_type, nudge_text)`` or ``None``.
-        """
-        planned = self._plan_metacognitive_nudge(user_message)
-        if planned:
-            record_nudge(planned[0], self._metacog_state)
-        return planned
-
     def _plan_metacognitive_nudge(
         self,
         user_message: str,
@@ -21464,12 +21418,9 @@ class ChatSession:
         entry queued here can never manufacture a synthetic user turn of
         its own — it waits for the user's real one.
 
-        No-ops while the session is inside a wake-driven turn
-        (``_wake_source_tag`` set) so model behaviour during the wake
-        send (e.g. denying a tool the wake suggested, hitting a
-        tool_error) doesn't queue a nudge that would land on
-        top of the wake's own turn or on the user's next real
-        turn referencing a context the user never saw.
+        No-ops while the session is inside a wake-driven turn (``_wake_source_tag`` set) so
+        advice generated during the wake cannot land on the wake's own turn or on the user's
+        next real turn referencing a context the user never saw.
         """
         if self._wake_source_tag:
             return
@@ -21544,12 +21495,10 @@ class ChatSession:
     def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
         """Queue a metacognitive nudge for the next tool-result batch.
 
-        Drains in ``_collect_advisories`` alongside guard findings, then is
-        emitted as a first-class ``{"role": "system"}`` turn AFTER the tool
-        batch (see the per-result loop in ``_run_loop``).  Used for nudges
-        that respond to a tool batch: ``tool_error`` and ``denial`` (the
-        operator rejected the batch — the nudge belongs next to the denied
-        results it explains).
+        Drains in ``_collect_advisories`` alongside guard findings, then is emitted as a
+        first-class ``{"role": "system"}`` turn AFTER the tool batch (see the per-result loop in
+        ``_run_loop``). Used for ``denial`` (the operator rejected the batch) and ``skill_hint``
+        advisories, which belong next to the results they explain.
 
         No-ops while the session is inside a wake-driven turn (see
         ``_queue_user_advisory`` for the rationale).
@@ -21573,9 +21522,8 @@ class ChatSession:
         ``_wake_source_tag`` is set for the duration of the synthetic
         send so:
 
-        * ``_check_metacognitive_nudge`` short-circuits (no
-          recursive correction / completion detection on the
-          envelope text)
+        * ``_plan_metacognitive_nudge`` short-circuits (belt-and-braces: the synthetic empty input
+          already matches no correction / completion detector)
         * ``_queue_user_advisory`` / ``_queue_tool_advisory`` short-
           circuit if model behaviour during the wake (e.g. a denied
           tool call) would otherwise queue a fresh nudge on top of
@@ -21828,46 +21776,6 @@ class ChatSession:
                         )
                         continue
                     self._nudge_queue.requeue(recovered, channel=QUIET_CHANNEL)
-
-    def _apply_post_execute_advisories(
-        self,
-        *,
-        has_tool_error: bool,
-        tool_error_memory_count: int | None = None,
-    ) -> None:
-        """Queue the tool-error nudge for a freshly-executed batch.
-
-        Updates ``self._nudge_queue`` (via ``_queue_tool_advisory``) and
-        ``self._metacog_state`` (cooldown timestamp via ``should_nudge``).
-        The operator-visible signal is the first-class operator-context
-        ``{"role": "system"}`` turn the per-result loop downstream emits
-        after the tool batch when the drained metacog nudges flush.
-
-        ``has_tool_error`` says whether any result in the batch carries a
-        ``_tool_error_flags`` mark, the authoritative is_error signal.  The
-        caller reads the flags; the per-result loop in ``_run_loop``
-        ``.pop``s them after this returns.
-        """
-        # Tool-error nudge — queued so it rides the same _collect_advisories
-        # drain pass as guard findings and is emitted as a system turn after
-        # the tool batch.  Cooldown gating in should_nudge keeps this to one
-        # nudge per batch even with many failing tools.
-        if (
-            self._nudges_enabled("tool_error")
-            and has_tool_error
-            and should_nudge(
-                "tool_error",
-                self._metacog_state,
-                message_count=len(self.messages),
-                memory_count=(
-                    tool_error_memory_count
-                    if tool_error_memory_count is not None
-                    else self._visible_memory_count()
-                ),
-                cooldown_secs=self._mem_cfg.nudge_cooldown,
-            )
-        ):
-            self._queue_tool_advisory("tool_error", format_nudge("tool_error"))
 
     # ------------------------------------------------------------------
     # Coordinator tools — reachable only when ``kind == "coordinator"``.
@@ -22217,7 +22125,10 @@ class ChatSession:
         if not child_ws_id:
             if voice:
                 self._voice_release_spawns(1)
-            msg = "Error: spawn returned no ws_id"
+            msg = (
+                "Error: spawn's reply carried no ws_id, so whether the child was created "
+                "is unknown; check with list_workstreams before retrying"
+            )
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
         # Successful spawn — surface child_ws_id + node_id + name +
@@ -22462,7 +22373,15 @@ class ChatSession:
                 continue
             ws_id = str(result.get("ws_id") or "")
             if not ws_id:
-                denied.append({"idx": idx, "reason": "spawn returned no ws_id"})
+                denied.append(
+                    {
+                        "idx": idx,
+                        "reason": (
+                            "spawn's reply carried no ws_id, so whether the child was "
+                            "created is unknown; check with list_workstreams before retrying"
+                        ),
+                    }
+                )
                 _child_not_started()
                 continue
             results[str(idx)] = {
@@ -22740,15 +22659,25 @@ class ChatSession:
                 {"call_id": call_id, "op": "close_all_children", "error": str(e)},
             )
             return call_id, msg
-        if result.get("error"):
-            msg = f"Error: {result['error']}"
+        error = result.get("error")
+        if not error and not all(
+            isinstance(result.get(key), list) for key in ("closed", "failed", "skipped")
+        ):
+            # A reply the client couldn't read as the route's object (it hands
+            # one back raw) says nothing about which children closed.
+            error = (
+                "the close_all_children reply could not be read, so which children closed "
+                "is unknown; check them with list_workstreams before retrying"
+            )
+        if error:
+            msg = f"Error: {error}"
             self._report_tool_result(call_id, "close_all_children", msg, is_error=True)
             self._emit_batch_event(
                 "batch_ended",
                 {
                     "call_id": call_id,
                     "op": "close_all_children",
-                    "error": str(result["error"]),
+                    "error": str(error),
                 },
             )
             return call_id, msg
@@ -28795,6 +28724,7 @@ class ChatSession:
         # before requesting it: the URL the model named, which the prepare-time
         # check could not resolve if it names a host, and wherever it 302s.
         pdf_data: bytes | None = None
+        binary_kind: str | None = None
         text = ""
         try:
             resp = fetch_with_ssrf_guard(
@@ -28807,10 +28737,23 @@ class ChatSession:
             body = resp.content
             if sniff_pdf_mime(body):
                 pdf_data = body
+            elif image_mime := sniff_image_mime(body):
+                binary_kind = f"an image ({image_mime}, {len(body):,} bytes)"
             else:
-                ct = resp.headers.get("content-type", "")
+                ct = resp.headers.get("content-type", "").lower()
+                # A UTF-16 byte order mark outranks a declared charset, as it
+                # does in browsers; httpx2 ignores it.  The little-endian UTF-32
+                # mark begins with the little-endian UTF-16 one, so it stays
+                # with the declared charset.
+                utf16_mark = body.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+                if utf16_mark and not body.startswith(codecs.BOM_UTF32_LE):
+                    resp.encoding = "utf-16"
                 text = resp.text
-                if "html" in ct:
+                if "\x00" in text[:_WEB_FETCH_BINARY_SNIFF_CHARS]:
+                    declared = _declared_media_type(ct)
+                    served_as = f"served as {declared}, " if declared else ""
+                    binary_kind = f"binary ({served_as}{len(body):,} bytes)"
+                elif "html" in ct:
                     text = strip_html(text)
 
         except httpx2.HTTPStatusError as e:
@@ -28831,6 +28774,12 @@ class ChatSession:
             return call_id, msg
 
         _check_fetch_cancelled()
+        if binary_kind is not None:
+            msg = (
+                f"Error: fetched content is {binary_kind}; web_fetch reads web pages, text and PDFs"
+            )
+            _report_fetch_result(msg, is_error=True)
+            return call_id, msg
         if pdf_data is not None and len(pdf_data) > PDF_SIZE_CAP:
             msg = f"Error: fetched PDF is too large ({len(pdf_data):,} bytes; cap {PDF_SIZE_CAP:,})"
             _report_fetch_result(msg, is_error=True)
