@@ -529,6 +529,9 @@ def _load_object(raw: str) -> dict[str, Any]:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"not valid JSON: {exc.msg}") from None
+    except (ValueError, RecursionError):
+        # As in _load_list: the decoder's limits are malformed input too.
+        raise ValueError("not valid JSON: nested too deeply or a number too large") from None
     if not isinstance(data, dict):
         raise ValueError("must be a JSON object keyed by TTS model alias")
     return data
