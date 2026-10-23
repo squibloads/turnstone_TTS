@@ -2927,8 +2927,12 @@ Status code: `200` with an empty body.
 
 ### `429 Too Many Requests`
 
-Returned when the per-IP rate limiter rejects a request. `/health` and
-`/metrics` are exempt.
+Returned when the rate limiter rejects a request. Each signed-in user has their
+own limit, whether they call the node directly or through the console; a request
+to a public path, such as sign-in, is limited per client address. `/health`,
+`/metrics`, `/openapi.json`, `/docs`, the page (`/`), its static files
+(`/static/`, `/shared/`) and a cancel (`/v1/api/workstreams/{ws_id}/cancel`,
+`/v1/api/watches/{watch_id}/cancel`) are exempt.
 
 **Response headers:**
 
@@ -3084,7 +3088,7 @@ scrape_configs:
 | `turnstone_errors_total` | counter | — | Errors reported by workstreams |
 | `turnstone_context_window_used_ratio` | gauge | — | Last known fraction of context window in use (0.0–1.0) |
 | `turnstone_sse_connections_active` | gauge | — | Number of open SSE connections |
-| `turnstone_ratelimit_rejected_total` | counter | — | Requests rejected by the per-IP rate limiter |
+| `turnstone_ratelimit_rejected_total` | counter | — | Requests rejected by the rate limiter |
 | `turnstone_backend_up` | gauge | — | LLM backend reachability (1 = up, 0 = down) |
 | `turnstone_circuit_state` | gauge | — | Circuit breaker state (0 = closed, 1 = open, 2 = half_open) |
 | `turnstone_workstreams_evicted_total` | counter | — | Workstreams auto-evicted when at capacity |
@@ -3164,11 +3168,15 @@ console returns a bounded `502` instead of exposing or trusting the malformed
 payload.
 
 A required node missing from live membership returns `503` with
-`code: "required_node_unavailable"` and `required_node_id`. An unreachable
-registered node can return an upstream `502`. Neither condition permits a
-fallback to another node. Ordinary route resolution reads the durable
-requirement before cached placement, including after the node disappears.
-Private-project requirements follow the same visibility rules as history.
+`code: "required_node_unavailable"` and `required_node_id`. A registered node
+the console can't reach returns an upstream `502`. When the request may have
+reached the node but no reply was read, a create that outlasts the console's
+30-second wait say, the `502` has `code: "upstream_no_reply"` and says the
+request may have been processed: the workstream may exist, so check before
+creating it again. None of these conditions permits a fallback to another node.
+Ordinary route resolution reads the durable requirement before cached placement,
+including after the node disappears. Private-project requirements follow the
+same visibility rules as history.
 
 ### `GET /v1/api/route/workstreams/{ws_id}/live`
 
