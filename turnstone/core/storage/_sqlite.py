@@ -1925,7 +1925,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
     def list_workstreams(
         self,
         node_id: str | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
         *,
         parent_ws_id: str | None = None,
         kind: WorkstreamKind | str | None = None,

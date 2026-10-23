@@ -378,6 +378,13 @@ coordinator's own fan-out.  This *soft-closes*; to *cancel* the
 fan-out instead, cancel the coordinator (§8) — a coordinator cancel
 auto-cascades to its direct children.
 
+Discovery combines registered children with all published children stored under the same
+coordinator and owner, including children whose creation events have not arrived. A failed
+discovery returns 503 before any child is closed. Discovery does not update UI membership or repair
+a failed reopen seed. Missing children whose creation events have already passed require a
+successful reopen to restore live event routing. Children published after discovery are outside
+this close-all operation.
+
 See [bulk-endpoints.md](bulk-endpoints.md) for why `close_all_children`
 uses the cascade-mutation shape and how it differs from the
 `spawn_batch` / `cluster/ws/live` shape.
@@ -405,13 +412,12 @@ returns `409` with the currently oldest cycle/call IDs. `always` remembers only
 the tool names in the cycle that actually resolved; it does not enable blanket
 approval.
 
-`cancel` requests cooperative cancellation of the coordinator's in-flight
-generation and auto-cascades to its direct children:
-`cancel_workstream` is dispatched through the routing proxy for
-every direct child in the registry. The HTTP acknowledgement is immediate;
-the worker becomes idle after unwinding. Pass `{"force": true}` only to release
-a wedged worker slot immediately. The coordinator itself remains open for a
-fresh `send`:
+`cancel` requests cooperative cancellation of the coordinator's in-flight generation and
+auto-cascades to its direct children. Discovery combines children in the console's registry with
+published children stored under the same coordinator and owner. The HTTP acknowledgement waits
+for discovery, then child cancellation requests are dispatched through the routing proxy; it
+does not wait for those requests or for workers to unwind. Pass `{"force": true}` only to release
+a wedged worker slot immediately. The coordinator itself remains open for a fresh `send`:
 
 ```http
 POST /v1/api/workstreams/{ws_id}/cancel
