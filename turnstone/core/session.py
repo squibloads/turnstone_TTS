@@ -26,7 +26,6 @@ import os
 import queue
 import random
 import re
-import shlex
 import shutil
 import signal
 import stat
@@ -119,7 +118,7 @@ from turnstone.core.lowering import (
     tool_args_preview,
     wire_valid_arguments,
 )
-from turnstone.core.mcp_client import MCPShutdownError, try_prime_user_pools
+from turnstone.core.mcp_client import MCPShutdownError, _decode_tool_result, try_prime_user_pools
 from turnstone.core.media_materialization import (
     PDF_EXTRACTED_TEXT_PART_OVERHEAD_CHARS,
     PDF_RASTER_TRUNCATION_NOTICE,
@@ -256,6 +255,8 @@ from turnstone.core.settings_registry import (
 )
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS, read_allowed_tools
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
+from turnstone.core.skill_placeholders import render_template as _render_template
+from turnstone.core.skill_placeholders import substitute_skill_args as _substitute_skill_args
 from turnstone.core.storage import (
     AttachmentWrite,
     ConversationCommitConflictError,
@@ -1847,6 +1848,36 @@ _TOOL_RESULT_SHARE: float = 0.20
 _CONSUMED_RESULT_TOOLS: frozenset[str] = frozenset({"bash_output"})
 
 
+def _tool_result_text(output: Any) -> str | None:
+    """Read the text body of a scalar or one-text-block image result.
+
+    MCP normalizes to this shape at ingestion. Other multipart shapes keep their existing path.
+    Returning the original string also preserves controller text and bounded-capture metadata.
+    """
+    if isinstance(output, str):
+        return output
+    if (
+        isinstance(output, list)
+        and output
+        and isinstance(output[0], dict)
+        and output[0].get("type") == "text"
+        and isinstance(output[0].get("text"), str)
+        and all(isinstance(part, dict) and part.get("type") == "image_url" for part in output[1:])
+    ):
+        text: str = output[0]["text"]
+        return text
+    return None
+
+
+def _replace_tool_result_text(
+    output: str | list[dict[str, Any]], text: str
+) -> str | list[dict[str, Any]]:
+    """Replace the single text body read by ``_tool_result_text``; retain every image."""
+    if isinstance(output, str):
+        return text
+    return [{**output[0], "text": text}, *output[1:]]
+
+
 def _result_marker_factory(tool_name: str) -> TruncationMarker:
     if tool_name in _CONSUMED_RESULT_TOOLS:
         return _bash_output_truncation_marker
@@ -2379,6 +2410,18 @@ _TASKS_MIXED_BATCH_ERROR = (
     "All-reads or all-writes are fine; mix only by splitting them across separate "
     "assistant turns."
 )
+# Skill activations (skills ``load``, spawn_workstream / spawn_batch with a
+# skill) read what skill writes (skills ``create`` / ``update`` / ``enable`` /
+# ``disable``) change.  An activation checks its skill as it runs, then reads it
+# again by name to apply it; a write running beside it in the parallel pool
+# could land between those two reads, unchecked.
+_SKILLS_MIXED_BATCH_ERROR = (
+    "Error: a skill write (skills create / update / enable / disable) and a "
+    "skill activation (skills load, or spawn_workstream / spawn_batch with a "
+    "skill) cannot run in the same tool batch: the calls run in parallel, so the "
+    "write could change the skill after the activation checked it. Split them "
+    "across separate assistant turns."
+)
 _TASKS_READ_ACTIONS: frozenset[str] = frozenset({"list"})
 _TASKS_WRITE_ACTIONS: frozenset[str] = frozenset({"add", "update", "remove", "reorder"})
 
@@ -2410,26 +2453,6 @@ _RESOURCE_PATH_RE = re.compile(
 )
 
 
-_TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
-
-
-# SKILL.md spec placeholders.  Single combined
-# regex so substitution is one-pass — a positional arg whose VALUE
-# happens to contain ``$ARGUMENTS`` (etc.) doesn't get re-expanded
-# on a second sweep.  The verbose form keeps the alternation
-# readable; precedence is left-to-right, so the bracketed
-# ``$ARGUMENTS[N]`` form is tried before the bare ``$ARGUMENTS``.
-_SPEC_PLACEHOLDER_RE = re.compile(
-    r"""
-    \$ARGUMENTS\[(?P<idx_bracket>\d+)\]            # $ARGUMENTS[N]
-    | \$ARGUMENTS\b(?!\[)                             # $ARGUMENTS (bare)
-    | \$\{(?P<env>(?:CLAUDE|TURNSTONE)_[A-Z_]+)\}     # ${TURNSTONE_*} / ${CLAUDE_*}
-    | \$(?P<idx_short>\d+)\b                          # $N
-    | \$(?P<named>[A-Za-z_][A-Za-z0-9_]*)\b           # $name
-    """,
-    re.VERBOSE,
-)
-
 # Argument names sourced from SKILL.md frontmatter ``arguments:`` must
 # match this same identifier pattern so the substitution regex can find
 # them.  ``/review`` on PR #578 caught the mismatch where the parser
@@ -2438,12 +2461,6 @@ _SPEC_PLACEHOLDER_RE = re.compile(
 # ``-number`` as literal text).  Parser validates at extraction time
 # and drops non-conforming names with a warning.
 _SKILL_ARG_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-# Detector for "did the original body include the bare ``$ARGUMENTS``
-# placeholder?" — used to decide whether to append ``ARGUMENTS: ...``
-# at the end per spec when the user passed args.  Negative lookahead
-# excludes the ``$ARGUMENTS[N]`` form which is a different placeholder.
-_SPEC_ARGUMENTS_LITERAL_RE = re.compile(r"\$ARGUMENTS\b(?!\[)")
 
 # Auto-title generation runs on the session's own (often thinking-capable)
 # utility model, and there is no portable way to turn reasoning off:
@@ -2588,141 +2605,6 @@ def _is_mcp_surface_tool(name: str) -> bool:
     name filter instead.
     """
     return name.startswith("mcp__") or name in ("read_resource", "use_prompt")
-
-
-def _render_template(content: str, context: dict[str, str]) -> str:
-    """Replace ``{{variable}}`` placeholders in a single pass.
-
-    Unresolvable placeholders are kept as-is.  Single-pass avoids
-    cross-variable injection (e.g. a model name containing ``{{ws_id}}``).
-    """
-
-    def _replace(m: re.Match[str]) -> str:
-        return context.get(m.group(1), m.group(0))
-
-    return _TEMPLATE_VAR_RE.sub(_replace, content)
-
-
-def _substitute_skill_args(
-    content: str,
-    *,
-    arguments_str: str,
-    arg_names: list[str],
-    ws_id: str,
-    effort: str,
-    skill_dir: str = "",
-    substitute_args: bool = True,
-) -> str:
-    """Apply SKILL.md spec placeholder substitution.
-
-    When *substitute_args* is False the invocation-arg forms
-    (``$ARGUMENTS`` / ``$ARGUMENTS[N]`` / ``$N`` / ``$<name>``) are left
-    LITERAL and only the ``${…}`` env vars resolve — for capability
-    contexts (``task_agent``) that are never invoked with args,
-    where a literal ``$1`` or ``$ARGUMENTS`` in the body is prose or shell
-    text, not a placeholder to blank.
-
-    Handles every spec placeholder form:
-
-    * ``$ARGUMENTS`` — full argument string as the user typed it
-    * ``$ARGUMENTS[N]`` / ``$N`` — Nth positional arg (0-indexed),
-      shell-quoted at parse time so ``"hello world" second`` yields
-      ``$0='hello world'``, ``$1='second'``
-    * ``$<name>`` — named arg from the SKILL.md ``arguments:``
-      frontmatter list, paired with the positional arg at the same
-      index
-    * ``${TURNSTONE_SESSION_ID}`` / ``${CLAUDE_SESSION_ID}`` — current
-      workstream id.  ``TURNSTONE_`` is canonical (Turnstone is
-      multi-provider); the ``CLAUDE_`` spelling is a permanent
-      back-compat alias so skills imported from Claude Code / skills.sh
-      keep resolving.  Both map to the same value.
-    * ``${TURNSTONE_EFFORT}`` / ``${CLAUDE_EFFORT}`` — reasoning_effort
-    * ``${TURNSTONE_SKILL_DIR}`` — absolute path of the materialized
-      resource bundle, resolved when *skill_dir* is supplied (the caller
-      materializes resources BEFORE substituting) and left literal
-      otherwise, so a skill that bundles no resources degrades gracefully
-      rather than emitting an empty path.  Unlike the session/effort vars
-      there is deliberately NO ``CLAUDE_SKILL_DIR`` alias: that name also
-      lives in bash, where turnstone-as-a-node-inside-Claude-Code must not
-      shadow the host's value — so turnstone claims it in neither surface
-      and leaves the foreign name entirely to the host.
-
-    Single-pass: a value containing a placeholder token (e.g.
-    ``$0='$ARGUMENTS'``) does not get re-expanded.  Matches the
-    spec's "Substitution runs once over the original file" rule.
-
-    Spec rule: when *arguments_str* is non-empty and the body has
-    no bare ``$ARGUMENTS`` placeholder, the full string is appended
-    at the end as ``ARGUMENTS: ...`` so the model still sees what
-    the user typed.  Indexed forms (``$ARGUMENTS[N]``) don't count
-    as the bare placeholder for this purpose.
-
-    Unresolvable placeholders (e.g. ``$unknown`` when ``unknown``
-    isn't in *arg_names*, or ``${CLAUDE_FOO}`` when ``CLAUDE_FOO``
-    isn't a known env key) are left as literals — matches the
-    forgiving behaviour of :func:`_render_template`.
-    """
-    try:
-        positional = shlex.split(arguments_str) if arguments_str else []
-    except ValueError:
-        # Unbalanced quotes — fall back to whitespace split so a
-        # typo in user-supplied args doesn't make the entire
-        # substitution a no-op (and silently leave ``$ARGUMENTS``
-        # placeholders in the prompt).
-        positional = arguments_str.split() if arguments_str else []
-
-    name_to_idx = {name: i for i, name in enumerate(arg_names)}
-    # ``TURNSTONE_*`` canonical + ``CLAUDE_*`` back-compat alias, same value.
-    env = {
-        "TURNSTONE_SESSION_ID": ws_id,
-        "CLAUDE_SESSION_ID": ws_id,
-        "TURNSTONE_EFFORT": effort,
-        "CLAUDE_EFFORT": effort,
-    }
-    if skill_dir:
-        # TURNSTONE_SKILL_DIR only — NO CLAUDE_SKILL_DIR alias.  That name is
-        # the host's in bash (see _skill_resource_env), so turnstone claims it
-        # in neither surface to avoid a prompt-vs-bash divergence.
-        env["TURNSTONE_SKILL_DIR"] = skill_dir
-
-    def _at(idx_str: str) -> str:
-        idx = int(idx_str)  # regex guarantees digits
-        return positional[idx] if 0 <= idx < len(positional) else ""
-
-    def _replace(m: re.Match[str]) -> str:
-        if m.group("env") is not None:
-            return env.get(m.group("env"), m.group(0))
-        if not substitute_args:
-            # Capability contexts never receive invocation args, so a literal
-            # $ARGUMENTS/$N/$name is prose or shell text — leave it untouched
-            # rather than blanking it.  Only the env vars above resolve.
-            return m.group(0)
-        if m.group("idx_bracket") is not None:
-            return _at(m.group("idx_bracket"))
-        if m.group("idx_short") is not None:
-            return _at(m.group("idx_short"))
-        if m.group("named") is not None:
-            name = m.group("named")
-            idx = name_to_idx.get(name)
-            if idx is None:
-                return m.group(0)
-            return positional[idx] if idx < len(positional) else ""
-        # Match is the bare $ARGUMENTS literal (no named groups).
-        return arguments_str or ""
-
-    rendered = _SPEC_PLACEHOLDER_RE.sub(_replace, content)
-
-    # The spec's append-ARGUMENTS-at-end rule only applies when args are being
-    # substituted at all — capability contexts (substitute_args=False) ignore
-    # invocation args entirely, so they must not append them either.  The
-    # literal-$ARGUMENTS scan is only consumed on that path, so defer it behind
-    # the guard rather than scanning every task_agent capability body.
-    if substitute_args and arguments_str:
-        had_literal_arguments = bool(_SPEC_ARGUMENTS_LITERAL_RE.search(content))
-        if not had_literal_arguments:
-            rendered = f"{rendered}\n\nARGUMENTS: {arguments_str}"
-
-    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -4718,18 +4600,39 @@ class ChatSession:
         # renders only while the row still holds it: a stamped skill edited since gets neither.
         if skill_data and body == skill_data.get("content"):
             self._check_skill_budget(skill_data)
-            if skill_data.get("risk_level") in ("high", "critical"):
-                risk_tier = skill_data["risk_level"]
-                log.warning(
-                    "skill.high_risk_loaded",
-                    skill=self._skill_name,
-                    risk_level=risk_tier,
-                )
-                self.ui.on_info(
-                    f"⚠ Skill '{self._skill_name}' has risk level: {risk_tier}. "
-                    f"Review scan report in admin panel before enabling in production."
-                )
+            self._warn_skill_risk(skill_data)
         self._validate_skill_resources()
+
+    def _warn_skill_risk(self, skill_data: dict[str, Any]) -> None:
+        """Warn the operator when the skill just loaded scans as high or critical risk.
+
+        The tier comes from the row's text, the same reading the model-activation
+        gate uses, not from its stored tier, which an older scanner may have
+        written.  A scan that fails gets a warning of its own.
+        """
+        from turnstone.core.storage._utils import skill_risk_tier
+
+        try:
+            risk_tier = skill_risk_tier(
+                str(skill_data.get("content") or ""), str(skill_data.get("allowed_tools") or "")
+            )
+        except Exception:
+            log.warning("skill.risk_check_failed", skill=self._skill_name, exc_info=True)
+            self.ui.on_info(
+                f"⚠ Skill '{self._skill_name}' could not be risk-checked. "
+                f"Review scan report in admin panel before enabling in production."
+            )
+            return
+        if risk_tier in ("high", "critical"):
+            log.warning(
+                "skill.high_risk_loaded",
+                skill=self._skill_name,
+                risk_level=risk_tier,
+            )
+            self.ui.on_info(
+                f"⚠ Skill '{self._skill_name}' has risk level: {risk_tier}. "
+                f"Review scan report in admin panel before enabling in production."
+            )
 
     @staticmethod
     def _skill_arg_names(skill_data: dict[str, Any]) -> list[str]:
@@ -11400,6 +11303,7 @@ class ChatSession:
         preview: dict[str, Any] | None,
         effect_status: str | None,
         projection_safe: bool,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> int | None:
         """Publish one accepted TOOL row or request exceptional repair.
 
@@ -11426,6 +11330,7 @@ class ChatSession:
                             is_error=is_error,
                             preview=preview,
                             effect_status=effect_status,
+                            **({"attachments": attachments} if attachments else {}),
                         )
                     )
                     if event_id is not None:
@@ -13780,14 +13685,15 @@ class ChatSession:
                     verbatim_pool = _ZERO_BUDGET_VERBATIM_POOL_CHARS
                     admitted: list[tuple[str, Any]] = []
                     for tc_id, output in results:
-                        if isinstance(output, str):
+                        text = _tool_result_text(output)
+                        if text is not None:
                             # ``_tool_error_flags`` is still populated here;
                             # the per-result loop below pops it to build the
                             # persisted turn.
                             truncation, verbatim_pool = self._admit_tool_result(
                                 names.get(tc_id, ""),
                                 tc_id,
-                                output,
+                                text,
                                 budget_tokens=truncation_budget,
                                 maximum_chars=cap,
                                 verbatim_pool=verbatim_pool,
@@ -13798,7 +13704,7 @@ class ChatSession:
                                 truncation_budget
                                 - math.ceil(len(truncation.text) / self._chars_per_token),
                             )
-                            output = truncation.text
+                            output = _replace_tool_result_text(output, truncation.text)
                         admitted.append((tc_id, output))
                     results = admitted
 
@@ -13892,16 +13798,17 @@ class ChatSession:
                 recut: list[tuple[int, str, Any, OutputAssessment | None]] = []
                 for _ri, tc_id, output, assessment in guarded_results:
                     rendered = _admissions.get(tc_id)
+                    text = _tool_result_text(output)
                     if (
                         rendered is not None
-                        and isinstance(output, str)
+                        and text is not None
                         and rendered.truncated
                         and rendered.limit_chars > 0
-                        and len(output) > rendered.limit_chars
-                        and output.count(rendered.marker) == 1
+                        and len(text) > rendered.limit_chars
+                        and text.count(rendered.marker) == 1
                     ):
-                        head, _marker, tail = output.partition(rendered.marker)
-                        output = (
+                        head, _marker, tail = text.partition(rendered.marker)
+                        text = (
                             TextProjectionSource(
                                 head, tail, len(head) + len(tail) + rendered.omitted_chars
                             )
@@ -13911,6 +13818,7 @@ class ChatSession:
                             )
                             .text
                         )
+                        output = _replace_tool_result_text(output, text)
                     recut.append((_ri, tc_id, output, assessment))
                 guarded_results = recut
                 _admissions.clear()
@@ -13954,6 +13862,16 @@ class ChatSession:
                             "tool_call_id": tc_id,
                             "content": tool_content,
                         }
+                        if tool_image_atts:
+                            tool_msg["_attachments_meta"] = [
+                                {
+                                    "attachment_id": att.attachment_id,
+                                    "kind": att.kind,
+                                    "filename": att.filename,
+                                    "mime_type": att.mime_type,
+                                }
+                                for att in tool_image_atts
+                            ]
                         tool_is_error = self._tool_error_flags.pop(tc_id, False)
                         if tool_is_error:
                             tool_msg["is_error"] = True
@@ -13982,18 +13900,14 @@ class ChatSession:
                                 1,
                                 int(text_chars / self._chars_per_token) + image_count * 1000,
                             )
-                            # One scalar is shared by pending /history,
-                            # accepted SSE, and the durable TEXT column. The
-                            # history projector joins multipart text blocks
-                            # with newlines, so use the same delimiter here.
-                            store_text = "\n".join(
-                                p.get("text", "")
-                                for p in output
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            )
                         else:
                             tok_est = max(1, int(len(output) / self._chars_per_token))
-                            store_text = output
+                        # One scalar is shared by pending /history, accepted SSE, and storage.
+                        store_text = (
+                            "\n".join(p.get("text", "") for p in output if p.get("type") == "text")
+                            if isinstance(output, list)
+                            else output
+                        )
                         tool_atts = list(tool_image_atts)
                         if tool_preview is not None:
                             tool_atts.append(tool_preview[1])
@@ -14780,6 +14694,7 @@ class ChatSession:
                 preview=preview,
                 effect_status=effect_status,
                 projection_safe=projection_safe,
+                attachments=message.get("_attachments_meta"),
             )
             message["_event_id"] = event_id_ref[0]
             turn.meta.event_id = event_id_ref[0]
@@ -17468,9 +17383,10 @@ class ChatSession:
                     fa["current_risk"] = it.get("current_risk", "")
                 elif action_val in ("enable", "disable"):
                     # Re-enabling a model-planted high/critical skill is the attack this projection
-                    # must expose: surface the existing skill's stored risk tier, auto_approve and
-                    # (when enabling) completion targets, stashed by ``_prepare_skills_toggle``, so
-                    # the judge weighs WHAT is being re-enabled, not just its name.
+                    # must expose: surface the risk tier of the existing skill's current text, its
+                    # auto_approve and (when enabling) completion targets, stashed by
+                    # ``_prepare_skills_toggle``, so the judge weighs WHAT is being re-enabled, not
+                    # just its name.
                     if it.get("risk_level"):
                         fa["risk_level"] = it.get("risk_level")
                     if it.get("auto_approve"):
@@ -20916,21 +20832,21 @@ class ChatSession:
                         "Use skills(action='find', query='...') to find available names."
                     ),
                 }
-            # Risk gate: high/critical-risk skills are PRINCIPAL-load-only — the
-            # same bar skills(load) / spawn_workstream / spawn_batch enforce via
-            # _high_risk_skill_denied.  task_agent is a model-initiated
+            # Principal-load-only gate — the same bar skills(load) /
+            # spawn_workstream / spawn_batch enforce via
+            # _principal_load_only_denial.  task_agent is a model-initiated
             # activation surface too, so a sub-agent must not route around it.
             # Enforced on the row we ALREADY fetched (no re-query, no drift
             # between get_skill_by_name and get_prompt_template_by_name).
-            risk_tier = skill_data.get("risk_level", "")
-            if risk_tier in ("high", "critical"):
+            denial = self._principal_load_only_check(skill_arg, skill_data)
+            if denial:
                 return {
                     "call_id": call_id,
                     "func_name": "task_agent",
                     "header": f"✗ task_agent: skill '{skill_arg}' is principal-load-only",
                     "preview": "",
                     "needs_approval": False,
-                    "error": f"Error: {self._principal_load_only_msg(skill_arg, risk_tier)}",
+                    "error": f"Error: {denial}",
                 }
             # ``get_skill_by_name`` returns the full prompt_templates row
             # (~30 columns including ``scan_report``, ``installed_by``,
@@ -21005,8 +20921,8 @@ class ChatSession:
         preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
         header = "\u2699 task_agent (autonomous agent"
         if skill_data:
-            # High/critical skills were denied above (principal-load-only), so a
-            # skill that reaches here is safe-tier — just name it in the header.
+            # Principal-load-only skills were denied above, so a skill that
+            # reaches here may be model-activated — just name it in the header.
             header += f", skill: {skill_data['name']}"
         if persona_arg:
             header += f", persona: {persona_arg}"
@@ -22131,9 +22047,9 @@ class ChatSession:
             if persona_err:
                 return self._coord_tool_error(call_id, "spawn_workstream", persona_err)
         if skill:
-            # Same principal-load-only gate as skills(load): a high/critical-risk
-            # skill must not be model-activated by handing it to a child.
-            skill_err = self._high_risk_skill_denied(skill)
+            # Same principal-load-only gate as skills(load): such a skill must
+            # not be model-activated by handing it to a child.
+            skill_err = self._principal_load_only_denial(skill)
             if skill_err:
                 return self._coord_tool_error(call_id, "spawn_workstream", skill_err)
         if initial_message:
@@ -22151,7 +22067,7 @@ class ChatSession:
         if target_node:
             header_bits.append(f"node={target_node}")
         header = " ".join(header_bits)
-        return {
+        item: dict[str, Any] = {
             "call_id": call_id,
             "func_name": "spawn_workstream",
             "header": header,
@@ -22167,6 +22083,9 @@ class ChatSession:
             "project": project,
             "persona": persona,
         }
+        if skill:
+            item["_batch_policy"] = _batch_policy("skills", "read", _SKILLS_MIXED_BATCH_ERROR)
+        return item
 
     def _validate_child_persona(self, persona: str) -> tuple[str, str]:
         """Prep-time gate for a spawn's ``persona`` arg.
@@ -22232,10 +22151,10 @@ class ChatSession:
     def _cancel_child_created_after_stop(self, ws_id: str) -> bool:
         """Cancel a child whose create returned after its tool call was stopped.
 
-        The Stop's cascade cancels only the children the console had registered from their
-        creation events when it landed, and this create's reply came after the Stop, so the
-        child is cancelled here; a second cancel of one the cascade reached is harmless.
-        Best effort: returns whether the cancel went through, for the caller's audit.
+        The Stop's cascade snapshots registered and stored children, but a create still in
+        flight can publish after that snapshot. Cancel its child here when the reply arrives;
+        a second cancel of one the cascade reached is harmless. Best effort: returns whether
+        the cancel went through, for the caller's audit.
         """
         try:
             return not self._coord_client.cancel(ws_id).get("error")
@@ -22245,6 +22164,15 @@ class ChatSession:
 
     def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
+        if item["skill"]:
+            # The principal-load-only gate ran on the skill as it was when the
+            # call was prepared; check it again as it is now, after the approval
+            # wait, just before the child is created with it.
+            denial = self._principal_load_only_denial(item["skill"])
+            if denial:
+                msg = f"Error: {denial}"
+                self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
+                return call_id, msg
         # Voice sessions spend one budget slot per started child.  The reserve
         # (not a peek) is what holds when sibling calls in one assistant
         # message run concurrently; a slot whose child never starts goes back
@@ -22416,11 +22344,11 @@ class ChatSession:
                     persona = canonical
                     spec["persona"] = canonical
             if skill and not spec.get("_error"):
-                # Same principal-load-only risk gate as spawn_workstream,
+                # Same principal-load-only gate as spawn_workstream,
                 # surfaced per-row (partial-success) rather than failing the
                 # whole batch.  Memoized: a fan-out usually repeats one skill.
                 if skill not in skill_verdicts:
-                    skill_verdicts[skill] = self._high_risk_skill_denied(skill)
+                    skill_verdicts[skill] = self._principal_load_only_denial(skill)
                 if skill_verdicts[skill]:
                     spec["_error"] = skill_verdicts[skill]
             normalised.append(spec)
@@ -22464,7 +22392,7 @@ class ChatSession:
 
         header = f"\u2699 spawn_batch: {len(normalised)} children"
         preview_body = f"{DIM}{chr(10).join(preview_rows)}{RESET}"
-        return {
+        item: dict[str, Any] = {
             "call_id": call_id,
             "func_name": "spawn_batch",
             "header": header,
@@ -22474,6 +22402,9 @@ class ChatSession:
             "execute": self._exec_spawn_batch,
             "children": normalised,
         }
+        if any(spec.get("skill") for spec in normalised):
+            item["_batch_policy"] = _batch_policy("skills", "read", _SKILLS_MIXED_BATCH_ERROR)
+        return item
 
     def _exec_spawn_batch(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
@@ -22519,6 +22450,11 @@ class ChatSession:
             # list_workstreams.
             if _batch_stopped():
                 return None, "not spawned: cancelled"
+            if spec["skill"]:
+                # Checked again as the skill is now, as spawn_workstream does.
+                denial = self._principal_load_only_denial(spec["skill"])
+                if denial:
+                    return None, denial
             try:
                 result = self._coord_client.spawn(
                     initial_message=spec["initial_message"],
@@ -23304,10 +23240,14 @@ class ChatSession:
             if deny is not None:
                 return deny
             if action == "create":
-                return self._prepare_skills_create(call_id, args)
-            if action == "update":
-                return self._prepare_skills_update(call_id, args)
-            return self._prepare_skills_toggle(call_id, args, enable=(action == "enable"))
+                item = self._prepare_skills_create(call_id, args)
+            elif action == "update":
+                item = self._prepare_skills_update(call_id, args)
+            else:
+                item = self._prepare_skills_toggle(call_id, args, enable=(action == "enable"))
+            # Every write joins the group, so no batch both changes a skill and activates one.
+            item["_batch_policy"] = _batch_policy("skills", "write", _SKILLS_MIXED_BATCH_ERROR)
+            return item
         return self._coord_tool_error(
             call_id,
             "skills",
@@ -23588,36 +23528,73 @@ class ChatSession:
     # -- load -------------------------------------------------------------------
 
     @staticmethod
-    def _principal_load_only_msg(name: str, tier: str) -> str:
+    def _principal_load_only_msg(name: str, reason: str) -> str:
         """The canonical denial wording for a principal-load-only skill.
 
-        Single-sourced so every activation surface (skills(load), spawn_*,
-        task_agent) speaks with one voice — the model keys its recovery path
-        off this text, so it must not drift between callers.
+        *reason* completes "skill '<name>' ..." with why.  Single-sourced so
+        every activation surface (skills(load), spawn_*, task_agent) speaks with
+        one voice — the model keys its recovery path off this text, so it must
+        not drift between callers.
         """
         return (
-            f"skill '{name}' has risk tier '{tier}' and can only be "
+            f"skill '{name}' {reason} and can only be "
             f"activated by the operator. Ask the user to run /skill {name} — the "
             f"model cannot load or assign it."
         )
 
-    def _high_risk_skill_denied(self, name: str) -> str:
-        """Return a denial message when *name* is a high/critical-risk skill the
-        model may not activate, else ``""``.
+    def _principal_load_only_check(self, name: str, row: dict[str, Any]) -> str:
+        """Return a denial message when the model may not activate skill *row*, else ``""``.
 
-        Design §5.5 / HYPOTHESIS Principle 7: such a skill is PRINCIPAL-load-only
-        — the model must not activate it through any tools path (an injection-
-        steerable lane that would widen authority behind a rubber-stampable
-        approval; the scanner escalates risk precisely for the auto_approve +
-        allowed_tools authority the create path warns about).  The operator
-        loads it explicitly with ``/skill`` (handle_command / cli --skill call
-        set_skill directly and bypass this gate).  This is the shared check for
-        the model-initiated activation surfaces that resolve the row by name —
-        skills(load) AND spawn_workstream / spawn_batch(skill=…) — so the gate
-        cannot be routed around by delegating activation to a spawned child.
-        ``task_agent`` enforces the same bar inline on the row it already
-        fetched (see ``_prepare_task``).  Narrowing-only: it can DENY, never
-        widen, so it is safe by construction.
+        Design §5.5 / HYPOTHESIS Principle 7: a skill is PRINCIPAL-load-only —
+        the model must not activate it through any tools path, an injection-
+        steerable lane behind a rubber-stampable approval — when either holds:
+
+        - it carries tool authority: ``auto_approve``, or an ``allowed_tools``
+          list, which a workstream created with the skill is granted;
+        - its current text scans as high or critical risk
+          (:func:`~turnstone.core.storage._utils.skill_risk_tier`), so a tier
+          stored by an older scanner, or by none, never decides.
+
+        Both come from the row itself.  A scan that fails denies: a risk gate
+        that cannot compute the risk must not wave the skill through.
+        Narrowing-only: it can DENY, never widen, so it is safe by construction.
+        """
+        from turnstone.core.storage._utils import skill_risk_tier
+
+        if row.get("auto_approve"):
+            return self._principal_load_only_msg(
+                name, "auto-approves every tool call (auto_approve)"
+            )
+        allowed_tools = str(row.get("allowed_tools") or "")
+        # The same reading workstream create applies: a value it can't read grants nothing.
+        if read_allowed_tools(allowed_tools):
+            return self._principal_load_only_msg(
+                name, "auto-approves the tools it lists (allowed_tools)"
+            )
+        try:
+            tier = skill_risk_tier(str(row.get("content") or ""), allowed_tools)
+        except Exception:
+            log.warning("skill.risk_gate_scan_failed", skill=name, exc_info=True)
+            return (
+                f"skill '{name}' could not be risk-checked and was not activated. "
+                f"Retry, or ask the operator to run /skill {name}."
+            )
+        if tier in ("high", "critical"):
+            return self._principal_load_only_msg(name, f"has risk tier '{tier}'")
+        return ""
+
+    def _principal_load_only_denial(self, name: str) -> str:
+        """Look up skill *name* and return :meth:`_principal_load_only_check`'s verdict.
+
+        The shared check for the model-initiated activation surfaces that
+        resolve the row by name — skills(load) AND spawn_workstream /
+        spawn_batch(skill=…) — so the gate cannot be routed around by
+        delegating activation to a spawned child.  ``task_agent`` applies the
+        same check to the row it already fetched (see ``_prepare_task``).  The
+        operator loads such a skill explicitly with ``/skill`` (handle_command /
+        cli --skill call set_skill directly and bypass this gate).  A missing or
+        disabled row gives no denial here: the load's exec and the node's create
+        refuse it as they apply it, so the model hears "not found or disabled".
         """
         storage = get_storage()
         row = None
@@ -23637,30 +23614,27 @@ class ChatSession:
                 f"skill '{name}' could not be risk-checked (storage unavailable) "
                 f"and was not activated. Retry, or ask the operator to run /skill {name}."
             )
-        if row and row.get("risk_level") in ("high", "critical"):
-            return self._principal_load_only_msg(name, row["risk_level"])
-        return ""
+        if not row or not row.get("enabled", True):
+            return ""
+        return self._principal_load_only_check(name, row)
 
     def _prepare_skills_load(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         # Both kinds can ``load`` — interactive sessions replace their own
         # persona, coordinator sessions do the same for their orchestrator.
-        # Parity with the admin / HTTP create path that already accepts a
-        # ``skill`` body field on coord workstreams: anything an operator
-        # can do at create time, the model can do at runtime through this
-        # same action.  Any skill in the catalog is loadable regardless of
-        # the row's ``kind`` marker — ``kind`` is authored audience
-        # metadata, not an enforcement boundary.  Real access control
-        # remains the ``allowed_tools`` + ``auto_approve`` pair, which
-        # applies identically across kinds.  Use ``spawn_workstream(skill=...)``
-        # for assigning to children; ``load`` activates on the *current*
-        # session.
+        # Any skill in the catalog is loadable regardless of the row's
+        # ``kind`` marker — ``kind`` is authored audience metadata, not an
+        # enforcement boundary.  The model may not load a principal-load-only
+        # skill (tool authority, or text that scans high or critical; see
+        # _principal_load_only_check), which the operator loads with /skill.
+        # Use ``spawn_workstream(skill=...)`` for assigning to children;
+        # ``load`` activates on the *current* session.
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", "load: 'name' is required")
-        # Risk gate: a high/critical-risk skill is principal-load-only.  Shared
-        # with the spawn paths (see _high_risk_skill_denied) so delegating
-        # activation to a child cannot route around it.
-        block = self._high_risk_skill_denied(name)
+        # Principal-load-only gate, shared with the spawn paths (see
+        # _principal_load_only_denial) so delegating activation to a child
+        # cannot route around it.
+        block = self._principal_load_only_denial(name)
         if block:
             return self._coord_tool_error(call_id, "skills", f"load: {block}")
         # SKILL.md spec ``$ARGUMENTS`` payload — optional.  Mirror
@@ -23690,6 +23664,7 @@ class ChatSession:
             "action": "load",
             "name": name,
             "arguments": arguments,
+            "_batch_policy": _batch_policy("skills", "read", _SKILLS_MIXED_BATCH_ERROR),
         }
 
     def _exec_skills_load(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -23713,6 +23688,13 @@ class ChatSession:
             )
             self._report_tool_result(call_id, "skills", msg, is_error=True)
             return call_id, msg
+        # The principal-load-only gate ran on the row as it was when the call
+        # was prepared; this is the row as it is now, after the approval wait.
+        denial = self._principal_load_only_check(name, skill_data)
+        if denial:
+            msg = f"Error: load: {denial}"
+            self._report_tool_result(call_id, "skills", msg, is_error=True)
+            return call_id, msg
         if (
             self._skill_name == name
             and self._skill_arguments == arguments
@@ -23726,8 +23708,13 @@ class ChatSession:
             self._report_tool_result(call_id, "skills", msg)
             return call_id, msg
         self.set_skill(name, arguments=arguments)
+        from turnstone.core.storage._utils import skill_risk_tier
+
         desc = skill_data.get("description", "")
-        risk = skill_data.get("risk_level", "")
+        # The tier the gate just read, not the row's stored one.
+        risk = skill_risk_tier(
+            str(skill_data.get("content") or ""), str(skill_data.get("allowed_tools") or "")
+        )
         parts = [f"Loaded skill '{name}'"]
         if desc:
             parts.append(f"Description: {desc}")
@@ -24018,12 +24005,12 @@ class ChatSession:
                     ),
                 )
             updates = filtered
-        current_risk = str(existing.get("risk_level") or "")
-        # Skip the scanner when no scan-relevant fields change.  Storage
-        # re-scans authoritatively on write; the prepare-time scan is
-        # purely to surface the projected tier on the approval card.
-        # A metadata-only update (kind/category/tags/description) can
-        # reuse current_risk without spending ~25 regex passes.
+        current_risk = self._current_skill_risk(existing)
+        # Scan the final state only when a scan-relevant field changes.
+        # Storage re-scans authoritatively on write; the prepare-time scan
+        # is purely to surface the projected tier on the approval card.  A
+        # metadata-only update (kind/category/tags/description) keeps the
+        # current tier.
         if "content" in updates or "allowed_tools" in updates:
             final_content = updates.get("content", existing.get("content", ""))
             final_at = updates.get("allowed_tools", existing.get("allowed_tools", "[]"))
@@ -24210,7 +24197,7 @@ class ChatSession:
         # so the operator sees *what* they're enabling before clicking
         # approve — a model-planted critical-tier skill should never be
         # re-enabled by an operator who saw only the name on the card.
-        existing_risk = str(existing.get("risk_level") or "")
+        existing_risk = self._current_skill_risk(existing)
         # Read as workstream create reads it, so the card shows what re-enabling grants.
         existing_allowed = read_allowed_tools(existing.get("allowed_tools"))
         # Re-enabling lets new workstreams send their final output to these targets, so the card
@@ -24322,8 +24309,9 @@ class ChatSession:
 
         ``allowed_tools`` may arrive as list (from args) or JSON string
         (from existing row) - normalize to JSON string for the scanner.
-        Scanner errors fold to empty tier so an approval card never
-        fails to render.
+        Scanner errors fold to ``"unknown"``, as :meth:`_current_skill_risk`'s
+        do, so an approval card never fails to render and the card and the
+        judge see that no tier could be read.
         """
         from turnstone.core.storage._utils import scan_skill_content
 
@@ -24337,8 +24325,27 @@ class ChatSession:
             tier, _, _ = scan_skill_content(content, at_str)
         except Exception:
             log.debug("skills.scan_proposed_failed", exc_info=True)
-            return ""
-        return tier
+            return "unknown"
+        # scan_skill_content gives an empty tier for a scan that failed.
+        return tier or "unknown"
+
+    def _current_skill_risk(self, row: dict[str, Any]) -> str:
+        """The risk tier of stored skill *row*'s current text, for an approval card and the judge.
+
+        Read as the activation gate reads it (:func:`skill_risk_tier`), not
+        from the tier stored in the row, which an older scanner may have
+        written.  A scan that fails gives ``"unknown"``, so the card and the
+        judge see that no tier could be read rather than none.
+        """
+        from turnstone.core.storage._utils import skill_risk_tier
+
+        try:
+            return skill_risk_tier(
+                str(row.get("content") or ""), str(row.get("allowed_tools") or "")
+            )
+        except Exception:
+            log.warning("skill.risk_check_failed", skill=row.get("name", ""), exc_info=True)
+            return "unknown"
 
     def _audit_skill_action(
         self,
@@ -25449,7 +25456,7 @@ class ChatSession:
             "mcp_args": args,
         }
 
-    def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str]:
+    def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str | list[dict[str, Any]]]:
         """Execute an MCP tool call via the MCPClientManager."""
         self._check_cancelled()
         call_id: str = item["call_id"]
@@ -25460,13 +25467,15 @@ class ChatSession:
         mcp_error = False
         mcp_status: EffectStatus | None = None
         try:
-            output = self._mcp_client.call_tool_sync(
+            result = self._mcp_client.call_tool_sync(
                 func_name,
                 args,
                 user_id=str(item["_principal_id"] or "").strip() or None,
                 timeout=self.tool_timeout,
                 is_interactive_for_consent=self._is_interactive_for_consent,
             )
+            output = _decode_tool_result(result)
+            mcp_error = result.is_error
         except TimeoutError:
             # An MCP tool is an opaque action — the server may have run it to
             # completion before we stopped waiting, so the outcome is unobserved.
@@ -25492,10 +25501,18 @@ class ChatSession:
             mcp_error = True
             self.ui.on_error(output)
 
+        # Receipts are text-only; pixels must reach the ordinary multipart
+        # fold intact, never the string truncator or the SSE event ring.
+        receipt = output
+        if isinstance(output, list):
+            receipt = "\n".join(
+                p.get("text", "") if p.get("type") == "text" else "[image attached]" for p in output
+            )
+        assert isinstance(receipt, str)
         self._report_tool_result(
             call_id,
             func_name,
-            self._truncate_output(output),
+            self._truncate_output(receipt),
             is_error=mcp_error,
             status=mcp_status,
         )
@@ -27589,13 +27606,10 @@ class ChatSession:
                 # Agents operate autonomously; they can refine their queries
                 # if the clip loses important detail.
                 original_chars: int | None = None
-                if isinstance(output, str):
-                    original_chars = (
-                        output.source.original_chars
-                        if isinstance(output, ProjectedText)
-                        else len(output)
-                    )
-                    if isinstance(output, ProjectedText) or len(output) > _AGENT_GUARD_WINDOW_CHARS:
+                text = _tool_result_text(output)
+                if text is not None:
+                    original_chars = source_chars(text)
+                    if isinstance(text, ProjectedText) or len(text) > _AGENT_GUARD_WINDOW_CHARS:
                         # A capture arrives as a rendering with its source
                         # attached: render the window from that source here,
                         # in the head mode the clip below uses, so the agent
@@ -27604,12 +27618,16 @@ class ChatSession:
                         # marker from the start: should redaction shrink it
                         # below the clip, the result still reads as cut, with
                         # its true size.
-                        output = _clip_agent_text(
+                        output = _replace_tool_result_text(
                             output,
-                            _AGENT_GUARD_WINDOW_CHARS,
-                            original_chars=original_chars,
-                            tool_name=tool_name,
+                            _clip_agent_text(
+                                text,
+                                _AGENT_GUARD_WINDOW_CHARS,
+                                original_chars=original_chars,
+                                tool_name=tool_name,
+                            ),
                         )
+                del text
 
                 # Output guard on the window.  A tool's own text inside a list
                 # result is guarded part by part, as in the main loop.
@@ -27641,13 +27659,18 @@ class ChatSession:
                             principal_id=agent_principal,
                             cancel_ref=cancel_scope.cancel_ref,
                         )
-                if isinstance(output, str) and len(output) > _AGENT_TOOL_OUTPUT_CAP:
-                    output = _clip_agent_text(
+                text = _tool_result_text(output)
+                if text is not None and len(text) > _AGENT_TOOL_OUTPUT_CAP:
+                    output = _replace_tool_result_text(
                         output,
-                        _AGENT_TOOL_OUTPUT_CAP,
-                        original_chars=original_chars,
-                        tool_name=tool_name,
+                        _clip_agent_text(
+                            text,
+                            _AGENT_TOOL_OUTPUT_CAP,
+                            original_chars=original_chars,
+                            tool_name=tool_name,
+                        ),
                     )
+                del text
                 if assessment is not None:
                     # The guard read past the clip, so a finding on a cut
                     # result may concern text the agent never receives; the
