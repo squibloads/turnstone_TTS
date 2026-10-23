@@ -73,7 +73,11 @@ from turnstone.core.avatar_routes import (
     upload_own_avatar_picture,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
-from turnstone.core.http_failures import REQUEST_FAILURES
+from turnstone.core.http_failures import (
+    REQUEST_FAILURES,
+    UPSTREAM_NO_REPLY_CODE,
+    may_have_reached_server,
+)
 from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
 from turnstone.core.mcp_oauth import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
@@ -507,7 +511,7 @@ async def cluster_nodes(request: Request) -> JSONResponse:
                 try:
                     _mf_json.loads(mv)
                     encoded[mk] = mv
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, RecursionError):
                     encoded[mk] = _mf_json.dumps(mv)
             try:
                 node_ids = storage.filter_nodes_by_metadata(encoded)
@@ -816,7 +820,7 @@ class _NodeDashboardCache:
                 if 200 <= status < 300:
                     try:
                         raw = resp.json()
-                    except (ValueError, json.JSONDecodeError):
+                    except (ValueError, json.JSONDecodeError, RecursionError):
                         raw = None
                     if isinstance(raw, dict):
                         payload = raw
@@ -968,7 +972,7 @@ async def _fetch_live_block(
             return None
         try:
             raw = resp.json()
-        except (ValueError, *REQUEST_FAILURES):
+        except (ValueError, *REQUEST_FAILURES, RecursionError):
             return None
         payload = raw if isinstance(raw, dict) else None
     if payload is None:
@@ -1976,6 +1980,9 @@ async def create_workstream(request: Request) -> JSONResponse:
             resp = await client.post(node_url, json=ws_body, headers=headers)
     except REQUEST_FAILURES as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
+        # A create that outlasted the timeout may have made the workstream, which the mask hides.
+        if may_have_reached_server(exc):
+            return _upstream_failure(exc, f"node {node_id}")
         return _dispatch_failed(node_id)
 
     # Preserve the coded project-required and wrong-executor refusals. Mask
@@ -2097,6 +2104,24 @@ def _record_route(
     if cm is not None:
         cm.record_route(method, status, time.monotonic() - t0)
     return resp
+
+
+def _upstream_failure(exc: Exception, node: str, *, unreachable: str = "") -> JSONResponse:
+    """The 502 for a request forwarded to *node*, a phrase like ``upstream node n1``, that failed in
+    transport. It says unreachable (*unreachable*, if given) only when the request never reached the
+    node: after that the node may have acted on it, a create that outlasted the proxy's timeout
+    say, so the reply says the request may have been processed and carries
+    ``UPSTREAM_NO_REPLY_CODE`` for the caller to check before retrying.
+    """
+    if not may_have_reached_server(exc):
+        return JSONResponse({"error": unreachable or f"{node} unreachable"}, status_code=502)
+    return JSONResponse(
+        {
+            "error": f"no reply was read from {node}, so the request may have been processed",
+            "code": UPSTREAM_NO_REPLY_CODE,
+        },
+        status_code=502,
+    )
 
 
 async def _refresh_unready_router(
@@ -2286,16 +2311,9 @@ async def route_create(request: Request) -> Response:
                 content=raw_body,
                 headers=upstream_headers,
             )
-        except REQUEST_FAILURES:
+        except REQUEST_FAILURES as exc:
             return _record_route(
-                request,
-                "create",
-                502,
-                t0,
-                JSONResponse(
-                    {"error": f"upstream node {ref.node_id} unreachable"},
-                    status_code=502,
-                ),
+                request, "create", 502, t0, _upstream_failure(exc, f"upstream node {ref.node_id}")
             )
     else:
         parsed_body = (
@@ -2424,16 +2442,13 @@ async def route_create(request: Request) -> Response:
                 resp = await client.post(
                     f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
                 )
-            except REQUEST_FAILURES:
+            except REQUEST_FAILURES as exc:
                 return _record_route(
                     request,
                     "create",
                     502,
                     t0,
-                    JSONResponse(
-                        {"error": f"upstream node {ref.node_id} unreachable"},
-                        status_code=502,
-                    ),
+                    _upstream_failure(exc, f"upstream node {ref.node_id}"),
                 )
 
             # The console chooses the destination id before routing, so the
@@ -2694,16 +2709,9 @@ async def route_attachment_proxy(request: Request) -> Response:
                 content=body,
                 headers=upstream_headers,
             )
-        except REQUEST_FAILURES:
+        except REQUEST_FAILURES as exc:
             return _record_route(
-                request,
-                method,
-                502,
-                t0,
-                JSONResponse(
-                    {"error": f"upstream node {ref.node_id} unreachable"},
-                    status_code=502,
-                ),
+                request, method, 502, t0, _upstream_failure(exc, f"upstream node {ref.node_id}")
             )
     else:
         try:
@@ -2846,16 +2854,9 @@ async def _resend_if_route_moved(
         return ref, resp
     try:
         return new_ref, await send(new_ref)
-    except REQUEST_FAILURES:
+    except REQUEST_FAILURES as exc:
         return _record_route(
-            request,
-            verb,
-            502,
-            t0,
-            JSONResponse(
-                {"error": f"retry node {new_ref.node_id} unreachable"},
-                status_code=502,
-            ),
+            request, verb, 502, t0, _upstream_failure(exc, f"retry node {new_ref.node_id}")
         )
 
 
@@ -3100,16 +3101,9 @@ async def route_proxy(request: Request) -> Response:
         resp = await client.request(
             http_method, f"{ref.url}{upstream_path}", json=body, headers=headers
         )
-    except REQUEST_FAILURES:
+    except REQUEST_FAILURES as exc:
         return _record_route(
-            request,
-            verb,
-            502,
-            t0,
-            JSONResponse(
-                {"error": f"upstream node {ref.node_id} unreachable"},
-                status_code=502,
-            ),
+            request, verb, 502, t0, _upstream_failure(exc, f"upstream node {ref.node_id}")
         )
 
     # Transparent retry on 404 (at most once): the selected node doesn't
@@ -3241,16 +3235,13 @@ async def route_workstream_delete(request: Request) -> Response:
     upstream_url = f"{ref.url}/v1/api/workstreams/{ws_id}/delete"
     try:
         resp = await client.post(upstream_url, json=body, headers=headers)
-    except REQUEST_FAILURES:
+    except REQUEST_FAILURES as exc:
         return _record_route(
             request,
             "delete",
             502,
             t0,
-            JSONResponse(
-                {"error": f"upstream node {ref.node_id} unreachable"},
-                status_code=502,
-            ),
+            _upstream_failure(exc, f"upstream node {ref.node_id}"),
         )
 
     # Only the node owning the workstream's lease may delete it (after its
@@ -3867,7 +3858,7 @@ async def _proxy_post(
         )
     except REQUEST_FAILURES as exc:
         log.debug("Proxy %s error for %r: %s", request.method, f"{api_prefix}/{path}", exc)
-        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+        return _upstream_failure(exc, "the node", unreachable="Node unreachable")
     # A busy node's 429 names its wait in Retry-After, and the browser's
     # authFetch waits that long before retrying.  Only delta-seconds pass.
     retry_after = resp.headers.get("retry-after", "")
@@ -6638,9 +6629,15 @@ async def admin_create_user(request: Request) -> JSONResponse:
     if isinstance(body, JSONResponse):
         return body
 
-    username = body.get("username", "").strip()
-    display_name = body.get("display_name", "").strip()
+    username = body.get("username", "")
+    display_name = body.get("display_name", "")
     password = body.get("password", "")
+    if not all(isinstance(v, str) for v in (username, display_name, password)):
+        return JSONResponse(
+            {"error": "username, display_name and password must be strings"}, status_code=400
+        )
+    username = username.strip()
+    display_name = display_name.strip()
 
     from turnstone.core.auth import is_valid_username
 
@@ -6799,14 +6796,15 @@ async def admin_create_token(request: Request) -> JSONResponse:
     if storage.get_user(user_id) is None:
         return JSONResponse({"error": "User not found"}, status_code=404)
 
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        body = {}
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
 
     name = body.get("name", "")
     scopes = body.get("scopes", "read,write,approve")
     expires_days = body.get("expires_days")
+    if not isinstance(name, str) or not isinstance(scopes, str):
+        return JSONResponse({"error": "name and scopes must be strings"}, status_code=400)
 
     # Validate scopes — ``service`` is NOT user-assignable (it bypasses
     # private-project tenancy; only ServiceTokenManager / the JWT secret
@@ -6821,9 +6819,18 @@ async def admin_create_token(request: Request) -> JSONResponse:
     if expires_days is not None:
         from datetime import UTC, datetime, timedelta
 
-        expires = (datetime.now(UTC) + timedelta(days=int(expires_days))).strftime(
-            "%Y-%m-%dT%H:%M:%S"
+        # Not bool, which is an int: false made a token that had already expired.
+        bad_days = JSONResponse(
+            {"error": "expires_days must be a whole number of days, at least 1"}, status_code=400
         )
+        if isinstance(expires_days, bool) or not isinstance(expires_days, int) or expires_days < 1:
+            return bad_days
+        try:
+            expires = (datetime.now(UTC) + timedelta(days=expires_days)).strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            )
+        except OverflowError:
+            return bad_days
 
     raw = generate_token()
     tid = uuid.uuid4().hex
@@ -7225,7 +7232,7 @@ def _normalize_task_dict(task: dict[str, Any]) -> dict[str, Any]:
     raw_nt = task.get("notify_targets", "[]")
     try:
         task["notify_targets"] = _json.loads(raw_nt) if isinstance(raw_nt, str) else raw_nt
-    except (_json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         task["notify_targets"] = []
     return task
 
@@ -7872,8 +7879,8 @@ async def admin_cancel_watch(request: Request) -> Response:
             content=b"{}",
             headers=headers,
         )
-    except REQUEST_FAILURES:
-        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+    except REQUEST_FAILURES as exc:
+        return _upstream_failure(exc, "the node", unreachable="Node unreachable")
     return Response(
         content=resp.content,
         status_code=resp.status_code,
@@ -8491,7 +8498,7 @@ async def admin_update_org(request: Request) -> JSONResponse:
         settings_str = str(body["settings"]).strip()
         try:
             json.loads(settings_str)
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return JSONResponse({"error": "settings must be valid JSON"}, status_code=400)
         updates["settings"] = settings_str
 
@@ -8746,7 +8753,7 @@ def _canonicalize_skill_string_list(raw: Any) -> str:
     if candidate.startswith("["):
         try:
             parsed = _json.loads(candidate)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return "[]"
         if not isinstance(parsed, list):
             return "[]"
@@ -8787,7 +8794,7 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
     import json as _json
 
     tags: list[str] = []
-    with contextlib.suppress(ValueError, TypeError):
+    with contextlib.suppress(ValueError, TypeError, RecursionError):
         tags = _json.loads(r.get("tags", "[]"))
     return {
         "template_id": r.get("template_id", ""),
@@ -8917,7 +8924,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     variables = str(body.get("variables", "[]")).strip()
     try:
         _json.loads(variables)
-    except (_json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
     org_id = str(body.get("org_id", "")).strip()[:64]
     author = str(body.get("author", "")).strip()[:256]
@@ -8932,7 +8939,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         tags_str = str(raw_tags).strip()
         try:
             _json.loads(tags_str)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             tags_str = "[]"
 
     # SKILL.md spec ``paths:`` — glob patterns gating autoload.
@@ -9081,7 +9088,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         var_str = str(body["variables"]).strip()
         try:
             _json.loads(var_str)
-        except (_json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
         updates["variables"] = var_str
     if "author" in body:
@@ -9100,7 +9107,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
             tag_str = str(raw_tags).strip()
             try:
                 _json.loads(tag_str)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 tag_str = "[]"
             updates["tags"] = tag_str
     if "paths" in body and body["paths"] is not None:
@@ -11187,7 +11194,7 @@ def _json_object(raw: Any) -> dict[str, Any]:
         return raw
     try:
         value = json.loads(raw or "{}")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -11592,7 +11599,7 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
     if s.get("env") and s["env"] != "{}":
         try:
             env_dict = json.loads(s["env"]) if isinstance(s["env"], str) else s["env"]
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             env_dict = {}
         # A stored value that is not an object (hand-edited rows) shows as empty.
         s["env"] = json.dumps({k: "***" for k in env_dict} if isinstance(env_dict, dict) else {})
@@ -11601,7 +11608,7 @@ def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str,
 
         try:
             hdr_dict = json.loads(s["headers"]) if isinstance(s["headers"], str) else s["headers"]
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             hdr_dict = {}
         # A secret:// reference is not itself a secret; it stays visible. A
         # stored value that is not an object (hand-edited rows) shows as empty.
@@ -13470,7 +13477,9 @@ _SCOPES_TOO_LONG_ERROR = f"obo_scopes exceeds {MODEL_AUTH_TEXT_MAX_LEN} characte
 
 
 def _canonical_capabilities(raw: Any) -> str | None:
-    """Canonical form of a ``capabilities`` blob, or ``None`` when unparseable.
+    """Canonical form of a ``capabilities`` blob.
+
+    Return ``None`` when parsing or canonicalization fails.
 
     Canonicalized through ``canonical_caps_value`` — the ONE normalization
     this column's two comparators share, so this guard and the calibrate
@@ -13481,9 +13490,9 @@ def _canonical_capabilities(raw: Any) -> str | None:
     """
     try:
         parsed = json.loads(str(raw or "") or "{}")
-    except ValueError:
+        return canonical_caps_value(parsed)
+    except (ValueError, RecursionError):
         return None
-    return canonical_caps_value(parsed)
 
 
 def _capabilities_value_changed(stored: Any, submitted: Any) -> bool:
@@ -13494,9 +13503,9 @@ def _capabilities_value_changed(stored: Any, submitted: Any) -> bool:
     test_reserialized_capabilities_do_not_defeat_pure_disable and
     test_capabilities_value_change_still_gates_dynamic_row.
 
-    An unparseable STORED blob compares as CHANGED (fail closed). The ONE
-    exception is the update twin's pure-disable derivation, which treats it
-    as not-blocking (see :func:`_derive_auth_gate`).
+    A stored blob that cannot be parsed or canonicalized compares as CHANGED (fail closed).
+    The ONE exception is the update twin's pure-disable derivation, which treats it as
+    not-blocking (see :func:`_derive_auth_gate`).
     """
     stored_canonical = _canonical_capabilities(stored)
     return stored_canonical is None or stored_canonical != _canonical_capabilities(submitted)
@@ -13931,7 +13940,7 @@ def _stored_workspace_id(row: dict[str, Any], provider: str) -> str:
         return ""
     try:
         caps = json.loads(row.get("capabilities") or "{}")
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return ""
     sc = caps.get("server_compat") if isinstance(caps, dict) else None
     raw = sc.get("anthropic_workspace_id") if isinstance(sc, dict) else None
@@ -14326,7 +14335,7 @@ def _row_serves_chat(row: dict[str, Any]) -> bool:
     raw = row.get("capabilities") or "{}"
     try:
         caps = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         caps = {}
     return serves_chat(caps if isinstance(caps, dict) else {}, str(row.get("model") or ""))
 
@@ -15060,7 +15069,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         # impossible to re-save, so the switch is refused until it is cleared.
         try:
             stored_caps = json.loads(existing.get("capabilities") or "{}")
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             stored_caps = {}
         err_msg = _validate_anthropic_workspace_id(stored_caps, str(updates["provider"]))
         if err_msg:
@@ -16533,6 +16542,41 @@ async def admin_delete_judge_setting(request: Request) -> JSONResponse:
 # -- Heuristic rules -------------------------------------------------------
 
 
+def _reload_judge_rules(request: Request) -> str | None:
+    """Reload local rules, reporting invalid configuration without dropping the cache."""
+    from turnstone.core.rule_registry import InvalidRuleConfigError, RuleRegistry
+
+    registry = getattr(request.app.state, "rule_registry", None)
+    try:
+        if registry is not None:
+            registry.reload()
+        else:
+            config_store = getattr(request.app.state, "config_store", None)
+            if config_store is not None:
+                request.app.state.rule_registry = RuleRegistry(storage=config_store.storage)
+    except InvalidRuleConfigError as exc:
+        log.warning("Failed to reload rule configuration: %s", exc)
+        return str(exc)
+    return None
+
+
+async def _judge_write_response(
+    request: Request, payload: dict[str, Any], *, status_code: int = 200
+) -> JSONResponse:
+    """Acknowledge a persisted edit even when other corrupt rules prevent its reload."""
+    error = _reload_judge_rules(request)
+    await _publish_config_change(request)
+    if error:
+        payload = {
+            **payload,
+            "warning": (
+                f"Change saved, but rule configuration could not be loaded: {error}. "
+                "Repair the rule before starting new sessions."
+            ),
+        }
+    return JSONResponse(payload, status_code=status_code)
+
+
 async def admin_list_heuristic_rules(request: Request) -> JSONResponse:
     """GET /v1/api/admin/judge/heuristic-rules — list merged heuristic rules."""
     from turnstone.core.auth import require_permission
@@ -16664,12 +16708,14 @@ async def admin_create_heuristic_rule(request: Request) -> JSONResponse:
     if isinstance(arg_patterns, str):
         try:
             arg_patterns = _json.loads(arg_patterns)
-        except _json.JSONDecodeError:
+        except (ValueError, RecursionError):
             return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
     if not isinstance(arg_patterns, list):
         return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
     for i, pat in enumerate(arg_patterns):
-        err_msg = _validate_regex_pattern(str(pat))
+        if not isinstance(pat, str):
+            return JSONResponse({"error": f"arg_patterns[{i}] must be a string"}, status_code=400)
+        err_msg = _validate_regex_pattern(pat)
         if err_msg:
             return JSONResponse({"error": f"arg_patterns[{i}]: {err_msg}"}, status_code=400)
 
@@ -16702,13 +16748,9 @@ async def admin_create_heuristic_rule(request: Request) -> JSONResponse:
         storage, audit_uid, "heuristic_rule.create", "heuristic_rule", rule_id, {"name": name}, ip
     )
 
-    # Reload rule registry
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_heuristic_rule(rule_id) or {}, status_code=201)
+    return await _judge_write_response(
+        request, storage.get_heuristic_rule(rule_id) or {}, status_code=201
+    )
 
 
 async def admin_get_heuristic_rule(request: Request) -> JSONResponse:
@@ -16807,12 +16849,16 @@ async def admin_update_heuristic_rule(request: Request) -> JSONResponse:
         if isinstance(ap, str):
             try:
                 ap = _json.loads(ap)
-            except _json.JSONDecodeError:
+            except (ValueError, RecursionError):
                 return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
         if not isinstance(ap, list):
             return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
         for i, pat in enumerate(ap):
-            err_msg = _validate_regex_pattern(str(pat))
+            if not isinstance(pat, str):
+                return JSONResponse(
+                    {"error": f"arg_patterns[{i}] must be a string"}, status_code=400
+                )
+            err_msg = _validate_regex_pattern(pat)
             if err_msg:
                 return JSONResponse({"error": f"arg_patterns[{i}]: {err_msg}"}, status_code=400)
         fields["arg_patterns"] = _json.dumps(ap)
@@ -16845,12 +16891,7 @@ async def admin_update_heuristic_rule(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_heuristic_rule(rule_id) or {})
+    return await _judge_write_response(request, storage.get_heuristic_rule(rule_id) or {})
 
 
 async def admin_delete_heuristic_rule(request: Request) -> JSONResponse:
@@ -16884,12 +16925,7 @@ async def admin_delete_heuristic_rule(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse({"status": "ok", "rule_id": rule_id})
+    return await _judge_write_response(request, {"status": "ok", "rule_id": rule_id})
 
 
 # -- Output guard patterns --------------------------------------------------
@@ -17086,13 +17122,9 @@ async def admin_create_output_guard_pattern(request: Request) -> JSONResponse:
         ip,
     )
 
-    # Reload rule registry
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_output_guard_pattern(pattern_id) or {}, status_code=201)
+    return await _judge_write_response(
+        request, storage.get_output_guard_pattern(pattern_id) or {}, status_code=201
+    )
 
 
 async def admin_get_output_guard_pattern(request: Request) -> JSONResponse:
@@ -17243,12 +17275,7 @@ async def admin_update_output_guard_pattern(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse(storage.get_output_guard_pattern(pattern_id) or {})
+    return await _judge_write_response(request, storage.get_output_guard_pattern(pattern_id) or {})
 
 
 async def admin_delete_output_guard_pattern(request: Request) -> JSONResponse:
@@ -17282,12 +17309,7 @@ async def admin_delete_output_guard_pattern(request: Request) -> JSONResponse:
         ip,
     )
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
-    await _publish_config_change(request)
-
-    return JSONResponse({"status": "ok", "pattern_id": pattern_id})
+    return await _judge_write_response(request, {"status": "ok", "pattern_id": pattern_id})
 
 
 # -- Judge utility endpoints ------------------------------------------------
@@ -17301,9 +17323,9 @@ async def admin_judge_reload(request: Request) -> JSONResponse:
     if err:
         return err
 
-    rule_registry = getattr(request.app.state, "rule_registry", None)
-    if rule_registry:
-        rule_registry.reload()
+    error = _reload_judge_rules(request)
+    if error:
+        return JSONResponse({"error": error}, status_code=409)
 
     await _publish_config_change(request)
     return JSONResponse({"status": "ok"})
@@ -17359,7 +17381,7 @@ async def admin_get_all_node_metadata(request: Request) -> JSONResponse:
         for r in rows:
             try:
                 val = _anm_json.loads(r["value"])
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 val = r["value"]
             entries.append({"key": r["key"], "value": val, "source": r["source"]})
         result[nid] = entries
@@ -17388,7 +17410,7 @@ async def admin_get_node_metadata(request: Request) -> JSONResponse:
     for r in rows:
         try:
             val = _nm_json.loads(r["value"])
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             val = r["value"]
         metadata.append({"key": r["key"], "value": val, "source": r["source"]})
     return JSONResponse({"node_id": node_id, "metadata": metadata})
