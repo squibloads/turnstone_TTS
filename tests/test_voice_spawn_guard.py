@@ -731,3 +731,27 @@ def test_voice_single_spawn_without_ws_id_releases_its_slot(monkeypatch):
 
     assert "no ws_id" in output
     assert sess._voice_spawns_this_turn == 0
+
+
+def test_voice_skill_refused_at_exec_costs_no_slot(monkeypatch):
+    """1.9.0 re-checks a child's skill after the approval wait; a refusal there
+    must not spend the voice budget, for a single spawn or a batch row."""
+    sess, coord, _ui = _make_session(
+        monkeypatch,
+        voice=True,
+        settings={"coordinator.voice_max_agents_per_turn": 2},
+    )
+    coord.spawn.return_value = _spawn_result()
+    single = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "one", "skill": "s"}))
+    batch = sess._prepare_tool(
+        _tc("spawn_batch", {"children": [{"initial_message": "a", "skill": "s"}]}, "call-b")
+    )
+    assert "error" not in single and "error" not in batch
+
+    monkeypatch.setattr(sess, "_principal_load_only_denial", lambda name: "skill now high-risk")
+    _call_id, output = sess._exec_spawn_workstream(single)
+    assert "high-risk" in output
+    sess._exec_spawn_batch(batch)
+
+    assert coord.spawn.call_count == 0
+    assert sess._voice_spawns_this_turn == 0
