@@ -248,3 +248,17 @@ def test_playback_rate_is_bounded() -> None:
     for bad in ("0.4", "2.5"):
         with pytest.raises(ValueError):
             validate_value("audio.tts_playback_rate", bad)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[" * 100_000 + "]" * 100_000,  # nested past the decoder's recursion limit
+        "[" + "9" * 5000 + "]",  # an integer past int's string-conversion limit
+    ],
+    ids=["too-deep", "huge-int"],
+)
+def test_validate_dictionary_rejects_json_the_decoder_cannot_hold(value: str) -> None:
+    # Malformed input, not a crash: the admin save answers 400 like any bad JSON.
+    with pytest.raises(ValueError, match="not valid JSON"):
+        validate_dictionary(value)
