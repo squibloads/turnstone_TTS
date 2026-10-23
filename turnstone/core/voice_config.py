@@ -108,6 +108,10 @@ def _load_list(raw: str) -> list[Any]:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"not valid JSON: {exc.msg}") from None
+    except (ValueError, RecursionError):
+        # The decoder's other failures: an integer past the conversion limit
+        # (plain ValueError) or nesting past the recursion limit.
+        raise ValueError("not valid JSON: nested too deeply or a number too large") from None
     if not isinstance(data, list):
         raise ValueError("must be a JSON list")
     return data
