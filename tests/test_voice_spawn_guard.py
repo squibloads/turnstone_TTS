@@ -480,3 +480,54 @@ def test_plain_coordinator_is_unaffected_by_the_voice_guard(monkeypatch):
 
     assert coord.spawn.call_count == 2
     assert all(call.kwargs["model"] == "" for call in coord.spawn.call_args_list)
+
+
+def test_voice_batch_sent_at_once_releases_every_kind_of_non_start(monkeypatch):
+    """spawn_batch sends its creates concurrently (#1457); a child that raised,
+    errored or came back without a ws_id still hands its slot back, and only
+    the child that exists keeps one."""
+    sess, coord, _ui = _make_session(
+        monkeypatch,
+        voice=True,
+        settings={"coordinator.voice_max_agents_per_turn": 4},
+    )
+
+    def _spawn(**kwargs):
+        msg = kwargs["initial_message"]
+        if msg == "raises":
+            raise RuntimeError("node vanished")
+        if msg == "errors":
+            return {"error": "upstream unavailable", "status": 502}
+        if msg == "no-id":
+            return {"name": "kid", "node_id": "node-1"}
+        return _spawn_result("child-ok")
+
+    coord.spawn.side_effect = _spawn
+    batch = sess._prepare_tool(
+        _tc(
+            "spawn_batch",
+            {
+                "children": [
+                    {"initial_message": "raises"},
+                    {"initial_message": "errors"},
+                    {"initial_message": "no-id"},
+                    {"initial_message": "ok"},
+                ]
+            },
+        )
+    )
+    _call_id, output = sess._exec_spawn_batch(batch)
+
+    assert len(json.loads(output)["denied"]) == 3
+    assert sess._voice_spawns_this_turn == 1
+
+
+def test_voice_single_spawn_without_ws_id_releases_its_slot(monkeypatch):
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.return_value = {"name": "kid", "node_id": "node-1"}
+
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "one"}))
+    _call_id, output = sess._exec_spawn_workstream(item)
+
+    assert "no ws_id" in output
+    assert sess._voice_spawns_this_turn == 0

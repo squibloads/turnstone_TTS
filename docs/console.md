@@ -228,7 +228,11 @@ shape `{"error":"Dispatch to node <node_id> failed"}` instead of reflecting
 arbitrary node text or retry-triggering 401/429 responses. Coded
 `server.require_project` (`400`) and wrong-execution-node (`409`) refusals retain
 their actionable wording. Consult the target node's logs for the underlying create
-correlation when a reachable node returns a masked 502.
+correlation when a reachable node returns a masked 502. When the create may have
+reached the node but no reply was read, a create that outlasts the console's
+30-second wait say, the `502` instead has `code: "upstream_no_reply"` and says
+the request may have been processed: the workstream may exist, so check before
+creating it again.
 
 ### `GET /v1/api/cluster/events`
 
@@ -295,12 +299,12 @@ Delete a user and revoke all their tokens.
 
 #### `POST /v1/api/admin/users/{user_id}/tokens`
 
-Create an API token for the given user. Returns a `ts_`-prefixed token string that can be used for Bearer auth or passed to `client.login(token="ts_xxx")`.
+Create an API token for the given user. Returns a `ts_`-prefixed token string that can be used for Bearer auth or passed to `client.login(token="ts_xxx")`. `scopes` is a comma-separated string (default `"read,write,approve"`), and `expires_days` an optional whole number of days, at least 1.
 
 ```json
 {
   "name": "CI pipeline",
-  "scopes": ["read", "write"]
+  "scopes": "read,write"
 }
 ```
 
