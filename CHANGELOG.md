@@ -6,117 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) for
 version numbers (`X.Y.Z`, with `X.Y.ZaN` / `bN` / `rcN` for pre-releases).
 
-Beginning with 1.8.0, `main` is the current stable line and `dev` is the next
-release line. A `stable/X.Y` branch is created only when `main` advances beyond
-that minor, so the current stable line never has two independently writable
-branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
-frozen.
+All development now integrates on `main`. Supported release lines are maintained
+on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
+The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
-## [Unreleased]
+## [1.9.0]
 
-> **Before upgrading:** migration 077 renames `mcp_user_tokens` to `oauth_tokens` and its
-> `server_name` column to `token_key`, preserving existing keys and encrypted data. Processes
-> running older code cannot use this OAuth storage until their code is upgraded; OAuth operations
-> on those processes can fail between migration and replacement. MCP API fields and token-keyring
-> configuration names are unchanged. See [Shared OAuth storage](docs/oauth-storage.md).
+Turnstone 1.9 focuses on predictable workstream ownership, explicit model
+selection, simpler skills, and more capable MCP connections. It also makes
+coordinators easier to interrupt, saved conversations easier to find, and tool
+approvals harder to bypass. This entry describes the change from 1.8.7; fixes
+already shipped on the 1.8 line are not repeated here.
+
+> **Before upgrading:** native installations require Python 3.13 or newer.
+> Recreate environments running Python 3.11 or 3.12 before upgrading; container
+> images include Python 3.14. The database advances from migration 076 to 083.
+> Back it up, then upgrade every node, console, CLI, and SDK client that shares
+> it together. Older processes cannot safely share the migrated database.
 >
-> **Before upgrading:** migration 078 adds the workstream owner lease to `workstreams`. Upgrade
-> every node, console and CLI that shares the database together: a process running older code
-> ignores the lease, so while versions are mixed two processes can write the same workstream.
-> Custom session factories must accept the new `workstream_lease` keyword argument and pass it
-> to the `ChatSession` they build; creating or opening a workstream fails when they do not.
-> `ChatSession.resume()` is removed: a session's workstream never changes after construction, so
-> hosts reopen a workstream with `SessionManager.open`, which builds its session and loads it with
-> `ChatSession.rehydrate()`. A host that embeds a `SessionManager` must call `start_lease_keeper()`
-> once it is built and `release_leases()` at shutdown, or its leases lapse after 30 seconds; a
-> custom `SessionEventEmitter` implements `on_lease_retired`, which announces a workstream another
-> process took over.
-> Custom storage backends must implement the lease methods (`acquire_workstream_lease`,
-> `renew_workstream_leases`, `release_workstream_lease`), `end_foreign_node_watches` and
-> `ensure_workstream_incarnation_snapshot` (which `open` now requires), and accept the `lease`
-> keyword on every session-owned write; `bulk_close_stale_orphans` and
-> `delete_stale_creating_reservations` no longer take `live_node_ids` (nor the latter
-> `local_node_id`), because liveness is now the lease.
-> `turnstone.core.policy.evaluate_tool_policy` and `evaluate_tool_policies_batch` are removed:
-> `evaluate_loaded_tool_policies` returns `None` when the policies cannot be read, and a caller
-> must then fail closed (see Security).
+> Migration 080 permanently removes skill model settings, activation modes,
+> task-agent turn limits, and token budgets. Export any values you need first.
+> Move model settings to aliases, default instructions to prompt policies or
+> personas, and task-agent limits to `tools.agent_max_turns`. Review completion
+> notification targets too: invalid lists are reset. The **Removed** section
+> below explains the new behavior.
 >
-> **Before upgrading:** migration 079 replaces the `usage_events` `ws_id` index with a
-> `(ws_id, timestamp)` index, built concurrently on PostgreSQL. Custom storage backends must
-> implement `list_saved_workstreams`; `list_workstreams_with_history` takes only `limit` (no
-> `kind`, `user_id`, `state` or `offset`) and returns only `(ws_id, alias, title, name, created,
-> updated, message_count)`;
-> `touch_workstream` is removed, and only conversation writes may change `updated`:
-> `update_workstream_state`, `update_workstream_name`, `publish_deferred_create` and
-> `bulk_close_stale_orphans` leave it unchanged, while `delete_messages_after` and
-> `truncate_messages_tail` stamp it when they remove rows. `SessionEndpointConfig` drops
-> `saved_state_filter` and `saved_loaded_lookup`, and `make_unified_saved_handler` its unused
-> `permission_gate`.
->
-> **Before upgrading:** migration 080 drops eight columns from skills (`prompt_templates`) and
-> discards their values (see Removed): the model settings (`model`, `temperature`,
-> `reasoning_effort`, `max_tokens`), the task-agent turn cap (`agent_max_turns`), the activation
-> mode (`activation`, `is_default`) and the token budget (`token_budget`). It also deletes each
-> workstream's saved `token_budget` key. This query lists the skills that set any of them: `SELECT
-> name, model, temperature, reasoning_effort, max_tokens, agent_max_turns, activation, is_default,
-> token_budget FROM prompt_templates WHERE model <> '' OR temperature IS NOT NULL OR
-> reasoning_effort <> '' OR max_tokens IS NOT NULL OR agent_max_turns IS NOT NULL OR activation <>
-> 'named' OR is_default = 1 OR token_budget > 0`.
->
-> To keep a skill's model settings, put them on a model alias and select that alias where the skill
-> is used. Task agents take their turn cap only from the `tools.agent_max_turns` setting, which is
-> unlimited (-1) by default, so set it if a skill capped task-agent turns. Scheduled tasks, channels
-> and coordinator spawns that relied on a skill's model run on the model they name, else the default
-> alias. Workstreams created before the upgrade keep the model and settings they were saved with.
->
-> A default skill's text no longer reaches the sessions that name no skill, existing workstreams
-> included when they reopen. To keep it, move the text into a prompt policy, which every session
-> reads live, existing ones too, or into a persona's prompt, which reaches only workstreams created
-> afterwards (each keeps the persona prompt it was created with; a kind's default persona covers
-> sessions that pick none). Unlike a default skill, both stay on when a workstream names a skill, so
-> move only text that suits every such session, skill or not. Search-activated skills leave the
-> system prompt; the model still finds them with the `skills` tool's `find` action. Nothing stops a
-> workstream at a token count any more: a turn a budget prompt held now runs.
->
-> The migration also fixes two kinds of saved data. A workstream switched to another skill before
-> the upgrade kept the skill it was created with in its saved copy, which would come back on reopen;
-> where the saved skill name is a different existing skill and the skill it was created with still
-> exists, the copy is cleared, so the workstream reopens with the skill it switched to. The saved
-> data cannot tell two rarer cases from that: a skill renamed before the upgrade whose old name a
-> newer skill took is treated as a switch too, and a switch whose original skill was deleted, or
-> whose target skill was later deleted or renamed, keeps the original's copy, shown under the name
-> it switched to. (A skill cleared before the upgrade looks like an older reopen and still comes
-> back.) A skill whose `notify_on_complete` fails the new check (see Changed) has it reset to `[]`;
-> such a list never fired, because workstream create ignored it or could not deliver it. This query
-> lists the skills with targets, to review them first: `SELECT name, notify_on_complete FROM
-> prompt_templates WHERE notify_on_complete NOT IN ('', '[]', '{}')`. Nodes started with
-> `turnstone-server --skill` must drop the flag (see Removed).
->
-> Upgrade every node and console together: a process from before 080 fails every skill read against
-> a migrated database. Custom storage backends: `create_prompt_template` no longer takes the eight
-> fields (it required `is_default`), and `list_default_templates` and `list_skills_by_activation`
-> are gone, as are the `turnstone.core.memory` helpers `list_default_skills` and
-> `list_skills_by_activation`. Upgrade Python SDK clients too: older ones require `is_default` and
-> fail to read skills.
->
-> **Before upgrading:** migration 081 rebuilds the orphan reaper's partial index
-> (`idx_workstreams_reaper`) to cover the new `evaluation` state, concurrently on PostgreSQL. The
-> reaper runs without the index for the length of the build.
->
-> **Before upgrading:** migration 082 stores the default model in the `model.default_alias` setting
-> when that setting has no value yet and the database holds enabled chat model definitions
-> (rerankers and speech models are skipped): the one named `default`, else the first in alias order.
-> A node or console whose config.toml picks its default itself, with `[model] default` or a model
-> named `default` under `[models.*]`, while the database holds model definitions, follows the stored
-> setting from now on, because the setting outranks config.toml; clear `model.default_alias` in the
-> Settings tab to go back to the config.toml default.
->
-> **Before upgrading:** migration 083 adds avatar columns to `users` and gives every existing user
-> an avatar colour, oldest account first, so that people who share an initial get different colours
-> where the six allow. Custom storage backends must implement `get_user_avatar`,
-> `list_user_avatars`, `get_user_avatar_image`, `set_user_avatar_color`, `set_user_avatar_image` and
-> `clear_user_avatar_image`; the two setters return `False` for a user that doesn't exist, and
-> `clear_user_avatar_image` returns the SHA-256 of the picture it removed, or `None`.
+> HTTP clients now use the operating system's certificate trust store. Install
+> private CA roots there, or configure `SSL_CERT_FILE` / `SSL_CERT_DIR` with a
+> complete trust bundle. Refresh system and custom CA bundles before restarting.
+> Custom session hosts and storage backends also need the lease and saved-session
+> interface updates described below.
 
 ### Added
 
@@ -269,6 +188,44 @@ frozen.
   filters and the `turnstone_workstreams_by_state` metric can now carry `evaluation`; clients
   that list the states should add it. The CLI's `/cluster nodes` table gains an EVAL column, and a
   sidebar row's hover text now names its state when it is not idle or running.
+- **One live owner per workstream.** A database-backed lease prevents two nodes
+  from writing to the same conversation. Opens route to the owner, concurrent
+  opens share one session, and a process that loses ownership stops generating
+  and writing. A crashed owner's workstream can be recovered after its lease
+  expires, normally within 30 seconds. The CLI opens resumed workstreams in
+  their own tabs and reports ownership changes without closing the whole shell.
+  See [Workstream Owner Lease](docs/architecture.md#workstream-owner-lease).
+- **MCP protocol 2026-07-28 support (#679).** Connections negotiate the newer
+  protocol when offered and retain the older initialization handshake for
+  existing servers. Catalog subscriptions reconnect and refresh, resource reads
+  honor cache hints, and structured-only tool results reach the model as JSON.
+  Optional server logging and resource subscriptions are documented in
+  [MCP settings](docs/tools.md#optional-2026-07-28-settings).
+- **Images from MCP tools (#1158).** Supported image results reach vision models
+  and appear in live and reopened conversations. They use the same attachment
+  storage and access boundaries as uploaded images.
+- **Test MCP connections before saving (#1328).** The server editor can test an
+  unauthenticated or static-header HTTP connection and show its tools, resource
+  and prompt counts, or a useful connection error. The test saves nothing and
+  runs from the console, whose network may differ from a node's.
+- **Secret references for credentials (#1329).** Model API keys and MCP HTTP
+  headers can use `secret://` references to mounted files or a configured secret
+  store. Values stay out of the database, model keys refresh on the configured
+  interval, and MCP headers pick up rotations on reconnect. Adding or probing a
+  reference requires the dedicated admin permission. See
+  [Secret References](docs/security.md#secret-references).
+- **User avatars (#997).** Accounts have a distinct initial and color, with an
+  option to upload a picture. Avatars appear in the user menu and Users table;
+  admins can remove uploaded pictures. Image uploads are bounded and normalized
+  before storage.
+- **A separate approval-evaluation state (#1325).** Dashboards distinguish
+  waiting for the intent judge from waiting for a person. The new `evaluation`
+  state appears in events, metrics, coordinator trees, and CLI cluster views;
+  API and SDK consumers that enumerate states should add it.
+- **Output-guard and attachment evaluations (#1291).** `turnstone-eval` can
+  measure injection detection, advisory accuracy, and task-agent behavior,
+  retain transcripts for later grading, and exercise attachments through the
+  same path as real uploads.
 
 ### Changed
 
@@ -677,1042 +634,180 @@ frozen.
   `judge.output_guard_model` to keep a separate model for the guard. A workstream's own judge model
   (the launcher's judge picker, the create API's `judge_model`, the CLI's `--judge-model`) is that
   workstream's `judge.model`, so it runs the guard too unless `judge.output_guard_model` is set.
+- **Model selection is explicit (#1359).** A missing, disabled, or unreadable
+  model is no longer silently replaced. New work that depends on it fails with
+  a useful error; an existing workstream keeps its selected model and waits for
+  it to return or for an explicit `/model` change. Default, task, coordinator,
+  and channel aliases follow the same rule. Nodes report a missing default
+  model as degraded, and model administration identifies settings that still
+  refer to an alias before allowing its removal.
+  - Migration 082 seeds `model.default_alias` from existing enabled chat models
+    when no default is stored. This setting takes precedence over per-node
+    configuration; clear it in Settings to restore configuration-based selection.
+- **The client transport and SDK contracts have changed (#679, #1011).** MCP
+  requires SDK 2.3, and the Python client SDK accepts an `httpx2.AsyncClient` for
+  `httpx_client`. Callers should catch `turnstone.sdk.REQUEST_FAILURES` for
+  transport failures. Helpers that import the removed `httpx`, `httpx_sse`, or
+  `certifi` dependencies must install them themselves. Event streams now reject
+  a single event larger than 16 MiB. See [SDK error handling](docs/sdk.md#error-handling).
+- **The native provider API uses version 2026-10-21.** Its SDK is now 2.x, and
+  that API rejects `temperature`, `top_p`, and `top_k`. Remove those overrides
+  from native model definitions and ensure gateways accept the new API version.
+  The compatible lane retains its temperature behavior. API keys retain their
+  key header, bearer tokens retain theirs, and clients carrying an API key no
+  longer follow redirects: configure the final gateway address directly. See
+  [provider configuration](docs/architecture.md#provider-adapter-layer).
+- **Stored model definitions contain values or secret references.** Definitions
+  saved in the console no longer expand `${VAR}` in API keys or base URLs;
+  environment expansion remains available in `config.toml`. Update older stored
+  placeholders before syncing models. Empty key expansions and keys with
+  surrounding whitespace are rejected instead of falling back to another
+  credential. Workspace-scoped definitions also carry their workspace header
+  through detection, diagnostics, and delegated authentication.
+- **Saved conversations are paged and searched on the server (#1268).** Both
+  dashboards can reach the full saved history, including coordinators, rather
+  than only the newest rows. Search and sort apply across the stored results.
+  A conversation's `updated` time now reflects message changes; opening,
+  renaming, or closing it no longer moves it to the top or restarts retention.
+  Custom storage backends must implement `list_saved_workstreams` and adopt the
+  revised history-list and timestamp contracts.
+- **Coordinators respond sooner (#1339, #1457).** User messages interrupt a
+  pending wait immediately, and batch spawns create children concurrently so a
+  stalled node does not delay every later child. The CLI keeps background
+  approval output away from the active prompt, and the first Ctrl-C stops a
+  parallel tool batch.
+- **The output guard inherits the workstream's judge model (#1291).** When
+  `judge.output_guard_model` is unset, it uses `judge.model`, then the session
+  model. Set a dedicated output-guard alias to keep its capacity separate from
+  intent approvals. Judge usage is included in recorded costs.
+- **OAuth storage and lifecycle are shared.** Model and MCP authentication use
+  one process-owned runtime for token requests, rotation, and durable writes.
+  Model authentication no longer depends on an MCP manager. Migration 077
+  renames the token table and key column while preserving encrypted credentials;
+  keyring configuration is unchanged. See [Shared OAuth storage](docs/oauth-storage.md).
+- **Development now stays on `main`.** The former `main` is `stable/1.8`, the
+  former `dev` is `main`, and `dev` is retired. Features and user escalations
+  follow the same development loop. Source downloads and the installer target
+  `main`; supported stable lines receive focused backports.
 
 ### Removed
 
-- **The tool-error memory nudge is gone (#1454).** A failed tool call no longer gets "A tool just
-  returned an error. Before retrying, check your memories" after its result; the model gets the
-  error result alone. Persisted `tool_error` turns in existing transcripts still render.
-  `turnstone.core.memory.count_structured_memories`, `turnstone.core.metacognition.should_nudge`
-  and the `memory_count` keyword of `nudge_allowed` are removed.
-- **The `[model] fallback` failover chain is gone (#1359)** *(BREAKING)* — a turn whose model failed
-  to answer after its retries was tried again on each alias in config.toml's `[model].fallback`
-  list, healthy backends first, possibly on another provider; the turn now fails on its own model
-  and says why. A config.toml that still sets `fallback` loads, the list is ignored, and each node,
-  console and CLI process logs one `model_registry.fallback_ignored` warning. `/model` no longer
-  prints a "Fallback:" line, the `health.failure_threshold` and `model.auth_fail_closed` help no
-  longer mention the chain, and a backend marked degraded is now only reported (in `/health`, the
-  console and the metrics). Custom code that builds a `ModelRegistry` or calls its `reload()` must
-  drop the `fallback` argument, and passes `agent_model` and the other routing aliases by keyword.
-- **The identical-repeat warning and its nudge are gone (#1339).** A tool called three times in a
-  row with the same arguments no longer has "⚠ Warning: this is an identical repeat of a previous
-  tool call" appended to its output, and the model no longer gets the "stop and reconsider your
-  approach" nudge. The check was written for an early model that looped on the same call, and it
-  fired on calls whose repetition is the documented usage: re-issuing `wait_for_workstream` after a
-  timeout or a user message, and polling `bash_output`, which needed its own exemption. Persisted
-  `repeat` turns in existing transcripts still render.
-- **Skills no longer choose the model, its settings or the task-agent turn cap (#1292)**
-  *(BREAKING)* — a skill's model alias, temperature, reasoning effort, max tokens and agent max
-  turns are gone from the skill editor, the admin skill API (`SkillInfo`, the create and update
-  bodies, the SKILL.md parse preview), the `skills` tool and the Python and TypeScript SDK types. A
-  workstream runs on the model its create request names, else the default alias, and that alias
-  supplies temperature, reasoning effort and max tokens; task agents take their turn cap from the
-  `tools.agent_max_turns` setting. Installing a SKILL.md now ignores its `model:` and `effort:`
-  keys, like any other unsupported key, reversing the 1.6.0 ingestion. Rows of the console's
-  `GET /v1/api/models` no longer carry `effort_ladder`, which only the skill editor read; the admin
-  model form keeps its ladder through `POST /v1/api/admin/models/effort-ladder`.
-- **Skills lose their activation mode and token budget (#1292)** *(BREAKING)* — default skills
-  (`activation` `default`, mirrored in `is_default`), whose text joined every session that named no
-  skill, are gone, and so is the `<available-skills>` list of search-activated skills in every
-  system prompt: a skill applies only when a workstream names it, and the model finds skills with
-  the `skills` tool's `find` action. The skill `token_budget`, which asked for approval once a
-  single model call passed it, is gone with its `__budget_override__` prompt on nodes and in the
-  CLI. The skill editor's Activation and Default controls and Token Budget field, the admin skill
-  API (`SkillInfo` and the create and update bodies), `GET /v1/api/skills` rows, the `skills` tool's
-  arguments and the Python and TypeScript SDK types lose `activation`, `is_default` and
-  `token_budget`; a request that names them has them ignored. `turnstone.core.skill_search`, which
-  nothing used, is removed.
-- **`turnstone-server --skill` is removed (#1292)** *(BREAKING)* — it gave its skill to every
-  workstream whose create request named none: a node-wide default skill, without the saved copy a
-  named skill gets. A workstream now runs a skill only when its create request, scheduled task,
-  channel or `/skill` names one. The CLI keeps its `--skill`: the skill for each workstream it
-  starts from scratch (`/new` copies the current tab's skill, and a resumed workstream keeps its
-  own).
+- **Skill-owned model settings and implicit activation (#1292).** Skills no
+  longer choose a model, sampling settings, output limits, task-agent turn cap,
+  or token budget. Default and search-activated skills are gone: a workstream
+  names a skill explicitly, or the model finds one with `skills(find)`.
+  `turnstone-server --skill` is removed; the CLI's per-workstream `--skill`
+  remains. Move default instructions to a prompt policy or persona, noting that
+  those instructions also apply when a workstream uses a named skill. Prompt
+  policies reach existing workstreams; persona prompts are copied when a new
+  workstream is created. Token budgets no longer hold a turn for approval.
+  Update SDK clients and custom
+  storage implementations that expect the removed skill fields or methods.
+- **Automatic cross-model failover (#1359).** `[model].fallback` is ignored
+  with a warning. A failed turn stays on its chosen model instead of trying
+  other aliases or providers; custom registry integrations must remove their
+  `fallback` argument.
+- **In-place session resume.** `ChatSession.resume()` is replaced by opening
+  through `SessionManager.open()`, which loads the session with `rehydrate()`.
+  Custom session factories must pass `workstream_lease`; embedded managers must
+  start their lease keeper and release leases at shutdown. Custom storage
+  implementations must support lease acquisition, renewal, release, and fenced
+  session writes. The [architecture guide](docs/architecture.md#workstream-owner-lease)
+  describes the lifecycle contract.
+- **Repeat-call and tool-error memory nudges (#1339, #1454).** Legitimate polling
+  no longer receives an identical-call warning, and a failed tool call no longer
+  injects a separate instruction to search memory. Actual tool results and
+  previously saved transcript entries remain available.
 
 ### Fixed
 
-- **A node with rate limiting on gives each signed-in user their own bucket (#1464)** — it keyed
-  its buckets on the request's address, and the console forwards every caller's request from its
-  own, so every request the console forwarded to a node, from every user and coordinator, drew on
-  one bucket sized for a single client, and one busy user could starve the rest. A signed-in
-  request now draws on its user's bucket, whether it comes direct or through the console, and a
-  coordinator's on its creator's. A request to a public path, such as sign-in, is still limited
-  per client address, through `ratelimit.trusted_proxies`. A user's bucket now carries all of that
-  user's page loads, so the default `ratelimit.burst` rises from 20 to 50: reloading a page that
-  restores eight workstream panes makes about 30 API requests. A full table of buckets now evicts
-  the least recently used one instead of refusing every new caller.
-- **A node with rate limiting on no longer limits its page and static files (#1464)** — one load
-  of the node's page fetches more than 60 files (the page, its scripts and stylesheets, and the
-  modules they import), each revalidated on every load, so at the default burst of 20 half or more
-  of them were refused, a refused script or stylesheet isn't retried, and the page couldn't load,
-  whether opened directly or through the console. `/`, `/static/` and `/shared/` are now exempt,
-  like `/health` and `/metrics`.
-- **A Stop always lands on a node with rate limiting on (#1464)** — a coordinator's Stop cancels
-  each of its children on its creator's bucket, which the children's own creates may just have
-  drained, and a cancel the limiter refused left that child running. A cancel is no longer
-  limited: `/v1/api/workstreams/{ws_id}/cancel` and `/v1/api/watches/{watch_id}/cancel` are exempt.
-- **A coordinator sends a create the node's rate limiter refused once more (#1464)** — with rate
-  limiting on, `spawn_batch` sends every child's create at once, and a create past its creator's
-  burst was refused and reported as denied. A create the limiter refuses, from `spawn_batch` or
-  `spawn_workstream`, is now sent once more after the wait the refusal names, unless the
-  coordinator is stopped first, which cuts the wait short; the limiter answers before any handler
-  runs, so the refused create made nothing. A refusal that names no wait, or one longer than 5
-  seconds, comes back as before. Like `spawn_batch`, `spawn_workstream` now cancels a child whose
-  create returns after a Stop, which the console's cancel cascade can't reach, and audits the
-  cancel as `coordinator.cancel_cascaded` with `src: spawn_workstream`.
-- **The Python SDK presents its client certificate when `ca_cert` is also set (#1425)** — with
-  both, the client certificate was dropped without a warning, so a node that requires one, such as
-  a node with TLS on, refused the handshake.
-- **The console answers 502 for a request to a node it can't build** — a node's redirect to a
-  `Location` that can't be parsed or whose host isn't valid IDNA, or a request path holding a
-  percent-encoded control character, raised past the console's error handling: proxied and routed
-  requests answered a bare 500 without recording route metrics, the event relay broke off after
-  its 200, a coordinator's inspect lost its fallback to stored state and its other calls to the
-  console raised instead of reporting it unreachable, and a node answering the startup scope check
-  that way, or with a body in a charset Python can't decode, stopped the console from starting.
-- **The MCP registry search and skill-source downloads fail cleanly on a request they can't
-  build** — a redirect to a `Location` that can't be parsed or whose host isn't valid IDNA, or a
-  search term or path holding a lone surrogate, raised past their error handling: the console's
-  registry search answered 500 instead of 502, and one bundled file like that failed a whole skill
-  install instead of being skipped.
-- **A TLS alert after the handshake fails a request like any other** — a TLS 1.3 server that refuses
-  the client's certificate says so after the handshake, and an async client could get that alert at
-  its first read as a raw `ssl.SSLError`, which the code making the request didn't catch: the
-  console answered 500 instead of 502, or failed to start when a node answered its startup scope
-  check that way, and OAuth, OIDC, the MCP registry search and skill sources raised past their own
-  error handling.
-- **Console logs no longer carry control characters from a request path or a node's reply** — a
-  proxied request that failed logged its path with any percent-encoded control characters decoded,
-  at debug, or at warning when the node answered an event stream with an error; the cluster
-  collector logged a node's 4xx reply, and the node id in a snapshot that named another node, at
-  warning as sent. With text-format logs, a signed-in user or a compromised node could forge a log
-  line or send terminal escapes. Paths and node ids are logged escaped, and every reply preview
-  replaces the characters that aren't printable, C1 controls and Unicode line separators included.
-- **`turnstone-doctor` survives a health reply nested too deeply.** A node, or a URL the doctor was
-  asked to probe, answering with JSON nested tens of thousands of levels deep stopped the version
-  scan before its report, and the `http_health` tool's indented output grew with the square of the
-  nesting depth. Such a reply now reads as unparseable, and the tool shows a reply as compact JSON.
-- **An OAuth or OIDC endpoint URL the client can't send is refused when its document is read.** An
-  identity provider's discovery document, an MCP server's challenge or metadata, or an
-  authorization server's metadata could name an endpoint holding a control character (a stray
-  trailing newline, say), a lone surrogate, or a host that isn't valid IDNA 2008. The address
-  checks accepted it and the request then failed with an error OAuth didn't handle: a JWKS URL
-  like that stopped the node, console or CLI from starting; the MCP consent callback and client
-  registration answered 500; a challenge like that ended discovery before the server's
-  origin-level document was tried; an MCP token lookup raised instead of returning a retryable
-  failure; and a model token mint failed without recording a cause. Such a URL is now refused like
-  any other rejected endpoint, also in a field that is sent only on some paths or never (an
-  identity provider's `userinfo_endpoint`, an authorization server's `revocation_endpoint`): OIDC
-  sign-in turns off with the configuration error logged until the next start, consent fails with
-  the discovery error, and the challenge is skipped. A URL that reaches a request anyway fails like
-  an unreachable endpoint.
-- **A node or console that can't read its settings at startup exits instead of running on the
-  defaults (#1406).** When the settings query failed after the database migrations had run (a
-  dropped connection, a failover, a timeout), the process ran on every setting's default until
-  something reloaded them. A node pruned workstreams on the default 90-day retention even with
-  retention off or longer, and closed idle workstreams on the default timeout; the default model
-  and the task, coordinator, channel, judge and audio models moved; `model.auth_fail_closed`,
-  `model.auth_audience_allowlist`, `ratelimit.enabled` and `server.require_project` reverted;
-  workstreams created meanwhile were saved without `session.instructions`; and the node and the
-  console skipped TLS. The console could also store `tls.enabled = false` over a stored `true`,
-  which kept TLS off after later restarts: if a console started during a database outage, check
-  `tls.enabled` in the Settings tab. Both now log `settings.load_failed` and exit, so a supervisor
-  restart retries the read, and a node that can't read its model definitions logs
-  `model_registry.load_failed` and exits too instead of running on config.toml's models until a
-  Sync. A reload that fails later keeps the settings that last loaded.
-  `turnstone-admin rerank-calibrate` stops with the error instead of calibrating on the default
-  query instruction.
-- **`TURNSTONE_TLS_ENABLED` can turn TLS on for a console that has already started without it
-  (#1413).** Each console start without TLS stored `tls.enabled = false`, and a setting is seeded
-  from its environment variable only while nothing is stored for it, so adding the TLS compose
-  overlay to an existing deployment left TLS off. The console's startup no longer writes back the
-  TLS state it found; unset reads as off on the console and the nodes. A database an earlier start
-  wrote `false` into keeps it, and the console now logs `config.env_ignored` when that row
-  shadows `TURNSTONE_TLS_ENABLED`: reset `tls.enabled` in the Settings tab to apply the variable.
-- **Database certificate paths and database passwords with punctuation no longer stop a node or
-  console from starting.** The migration step failed before it connected when the PostgreSQL URL
-  carried `sslrootcert`, `sslcert` or `sslkey` (under `[database]`, or as
-  `TURNSTONE_DB_SSLROOTCERT`, `TURNSTONE_DB_SSLCERT` and `TURNSTONE_DB_SSLKEY`), another parameter
-  holding a path such as a Unix-socket `host=/run/postgresql`, or a password with punctuation
-  other than `+`, `-`, `.`, `_` and `~`, and when a SQLite path held a `%`, a letter outside ASCII
-  or punctuation such as `(`, `,`, `:` or `#`. `python -m turnstone.core.storage._migrate` failed
-  the same way; `sslmode` alone was not affected.
-- **The Docker image's migration step reads the database settings the services use.** `python -m
-  turnstone.core.storage._migrate`, which the entrypoint runs before the services start, read
-  only `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL` and `TURNSTONE_DB_PATH`. It now reads
-  config.toml's `[database]` first and then the `TURNSTONE_DB_*` variables, as the node does, the
-  TLS settings (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`) included. A database configured
-  only in config.toml no longer leaves the step migrating a SQLite file in its working directory.
-- **A stored model definition whose `temperature` or `max_tokens` isn't a number, or is outside
-  the range the console accepts (0 to 2, and at least 1), loads with that field unset.** The
-  loader logs `model_registry.override_invalid`, as it already did for such values in config.toml.
-  A value that isn't a number used to stop the load at that row: a node's Sync answered 503, and
-  doctor and the console's coordinator went without it and every definition sorting after it. One
-  out of range, `NaN` among them, was sent to the provider. The console refuses such values, so
-  only a direct write to the table stores one.
-- **Saving a model definition with `max_tokens` set to `Infinity` answers 400.** The JSON body
-  parsed it as a float that `int()` can't convert, and the create and update endpoints answered
-  500.
-- **A long speech-synthesis reply no longer shows "Node unreachable".** `POST /v1/api/tts` answers
-  only once the whole clip is synthesized, so a slow or local backend outlasted the console's
-  shared 30-second proxy timeout and the user saw a connection error for a node that was working
-  fine. The console now allows 90 seconds for the `tts` answer and only for that wait: connecting,
-  writing, and the pool keep the shared bound, and every other forwarded request is unchanged. A
-  proxy in front of the console has to allow 90 seconds without data on this route; the AWS ECS
-  module's load balancer now allows 120 (its `idle_timeout` was the 60-second default), and the
-  browser shows a readable error when a proxy answers with an HTML page instead.
-- **Speech synthesis no longer ties up the node, or keeps going for nobody (#1424).** Each clip
-  held a worker from the pool the service heartbeat shares, so a few slow clips could make the
-  console mark a working node offline. The backend call was retried twice, each time for the
-  whole clip, and synthesis ran to the end after the caller had left. A node now synthesizes at
-  most two clips at once, on threads of its own, and refuses a third with 429 and `Retry-After`;
-  the console now passes a node's `Retry-After` on, and the browser waits it out and retries. The
-  backend call is one attempt, bounded at 80 seconds of silence, so a transient backend error now
-  fails the play. A play that is replaced, or whose pane or tab closes, cancels its request, and
-  the console passes the departure on, so the node stops reading the clip at the backend's next
-  chunk.
-- **Channel bots no longer start conversations on the wrong model before they have fetched the
-  channel model (#1377).** Until a Discord or Slack bot had fetched `channels.default_model_alias`
-  once, every conversation started meanwhile took the setting as unset and ran for good on the
-  fallback model (Discord's `--model`, else the server default). That covered a slow or failing
-  first fetch and, for a bot started less than 30 seconds after its host booted, the rest of those
-  30 seconds, when it didn't fetch at all. A conversation start now waits for the setting, and one
-  that can't fetch it doesn't start: Discord and the Slack slash command reply that they couldn't
-  look up the model, and the slash command keeps the current session open; a Slack DM gets its
-  usual error, including one that has to restart its conversation. Messages to a live conversation
-  don't fetch it.
-- **A JPEG saved in an extreme number of passes no longer ties up a CPU.** A progressive JPEG
-  decodes in passes (scans), each costing a pass over the whole picture, and a small file can
-  hold thousands. Chat attachment uploads now refuse a JPEG with more than 100 scans, and
-  thumbnails and the orientation fix applied to images sent to the model skip one already
-  stored; real encoders write about 10. Avatar uploads apply the same limit.
-- **A rotated photo with unusual EXIF gets an upright thumbnail and reaches the model upright.**
-  Turning a picture by its EXIF orientation also rewrote the rest of its EXIF, which failed when
-  another entry was stored in an unexpected type: the photo got no thumbnail and was sent to the
-  model sideways. Thumbnails, images sent to the model and avatar uploads now read the orientation
-  tag directly, from the EXIF a JPEG, PNG or WebP carries ahead of its pixels, as browsers do for
-  JPEG and PNG. An orientation stored only in XMP, in a PNG's text or after its pixels, or as
-  anything but one whole number, no longer turns the picture, so the thumbnail and the model's copy
-  match what the browser shows.
-- **Pictures in a conversation are no longer decoded again on every turn.** Each send rebuilds the
-  request from the stored pictures: every PNG without EXIF before its pixels was decoded to look for
-  an orientation tag after them, and every rotated photo was decoded, turned and re-encoded, tens of
-  milliseconds per picture on every turn. An upright picture is now sent without a decode, and the
-  server keeps each rotated photo's turned copy.
-- **Creating a session with several attachments says which file it refused.** The create stops at
-  the first file it can't take, and the error didn't say which one; it now starts with that file's
-  name. The console's session launcher, which showed any refusal as a generic error, now checks the
-  files itself and shows the same message.
-- **Thumbnails of large photos take a fraction of the time and memory.** A JPEG now decodes at the
-  smallest scale that still covers its thumbnail, so a 12-megapixel photo takes about 30 ms and
-  1.5 MB instead of 60 ms and 95 MB, which adds up when a new session's ten photos all ask for
-  theirs at once.
-- **The rail's user chip keeps your name after a session refresh (#997).** The refresh response
-  carried no name, so the chip fell back to "account" until the page reloaded. Login and refresh now
-  return the display name and avatar as whoami does. The chip's old two-letter initials also broke
-  on names starting with an emoji, punctuation or ß; the one-letter avatar replaces them.
-- **Local PDF processing works on macOS.** macOS refuses the address-space limit the PDF worker sets
-  on itself, so every local PDF text extraction, page render and thumbnail there failed. The parent
-  now samples the worker's physical memory footprint every 10 ms and stops it above 384 MiB. This
-  sampled threshold can be exceeded between checks; the worker's CPU, file-size and core-dump limits
-  still apply. Linux keeps its kernel-enforced address-space limit and existing polling behaviour.
-- **Closing a model client mid-stream no longer leaves the stream hanging.** A model-registry reload
-  closes each provider's SDK client while a turn may still be streaming. The blocked read was left
-  waiting for the server's next byte on Linux and for the full read timeout on macOS, up to ten
-  minutes. Turnstone's SDK clients now shut each connection down before closing it, so the blocked
-  read fails at once with the retryable transport error that stream recovery already handles, on
-  every platform. (#1350)
-- **A host that can't run the PDF worker says so.** On macOS, which refuses a finite address-space
-  limit, on any host whose sandbox blocks `setrlimit`, and on a host where the worker's temporary
-  directory can't be created or the worker can't start, every PDF that needed local processing was
-  reported as having exceeded the safety limits. Models without native PDF input are now told that
-  local PDF processing isn't available on this host, `web_fetch` returns the same error, and a
-  server-log warning names the step that failed. The worker still never touches the PDF in those
-  cases, and models that take PDFs natively are unaffected. Inside the worker, running out of file
-  descriptors or processes is now reported as a limit rather than as an unreadable PDF. A temporary
-  directory that can't be cleaned up no longer hides the error that stopped the work, and a worker
-  cut off by a deadline or cancellation is killed before its temporary directory is removed; killing
-  it after could leave a `turnstone-pdf-*` directory behind.
-- **The model form no longer saves a hidden thinking mode (#1366).** The Thinking mode field shows
-  only for the two compatible providers, but every save wrote its value back for any provider, and
-  editing a definition moved a stored `thinking_mode` out of the raw capabilities JSON into that
-  hidden field: a value left there after switching provider was saved, and a stored one could not be
-  seen or removed. The field, and the effort annotations it feeds, now apply only on the compatible
-  lanes; on other providers `thinking_mode` stays in the raw capabilities JSON. The effort
-  annotations now also follow the capability tiles, as a save does.
-- **Claude Haiku 5.5 requests rejected (#1362).** `claude-haiku-5-5` had no capability row and fell
-  through to the default Anthropic row, which then described models that take a thinking budget.
-  Any configured reasoning effort sent `budget_tokens`, which this model rejects with a 400, and
-  with no effort set a configured temperature was sent, which it also rejects. With no effort set
-  the model still thinks by default, so with reasoning replay enabled, on Anthropic organizations
-  created on or after 2026-08-31, a replayed thinking block whose earlier conversation had since
-  changed, for example after compaction, failed the whole request with a 400. A model definition
-  left on auto-detect also ran with the 32,768-token fallback context window instead of 1M, and tool
-  search ran client-side instead of through the API's search tool. The model now has its own row:
-  adaptive thinking, the documented `low` through `max` effort ladder (left unset, the model's own
-  default, `medium`, applies), no temperature, the API's tool search, and the binding control, so a
-  thinking block bound to a changed conversation is dropped server-side, unbilled, and the request
-  proceeds. Like Opus 5.5 and Sonnet 5.5, it also receives operator notes as native mid-conversation
-  system messages. A Haiku 5.5 model definition whose window was saved as 32,768 from the Models
-  tab's Detect result keeps that value until it is set to 0 (auto-detect) or 1,000,000.
-- **A model definition saved with a non-string `api_key` or `base_url`, JSON `null` included, is
-  refused.** The console stored the value's text (`None`, `False`, `123`) and sent that as the key
-  or URL; it now answers 400.
-- **A model key follows the rule a `secret://` key does.** One trailing line break is dropped, so a
-  key read from a file works wherever it is written: a model definition, a config.toml `[models.*]`
-  entry (after `${VAR}` expansion), the CLI's `--api-key`, `[api] api_key` or provider key variable,
-  and the provider SDK's own variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-  `ANTHROPIC_AUTH_TOKEN`) that a model with an empty key uses, as the compose and Helm setups do. A
-  key an HTTP header still cannot carry is refused, and so is one that was only a line break or
-  written without quotes in config.toml; such a key failed every request or, depending on the
-  provider, was sent. The message names where the key came from, never the key: a model definition
-  or `[models.*]` entry is skipped and named with the reason, the CLI's own key stops the CLI at
-  startup, a provider variable fails the models that use it when their client is built, and the
-  console's Detect and Re-calibrate and `turnstone-admin rerank-calibrate` refuse the key.
-  turnstone-doctor's backend check, given no key, sends a placeholder rather than the provider
-  variable.
-- **The MCP Servers list shows connect errors again (#1328).** Since the node status read stopped
-  carrying error text, a server that failed to connect showed **idle**, and a newly saved one
-  showed **connecting** forever. The list marks a failing server as **error**, and admins
-  (`admin.mcp`, with the approve scope) see the reason on each node; read-scope dashboards and
-  read-only tokens still see only `has_error`.
-- **A saved MCP server whose first connect fails stays registered (#1328).** It used to be dropped
-  until the next save or reload, even after the server came up. It now keeps its error in its status
-  and the health loop retries it, as it does a server that fails at startup; disable or delete the
-  server to stop the retries. With the health check turned off, every reload, including the one
-  each save starts, retries the database's servers that are not connected instead.
-- **An open dialog no longer covers the sign-in screen (#1332).** A dialog left open when a session
-  expired or someone signed out, here or in another tab, stayed on top of the sign-in screen,
-  readable, and the sign-in form took no input until it was dismissed. Showing the sign-in screen
-  now closes any open dialog, as dismissing it would, so a newly created token still on screen goes
-  with it. Shelves stay open behind the sign-in screen, and Escape pressed in its form no longer
-  closes one.
-- **Typing in the sign-in form, dialogs and shelves no longer lags.** The sign-in screen, the
-  backdrop behind a modal dialog, the scrim behind a pane's shelf and the keyboard-shortcuts overlay
-  blurred what lay behind them, and the browser redraws that blur over the whole area on every frame
-  in which anything changes, each keystroke included. On a HiDPI display with software rendering,
-  typing in the sign-in form fell to about 8 frames a second. They now dim with a plain tint. The
-  sign-in screen is opaque: it also opens over the conversation when a session expires or after a
-  sign-out, and without the blur that conversation showed through.
-- **A reopened workstream keeps its skill (#1292).** Reopening, forking or copying (`/new`) a
-  workstream created with a skill dropped the skill's name and put its saved text, unrendered, in
-  the cached system prompt that task agents inherit: `$ARGUMENTS` and `${TURNSTONE_*}` stayed
-  literal, `/skill` reported no skill, and the next save erased the name. A skill switched or
-  cleared after creation also came back on reopen. The skill now keeps its name and renders like any
-  named skill, with the text it had at creation even after the skill is edited, renamed, disabled
-  or deleted: disabling or deleting a skill only keeps it out of new workstreams. That covers
-  workstreams created through a node's create API (the console's interactive launcher, the API,
-  schedules, channels and coordinator spawns); coordinators created from the console launcher, CLI
-  `--skill` sessions and skills loaded mid-conversation are looked up by name on reopen (#1312,
-  #1320). A switch or clear survives a reopen. `skills(load)` of a skill that was missing when the
-  session loaded it now applies the skill once it exists, where it answered that the skill was
-  already active.
-- **`skills(find)` ranks past the first page (#1292).** A query ranked only the first page of skills
-  in storage order (100 by default), so a better match past it was never found, and it returned at
-  most 50 rows whatever its `limit`. It now ranks up to 500 filtered skills and returns up to
-  `limit` of them (50 by default with a query).
-- **MCP shutdown stops the work callers wait on.** Shutting down the MCP client left work that a
-  caller was waiting on running, so the caller waited out its own timeout (two minutes for a tool
-  call, forever for adding a server), and garbage collection later closed the abandoned work on
-  whatever thread it ran, reporting "Exception ignored" errors. Shutdown now cancels that work and
-  closes every MCP server connection under one 20-second deadline, which keeps MCP shutdown within
-  a 30-second stop budget, and each waiting caller gets "MCP client is shutting down" at once. A
-  server that never answers the request ending its session gets 3 seconds, so it can no longer
-  hold a connection open through shutdown. A tool call stopped mid-flight is recorded with an
-  unknown outcome, because it may already have reached its server; a shutdown never counts
-  against a server's circuit breaker.
-- **An MCP server removed while a reconnect waited stays removed.** An operator reconnect, or the
-  startup pass that connects every configured server, could wait behind a server's removal and
-  then connect it again from the config it had read, so the removed server's tools stayed in use
-  until the next restart. Both now skip a server removed while they waited. A reload that added or
-  removed a server while the startup pass was still running also stopped the pass, which skipped
-  the remaining servers and never started the health checks that reconnect a dropped server; the
-  pass now reads each server's config when it reaches that server.
-- **Saved sessions list all stored history (#1268).** The saved list returned at most the 50 newest
-  sessions of each kind that the caller could see, without a total, so the dashboard's pager and
-  search never reached older sessions. It now pages through every session the caller may see, with
-  an exact total. A coordinator left behind by a console that crashed or restarted appears once its
-  owner lease expires (within 30 seconds), instead of only after the idle timeout closed it, or
-  never when the idle timeout is 0. Closing a session, by hand, at its idle timeout or in cleanup,
-  no longer stamps it as just updated, so it keeps its place in the list instead of jumping to the
-  top (see the change to `updated`); sessions closed before this release keep the time stamped
-  then. On PostgreSQL the list's latest-usage lookup could scan every newer usage event for each
-  session (over a second for a few hundred sessions); migration 079's index makes it a short index
-  scan.
-- **Saved lists keep their NAME column, and empty states are legible (#1268).** The dashboards'
-  saved tables dropped columns by the window's width, so beside the side rail or in a split pane
-  NAME could shrink to nothing (at a 1024-pixel window on the console); they now go by their own
-  width and drop one lower-value column at a time until NAME has 200 pixels: ID first (whenever
-  NAME would have less than 280), then the message or children count, PERSONA, PROJECT, MODEL and
-  the console's KIND, keeping the sorted column for last; if even that one goes, the footer names
-  the order. A long name and its skill chip share the cell, the chip names its skill on hover and
-  the row's accessible name includes it, and cut-off text keeps a gap before the next column. The
-  header's search box and Delete move to their own row when they no longer fit beside the title,
-  the search box narrowing as far as it must so Delete is never pushed out of view; in a narrow
-  pane the pager drops below the count instead of squeezing it; Retry says so while it works; and
-  the CTX column no longer goes blank on phones. Empty and error messages in both apps lost an
-  extra opacity that put them below WCAG AA contrast.
-- **The output-guard judge gets its model's output budget (#1291).** The LLM stage capped every
-  verdict at 512 tokens, and the cap counts reasoning as well as the answer, so a thinking model
-  could spend it before writing the verdict; the verdict was then dropped and only the regex stage
-  stood. The cap is now the guard model's own: the alias's `max_tokens`, else the `model.max_tokens`
-  setting (32,768 by default), never above the model's advertised maximum output, and fitted to the
-  context window the prompt leaves. A change to `model.max_tokens` reaches the judge without a
-  restart. To size its prompt against the window, the judge now counts each ASCII digit as a token,
-  text outside ASCII by its UTF-8 length and a dense base64-like run (mixed case, with a digit) at
-  0.6 tokens a character, then allows for up to 1.4 times that count: numeric output such as JSON,
-  CSV or logs ran up to 3.5 times the old character estimate, Chinese, Japanese, Korean and base64
-  text up to 2.4 times, and a server such as vLLM refuses a request whose prompt and cap together
-  exceed the window. With an effort resolved for the guard, a model that takes a fixed thinking
-  budget, as some of Anthropic's do, now thinks on every judged result, at temperature 1.0; the 512
-  cap left it no room to. A judged result can now use up to the cap and take up to
-  `judge.output_guard_llm_timeout`; a smaller `max_tokens` or a lower effort on the guard's alias
-  bounds both.
-- **A failed request no longer strands a web search (Anthropic).** When the model called web
-  search alongside another tool, the API held the search back until the next request. If that
-  request failed (an exhausted credit balance, say) and a new message followed, every later request
-  was rejected (`web_search tool use with id ... was found without a corresponding
-  web_search_tool_result block`) and the workstream could not continue. Such a search is now sent
-  back with the API's own `unavailable` error, so the model sees that it failed and can search
-  again in a later turn. A mid-turn compaction that kept a reply opening with a search result, but
-  summarized away the search that produced it, no longer breaks the workstream either.
-- **Native tool search keeps working after its first round (Anthropic).** The search's result was
-  left out when the conversation was sent back, so the API rejected every request from the second
-  one after a search onward and the workstream could not continue. The result is now passed back
-  unchanged, and workstreams already stuck this way continue. A tool that a search found but a
-  later request no longer offers, for example because its MCP server is offline, is offered as no
-  longer available, since the API rejects a request whose history names a tool it does not have.
-- **A saved workstream with no messages keeps its settings.** Opening one (from a pane, and now
-  also `--resume` and `/resume`) applied the constructor's defaults instead of its saved model,
-  sampling, instructions and skill, and the next settings change wrote those defaults over the
-  saved ones. It now opens with its saved settings.
-- **The model keeps its own searches in its history (OpenAI).** Replayed history left out the web
-  searches and tool searches the model ran itself, so it searched again for tools it had already
-  found. Both now replay where they ran, and a call to a tool that a search loaded carries the
-  namespace the API requires for it. A replayed web search shows the model its query or the page
-  it opened, not the results, which the API does not take back. Compatible endpoints and xAI
-  replay as before. A workstream that searched misses the prompt cache once, on its first request
-  after the update. One that searched again for tools it had already found resends each of those
-  searches, with the definitions it loaded, until it compacts.
-- **A refused tool call says the tool is not available, not "Unknown tool" (#1287).** Tools can
-  leave a session mid-conversation: an MCP server drops one or goes away, or another user sends on
-  a shared workstream, whose tools follow the sender. When the model called one, it was told
-  "Unknown tool" and to use a listed name exactly, and the operator saw "Model called unknown
-  tool", as if the model had made the name up. Both now say the tool is not available now, and the
-  model is told it may have been removed or be misspelled, or, on a shared workstream, belong to
-  another user. The tools that reply lists are the ones the request offers, where it used to name
-  every built-in tool, including coordinator tools in a regular session, tools a persona hides and
-  tools an operator revoked. With tool search on, it lists the tools offered outright and says more
-  may be found by searching, and a task agent sees its own tools.
-- **A storage error while opening a workstream no longer replaces its saved settings.** Building the
-  session saves its defaults when no settings are saved, and a read that failed counted as none
-  saved, so one failed read could overwrite the saved model, sampling, instructions and skill. That
-  open, or a create that hits the same failure, now answers 503 and can be retried.
-- **Warning toasts look like warnings.** Ten warning toasts in the shell, the node UI and judge
-  verdicts asked for a style the toast component does not have and fell back to the neutral one;
-  they now use the warning style.
-- **Hosted search for Astra (#1191).** The capability table now enables native web search
-  when the session offers `web_search`, without requiring a model capability override.
-- **Chat search usage no longer inflates replay context (#1191).** Requests with hosted search use
-  the local context estimate instead of anchoring on billed input that includes search results,
-  including automatic search without explicit search options. Text calibration remains unchanged.
-  Automatic search also marks the request as using native tools, preventing an automatic replay of
-  an accepted response.
-
-- **Stream cleanup after callback failures.** Chat and Responses adapters close the underlying
-  SDK response when a local chunk callback interrupts generation, preserving the original error.
-
-- **MCP catalogs are read past their first page (#1225).** A server that paginates its tools,
-  prompts, resources or resource templates had only its first page published, on connect and on
-  refresh, for shared and per-user servers alike. Each list is now followed to its last page,
-  within the existing per-server cap of 1,000 entries, which still truncates with a warning. An
-  entry listed twice is published once. Empty pages that still point onward are read past. The
-  walk also stops, with a warning, when the server repeats a cursor, sends ten pages in a row
-  with nothing new, or answers a later page with a JSON-RPC error; it keeps the pages already
-  read, so a catalog is never published shorter than its first page.
-
-- **MCP HTTP failures release waiting calls promptly (#1223).** Shared and per-user connections
-  capture upstream HTTP status before the SDK loses it. A 5xx counts against the circuit breaker;
-  a 404 on a held session causes reconnection on the next call. HTTP 401/403 failures remain
-  breaker-neutral, including shared connections, and per-user auth refresh and consent handling
-  are preserved. Tools, resources, and prompts also stop waiting when their transport owner exits.
-  Caller deadlines and protocol errors returned with HTTP 200 remain breaker-neutral.
-
-- **A malformed MCP tool no longer sets off a reconnect loop (#1224).** The MCP SDK rejects a
-  server's whole tool list when one entry fails its validation, such as a tool with no
-  `inputSchema`, so that server publishes no tools; keeping the valid ones would need SDK
-  internals. The server's status now names the entry and the field (`InvalidCatalogError: MCP
-  server 'docs' lists an invalid tool 'search' at tools[1].inputSchema: Field required`), and so
-  does each user's status for a per-user server. The failure no longer counts against the circuit
-  breaker. A shared server stops offering the tools, resources and prompts from its last good
-  connect (its prompts' templates are removed until it recovers), and is retried every five
-  minutes instead of on the reconnect backoff of up to a minute; an operator reconnect still
-  retries at once. A refresh that meets a malformed entry keeps the last good catalog and is
-  retried like any failed refresh. A malformed entry on a later page fails the same way instead
-  of cutting the catalog short, and a tool result that does not match the protocol's schema no
-  longer counts against the breaker either. A shared server's status also shows why a reconnect
-  failed, where before it showed only a failure at startup.
-
-- **Processes started by a stdio MCP server no longer outlive it (#1226).** A server that
-  started a helper process and then exited cleanly when its stdin closed left the helper
-  running, so every reconnect, reload, removal or shutdown leaked another. Once a stdio
-  server's connection has closed, whatever remains of its process group gets SIGTERM, then
-  SIGKILL after one second; the server itself keeps its usual window to shut down. Containers
-  now reap the stopped helpers; see the container init change above.
-
-- **Shutdown no longer deletes MCP prompt templates (#1146).** A catalog refresh still waiting
-  on a reconnecting server when Turnstone shut down could finish during cleanup, after shutdown
-  had emptied the prompt catalog, and delete every MCP-sourced prompt template; the next sync
-  recreated them as new rows. A refresh abandoned at shutdown no longer syncs when cleanup
-  finishes it, and no prompt-template sync runs once shutdown starts emptying the catalog.
-
-- **Watch output is delivered as tool data (#1235).** Watch notices carry metadata and a
-  `watch(action="read", name="<watch id>")` hint. Command output and condition exception details
-  are returned through the normal tool-result path and its configured output guard, rather
-  than entering model context with operator authority. The watch-result card still shows the
-  output, and completed watches remain readable by name or ID. Delivered snapshots remain
-  readable in forks and after compaction or checkpointed resume, even if the terminal poll
-  update failed or the source was compacted before forking.
-
-- **Web UI typography.** Locally served font subsets retain the requested stylistic
-  features, real italics and the 800 weight used by attention chips. Bundled symbol
-  fallback and information icons give interface marks consistent shapes across platforms (#1231).
-
-- **GPT-6 effort changes preserve the cached prompt prefix (#1246).** Supported standard
-  Responses requests keep request-level effort at its initial value and replay later changes
-  as `configuration_update` input items. Accepted turns record their resolved effort, so
-  resume and fork preserve update positions; compaction starts a new baseline. Pro mode,
-  requests with sampling parameters, compatible endpoints, and a return to an unknown server
-  default retain request-level effort.
-- **`THIRD-PARTY-NOTICES` lists the versions the package ships.** Its KaTeX, highlight.js, Mermaid
-  and hls.js sections named older versions than the vendored files, because the update script
-  rewrote version references only in source files and every bump left the notices behind. The
-  headers now read KaTeX 0.18.10, highlight.js 11.12.0, Mermaid 12.0.0 and hls.js 1.7.3, and each
-  section reproduces the license file shipped with the library, which restores the Brightcove
-  copyright notice that the hls.js license carries for code derived from videojs-contrib-hls. The
-  update script now rewrites the notices header on each bump, and tests fail when any
-  version-named directory under `shared_static/`, fonts included, lacks a section whose header
-  names its version and which reproduces or names its `LICENSE` file.
-- **GPT-6.1 Sol requests built from generic defaults.** `gpt-6.1-sol` had no capability row, and its
-  dotted version matched none of the GPT-6 rows, so it fell through to the default OpenAI row: a
-  configured reasoning effort was dropped, a configured temperature was sent although the model
-  always reasons and its guide says to remove sampling parameters, a model definition left on
-  auto-detect ran with the 32,768-token fallback context window instead of 1.05M, output was capped
-  at 64K instead of 128K, and the model was treated as unable to see images. It now has a row with
-  the documented `low` through `max` effort ladder (no `none`) and default `medium`, no temperature
-  at any effort, vision, PDF input, and tool search, and the 30-minute `prompt_cache_options`
-  lifetime now covers GPT-6 point releases as well. A GPT-6 model definition whose window was saved
-  as 32,768 from the Models tab's Detect result keeps that value until it is set to 0 (auto-detect)
-  or 1,050,000.
-- **Native mid-conversation system messages rejected after a wake or approval feedback.** On Claude
-  models that take operator notes as native mid-conversation system messages (Opus 4.8, Opus 5 and
-  5.5, Fable 5 and 5.1), an idle wake, such as a finished watch, background shell or child, sent its
-  note right after the assistant's turn, and feedback typed with an approval after an advisory put a
-  user message right after the note. The API rejects both with a 400, and because the note stays in
-  the history, every later request in the workstream failed the same way. The Anthropic request now
-  places such a note after the user turn that follows it, or behind a short placeholder user turn
-  when it would otherwise follow the assistant's turn.
-- **Claude Sonnet 5.5 requests failing after a history edit.** `claude-sonnet-5-5` had no capability
-  row and resolved to the Sonnet 5 row, so its requests never opted into the degrade mode for
-  thinking bound to the conversation prefix. With reasoning replay enabled for the model, on
-  Anthropic organizations created on or after 2026-08-31, a replayed thinking block whose earlier
-  conversation had since changed, for example after compaction, failed the whole request with a 400,
-  and retries failed the same way. The model now has its own row and sends the binding control, so
-  such blocks are dropped server-side, unbilled, and the request proceeds. Unlike Sonnet 5, and like
-  Opus 5.5 and Fable 5.1, it also receives operator notes, such as nudges and messages the user
-  queues mid-turn, as native mid-conversation system messages.
-- **Small models looking for an attached file on disk.** A text attachment reached the model as
-  a bare document block after the user's message, with nothing saying it was the file the user
-  named or that it was not in the workspace. Small local models answered "summarize notes.md" by
-  calling `read_file` on the name, searching the workspace, and reporting that the file does not
-  exist, and in chat offered to create it. Each attached text file (a long paste included) is now
-  introduced by a label naming it and saying attachments are not saved to disk, and `read_file`
-  on a missing path named like an attachment says the user attached that file and points at their
-  message instead of the filesystem.
-- **GPT-6 Sol and Luna requests built from generic defaults.** `gpt-6-sol` and `gpt-6-luna` had no
-  capability rows and fell through to the default OpenAI row: a configured reasoning effort was
-  dropped, a configured temperature was sent while reasoning ran at the server default, which the
-  models' guide says to remove, a model definition left on auto-detect ran with the 32,768-token
-  fallback context window instead of 1.05M, output was capped at 64K instead of 128K, and the models
-  were treated as unable to see images. Both models now have rows with the documented `none` through
-  `max` effort ladder, temperature only at effort `none`, vision, PDF input, tool search, and the
-  30-minute `prompt_cache_options` lifetime.
-- **Claude Opus 5.5 requests failing after a history edit.** `claude-opus-5-5` had no capability row
-  and resolved to the Opus 5 row, so its requests never opted into the degrade mode for thinking
-  bound to the conversation prefix. On Anthropic organizations created on or after 2026-08-31, a
-  replayed thinking block whose earlier conversation had since changed, for example after
-  compaction, failed the whole request with a 400, and retries failed the same way. The model now
-  has its own row and sends the binding control, so such blocks are dropped server-side, unbilled,
-  and the request proceeds.
-- **Context gauge after a server-side tool loop.** When the model ran several web searches inside
-  one response, the provider's closing usage reported billing totals summed across its sampling
-  passes, and the session took them as its context size. On the Anthropic lane a four-search turn
-  reported three times the real figure: the status bar showed it, the token estimate was calibrated
-  on it, a tool result was dropped for an exhausted budget, and a two-message conversation was
-  compacted. On the OpenAI Responses lane hosted search reported twice the real figure. Adapters now
-  report what the request carried and what the server appended, and flag cumulative counters; one
-  shared rule turns that into the context anchor and the calibration denominator for the session,
-  task agents, and the agent context badge. Reported cache reads still feed the usage records.
-- **Context estimate on the turns after a server-side search.** The search results the provider
-  appends to a response are replayed to it on every later request as opaque blocks the character
-  measure cannot see, so from the next turn on the estimate was calibrated about 2.3 times low: new
-  text and tool results were over-estimated by that factor, tool results were cut at less than half
-  the intended ceiling, and the shrinkage lasted until compaction removed the results. The assistant
-  turn now records the provider's own count of what it appended, the accepted turn is charged its
-  completion count plus that count, the estimate charges it like the fixed image charge, only toward
-  the provider that replays the lane, and a request that carries such a charge is not a calibration
-  sample, so the ratio keeps its value, the default if nothing had calibrated it yet, until
-  compaction removes the lane or another provider family serves a request; a model switch to another
-  provider, which rebuilds the turn from its text, charges nothing. The count is persisted with the
-  turn and survives reopen and fork; it is refused above the lane's own window, and a lane whose
-  window nothing names records nothing, so a broken usage report cannot poison a workstream. A turn
-  under reasoning replay off is over-charged by the thinking the provider fed back into its own next
-  pass, bounded by its completion count. A compaction whose estimate did not shrink is logged with
-  both figures and the ratio, beside the marker the card already shows.
-- **Task-agent reply with no output count.** A task agent's reply whose provider reported no output
-  token count is now charged from its text, the rule the session's own accepted turn already
-  applied, instead of a single token, so the agent's context estimate no longer runs low after such
-  a reply.
-- **Incomplete task results and perception fallback.** Failed task completions now report an
-  error, with any earlier partial work explicitly labelled incomplete. Optional perception
-  memoizes a model that produces no description for the same binding generation and gives
-  backend or local failures a 60-second cooldown, so neither repeats attachment processing on
-  each send while a failed backend can still recover afterward.
-- **Context-window stop reason.** A response that ends with Anthropic's
-  `model_context_window_exceeded` stop reason was persisted as a clean completion, with no warning
-  and no compaction. It now surfaces as the same context overflow an over-long request already
-  produces, so the conversation is compacted and the turn retried for a complete answer.
-- **Console forms on narrow panes.** The rule that collapses two-column form rows to one column
-  on a narrow pane never applied: it was declared above the base rule it needed to override, and a
-  container query adds no specificity. It now sits after it, so a tight split or a phone-width
-  pane gets one column with an even rhythm between fields, and the model editor's provenance line
-  wraps as a sentence instead of shredding the model id. Capability tiles stay two-up.
-- **Label hints in the dark theme.** The small hint next to a form label was dimmed below the
-  4.5:1 contrast floor; it now renders at full opacity in both themes, and the explanatory notes
-  that stand on their own keep a subordinate size and colour instead of inheriting body text.
-- **MCP OAuth consent return URLs.** Malformed URLs no longer abort consent; the callback
-  falls back to the home page when the return URL contains invalid ports or brackets.
-- **MCP submissions during shutdown.** Pool priming, catalog eviction and static server
-  reconnection tolerate the loop closing between admission and scheduling. Rejected coroutines
-  are closed, and reconnection reports its normal failure instead of an internal attribute error.
-- **Per-user MCP OAuth refresh.** Discovery and refresh requests now use their owner's HTTP
-  client, preventing cross-loop failures after browser sign-in.
-- **OAuth cancellation and shutdown.** Cancelled requests settle started token writes before
-  releasing their runtime locks. Bounded shutdown tracks advisory-lock workers, and unavailable
-  runtimes return transient/no-token results without revoking grants or changing backoff.
-- **Judge spend in the usage records.** The intent judge and the output-guard judge ran their
-  model calls outside the auxiliary accounting that titles, compaction summaries, web-fetch
-  extraction, and task agents use, so their tokens reached neither the usage records nor the
-  node token metrics. Both judges now record every completed model call under the judge's own
-  model, which is the configured judge alias's model when one is set. Like the other auxiliary
-  calls, judge calls do not move the live context gauge of the workstream they run for.
-- **The dashboard keeps one HTTPS certificate across restarts.** A browser sends no server name
-  when it dials an IP address, so Caddy named the certificate after its container's Docker
-  address, which changes whenever compose recreates the container, and issued a new one each
-  time; every certificate also expired after 12 hours. Such connections now get one certificate
-  for `127.0.0.1`, and each certificate Caddy issues for the dashboard and the SearxNG UI is valid
-  for a year and kept in the `caddy-data` volume, so the certificate a browser accepted stays the
-  same. Caddy reads its Caddyfile only when it starts: re-running `run.sh` now restarts it, and
-  otherwise run `docker compose restart caddy`. Certificates already issued are replaced as they
-  come due. Caddy also closes open dashboard streams within 5 seconds when it stops; before, a
-  restart with the dashboard open waited out Docker's 10-second stop timeout and was killed.
-- **`attention` now means someone must decide (#1325).** Every tool batch moved a workstream to
-  `attention` before the approval gate ran, so dashboards and the CLI's workstream list flashed it,
-  and a coordinator's child tree announced "Approval required", for calls that needed no approval
-  or that a tool policy, an "Always" grant or auto-approve then settled. The gate now moves the
-  workstream only when the batch waits on the judge (`evaluation`) or on a person (`attention`): an
-  approval card, the CLI's prompt, or a background CLI workstream holding a batch until it is
-  brought forward.
-- **A task agent waiting for approval shows the workstream as needing attention (#1338).** A task
-  agent's tool call waiting for a person left the workstream in `running`: the sidebar and the
-  conversation tabs stayed green, the dashboards and the CLI's workstream list showed it running,
-  and a background CLI workstream rang no bell. The workstream now enters `attention` while any
-  task agent's call waits for a person (`evaluation` while one waits on the judge in a Smart
-  Approvals wait), as it does for the main loop's calls, and goes back to `running` when the last
-  waiting call is resolved.
-- **A background CLI workstream waits only for tool calls that need a person (#1342).** Its
-  approval gate held every tool batch until the workstream was brought forward, before tool
-  policies and auto-approve had run, so calls that need no approval and calls that a policy, an
-  "Always" answer or `--skip-permissions` settles waited too. A batch they settle now runs at once.
-  No current CLI flow makes a gate wait in the background, since the CLI runs each turn in the
-  workstream in front.
-- **CLI output no longer prints over the workstream in front.** The intent judge keeps working
-  after a call is approved, so a verdict could land after a switch to another workstream and print
-  over its prompt. A background workstream now keeps its judge verdicts, tool errors, output
-  warnings, task-agent steps and operator messages with its buffered output, shown when you switch
-  back to it (tool errors on stderr); before, its tool errors were dropped and the rest printed over
-  the workstream in front. In front, a tool error now prints at once even while a task agent's
-  approval prompt is open, instead of waiting for that prompt's answer.
-- **The first Ctrl-C stops a parallel batch in the CLI.** During a batch of tool calls run in
-  parallel (several task agents, say), the first Ctrl-C waited for every call to finish, and a
-  second ended that wait but left the calls running, out of sight. The first Ctrl-C now stops the
-  batch as Stop does: running commands are killed, task agents stop, every intent judge still
-  running in the workstream stops (late verdicts are not shown), and calls that had not started
-  are recorded as not run; the turn then ends as interrupted. A call that cannot stop part-way (an
-  MCP call, a web search, a page still downloading) still runs until it returns or times out.
-  Ctrl-C reaches only the main thread, so an approval prompt already open on a task agent's thread
-  still takes the next line typed: that answer is not used, and the CLI says so.
-- **Smart Approvals hands a batch to a person sooner (#1325).** The verdict wait ends as soon as
-  one verdict rules the batch out (a `review` or `deny`, a judge error, or a confidence below the
-  threshold), instead of waiting for every verdict, and a batch with a call the heuristic rules
-  flagged `deny` or `critical` skips the wait, since no verdict can clear it. The approval card
-  appears sooner; verdicts still arriving fill it in. A verdict another judge run left for a reused
-  call ID no longer ends the wait early: only the batch's own verdicts count.
-- **A node's workstream list in the console puts running workstreams first.** It ranked running
-  workstreams below idle ones, the opposite of the cluster API's `sort=state`, so on a long list
-  they fell off the first page.
-- **Images with transparent areas are flattened when they are attached (#1445).** A PNG or WebP went
-  to the model with its alpha channel, which vision models can't take, so each provider removed it
-  its own way: filling transparent areas with white or with black, or dropping the channel and
-  showing whatever colour the transparent pixels stored. White text on a transparent background
-  vanished wherever transparency became white, and dark text wherever it became black. An uploaded
-  image, and an image `read_file` returns, now has its transparent areas filled with white, black or
-  mid grey, whichever the content's edges stand out on most (mid grey when they are both light and
-  dark), and is stored that way: its preview and download show the flattened image, and every model
-  is sent the same pixels. The stored copy keeps the image's format, colour profile and kind of
-  colour (palette, grey or full colour), and a lossless WebP stays lossless. Images over 8.4
-  megapixels, animated images, colour-keyed PNGs that aren't 8-bit, and any image whose flattened
-  copy would outgrow the 4 MiB image cap are stored as uploaded. A process flattens one image at a
-  time, so a burst of uploads queues instead of flattening all at once; an image whose header
-  declares no transparency skips the queue. The queue has no length limit, and a workstream create
-  waiting its turn holds its workstream slot. On a node, rate limiting (`ratelimit.enabled`: per
-  signed-in user, off by default) bounds how fast one user can add to the queue; the console's
-  coordinator uploads, open only to coordinator admins, have no rate limit. Images already in a
-  conversation are left as they are, so it keeps sending what it sent and its history and cached
-  prompt prefix don't change; attach such an image again to have it flattened.
-- **`web_fetch` refuses images and other binary content instead of extracting from it (#1452).** A
-  fetched body that wasn't a PDF was decoded as text, and an image's bytes decoded to characters
-  that were largely replacement characters: a 23 KB JPEG became 22,395 characters, 10,883 of them
-  U+FFFD. The result wasn't empty, so the extraction model was asked about it and answered from the
-  noise or made an answer up. `web_fetch` now returns an error naming the content's type and size
-  (for example `an image (image/png, 3,081 bytes)`) and makes no extraction call. A PNG, JPEG, GIF
-  or WebP image is recognised by its bytes; other content is binary when the first 8,192 characters
-  of its decoded text hold a NUL character. The error names the media type the server declared
-  when it is well formed. UTF-16 text still reads as text when it declares its byte order
-  (`utf-16le` or `utf-16be`), and when it starts with a byte order mark, which now outranks the
-  declared charset, as in browsers. A page served with its `Content-Type` in capitals, such as
-  `text/HTML`, now has its markup stripped like any other. A PDF that begins with the PDF header
-  is handled as before; one with bytes before its header, which was never recognised as a PDF, is
-  now refused as binary when its first 8,192 characters hold a NUL, as compressed content nearly
-  always does, instead of being decoded as text.
-- **A coordinator's task list survives a storage read that fails during a `tasks` call (#1416).**
-  A task add after a failed read saved its one task over the stored list, and a reorder with no
-  ids saved an empty list; an update or remove answered "task not found" and a list answered that
-  there were no tasks. Every `tasks` action now tells the model that the stored list couldn't be
-  read and nothing was changed, and to retry. The tasks pane's read answers 503 when it fails, so
-  the pane keeps the list it last showed instead of emptying. A list nested too deeply to parse
-  now reads as corrupt, like any other unparseable list: the pane shows it empty and changes to it
-  are refused.
-- **A server node no longer reports a workstream it can't read as missing.** A node route that
-  checks access to a workstream, such as its history, close or send, answers 503 with the code
-  `workstream_unreadable` instead of 404 "Workstream not found" when it has to read the
-  workstream's row and the read fails. Slack and Discord took that 404 for an already-closed
-  workstream and unlinked the channel; they now report the error and keep the link. The console's
-  route proxy tries the node that holds the workstream on the coded 503, as it does on a 404. When
-  that retry can't refresh the cluster's membership or resolve the workstream's route, the proxy
-  answers 503 instead of passing on a 404 it couldn't check. A failed membership read there, or on
-  any routed request while the console knows no live node, answers 503 instead of a plain-text
-  500. The node's API spec and reference list the coded 503.
-- **Every coordinator route checks a coordinator the same way, an outage included.** The console's
-  coordinator routes share one access check. When a coordinator isn't loaded and its row can't be
-  read, the check answers the same 404 "coordinator not found" as for an id that names nothing, so
-  a storage outage can't be used to tell which ids name coordinators in a private project. The
-  routes coordinators share with other workstreams, such as history, answered that read with a 500
-  before.
-- **Coordinator tools report a failed read instead of a missing or changed child.**
-  `wait_for_workstream` ends with an error to retry when it can't read its children's states or
-  token counts; it used to report them as not among the coordinator's children, or as changed since
-  the caller's snapshot. A send, close, cancel or delete whose ownership check can't read the child
-  answers an error to retry instead of "no workstream matching". When the list of the coordinator's
-  children can't be read, an id that has to be checked against it gets an error to retry, and an
-  error that only shows the list as a hint leaves it out instead of showing it empty.
-  `inspect_workstream` reports a failed read of a child's history, or of a finished child's close
-  reason and last error, as an error to retry instead of an empty history or a child with neither,
-  and a failed read of the child itself now says to retry instead of quoting the storage error. It
-  leaves a child's live token count out when the persisted count can't be read, instead of showing
-  0. A `wait_for_workstream` result for an errored child whose last error can't be read has
-  `message: null`, as for any message the wait couldn't read, instead of the child's last assistant
-  turn. `list_nodes` answers an error to retry when it can't read which nodes are live, instead of
-  offering every node that ever registered, and says to retry instead of quoting the storage error
-  when it can't read their metadata. A stored node value nested too deeply to parse is listed raw
-  instead of failing the whole listing. `close_all_children` reports a reply it can't read as an
-  error instead of "closed 0". That error, and a spawn whose reply carries no ws_id, tell the model
-  to check `list_workstreams` before retrying, since the children may already have changed, and
-  `list_workstreams` says to retry instead of quoting the storage error when it can't read them. A
-  coordinator reopened while its children can't be read no longer takes them for none:
-  `close_all_children` answers an error to retry instead of "closed 0", and a cancel records that
-  it couldn't reach them instead of cascading to nobody.
-- **Other reads that fail say so instead of looking empty.** The coordinator metrics route answers
-  503 when one of its reads fails, where it reported zeros that read as a healthy, idle
-  coordinator. The cluster detail route answers 503 when it can't read the message tail it was
-  asked for, instead of an empty tail. History and export answer 503 instead of 404 when their own
-  row read fails after the access check passed, and history answers 503 when it can't read a saved
-  workstream's settings, where it showed stored reasoning that the model's settings may hide. The
-  coordinator page's tasks and children panes say they couldn't be loaded, instead of "no tasks
-  yet" or "no children spawned yet", until one of their loads succeeds; children that live updates
-  add in the meantime are marked as only part of the list. The cluster node detail route answers
-  503 when it can't read the node's metadata, instead of showing none.
-- **Inspecting a child and checking access on a node cost less.** `inspect_workstream` reads the
-  messages it returns, plus some slack, instead of the child's whole history and its attachments,
-  and asks the console for no message tail it would discard. On a server node, the access check
-  behind send, speech to text and the command route reads the workstream's row in a worker thread,
-  so a slow database no longer stalls every request on the node. The console's create proxy and
-  node detail route read storage in a worker thread too.
-- **JSON nested too deeply to parse is treated as malformed (#1456).** Python 3.13's JSON parser
-  raises `RecursionError` instead of a decode error for input nested about 10,000 levels deep, and
-  3.14 raises it when a thread's stack runs out. Most of the package's parse guards caught only the
-  decode error, so such input got past them: a request body answered a 500 where malformed JSON
-  answers 400, and a stored value, a reply from a node or provider, a command's output or a model's
-  tool arguments failed a read that handles an unparseable one. Every parse guard now treats input
-  too deep to parse as malformed, and a test keeps new guards covered. A stored setting nested too
-  deeply reads as invalid, as a malformed one does, instead of failing a node's startup. A skill's
-  `allowed_tools` that can't be parsed, or isn't a flat list of names, grants no tools: it was split
-  on commas, so a value too deep for one node's parser could grant tools nobody listed. Workstream
-  create, the re-enable approval card, the skill scanner and the skills tool now read it one way;
-  the card says when it can't be read, and a comma-separated value from before the JSON form scores
-  and lists like its JSON form.
-- **Request bodies of the wrong shape answer 400.** Admin token creation read a body it couldn't
-  parse as `{}` and minted a token with the default scopes; it now answers 400, as it does for a
-  body that isn't a JSON object and for fields of the wrong type. That includes a number or boolean
-  token name, which it used to store as text, and an `expires_days` that isn't a whole number of
-  days of at least 1: `false` minted a token that had already expired. Login, first-time setup,
-  admin user creation and the channel notify hook answer 400 instead of 500 for a body that isn't a
-  JSON object or holds a field of the wrong type, and the notify hook's malformed-body error reads
-  "Invalid JSON body". The console reference's token example sends `scopes` as the comma-separated
-  string the API takes.
-- **A request whose reply never came is no longer reported as unreachable.** A coordinator's
-  requests to the console, and the console's proxies to a node, called every transport failure
-  unreachable, a reply that timed out included. Both wait 30 seconds, so a create that took longer
-  could still make the child, and a model told the upstream was unreachable could spawn it again.
-  They now say unreachable only when the request never reached a handler that could act on it (a
-  connection that never opened, a request that couldn't be built or encoded, or a redirect from
-  something in front of the node); any other failure says no reply was read, so the request may have
-  been processed, and carries the code `upstream_no_reply`. `spawn_workstream` and `spawn_batch` add
-  that the coordinator should check with `list_workstreams` before retrying, after such a failure
-  and after any 5xx answer, since a gateway in front of the node can time out while the node
-  finishes. The console's create, verb, delete, attachment, node and watch-cancel proxies answer
-  this way, and the launcher's create, which said only that the dispatch failed, now says when the
-  workstream may exist. The task scheduler reads the same rule, so a firing whose create couldn't be
-  encoded is held for retry instead of recorded as unresolved.
-- **A model's tool arguments nested more than 100 levels deep read as malformed.** Arguments that
-  deep still parse, but break code that walks them one level at a time: three MCP calls nested 255
-  levels or more opened a static MCP server's circuit breaker for every session on the node, and on
-  a Python 3.13 node whose threads run on 2 MiB stacks an argument about 8,300 levels deep crashed
-  the process. The model is told the arguments couldn't be parsed and to retry.
-- **Handle deep values and recursive output schemas (#1458).** Complete tool inputs over 200 levels
-  deep are refused before replay capture, matching the streamed-input limit. Capabilities too deep
-  to compare count as changed for authorization and prevent calibration writes. A recursive MCP
-  output schema fails its tool call without opening the server's circuit breaker for other tools.
-- **Treat oversized JSON integers as malformed input (#1459).** Integers beyond the conversion
-  limit now receive the usual parse-error handling: invalid notification targets return 400,
-  malformed tool arguments fail replay validation, and SSE readers skip invalid events. Corrupt
-  heuristic-rule patterns reject a reload and preserve the cached rules; new sessions refuse to
-  start until those patterns are repaired. Pattern arrays must contain valid regex strings, and
-  unreadable scheduler locks prevent dispatch rather than allowing a takeover. Admin edits still
-  save and notify nodes when another corrupt rule prevents a local reload, with a warning that
-  allows administrators to repair rules one at a time.
-- **A force-cancelled `wait_for_workstream` stops.** A force-cancel gives the session a fresh
-  cancel event for its next turn, and the wait read the session's current one, so an abandoned wait
-  went on polling until its timeout, up to 600 seconds. It now checks the turn it belongs to.
+- **Stopping and closing coordinators reaches every child (#1465, #1471).**
+  Cancellation includes children whose creation notifications have not arrived.
+  Force-cancel also ends a pending `wait_for_workstream` instead of leaving it
+  attached to an obsolete cancellation signal.
+- **Failed reads stay failures.** Storage outages no longer masquerade as empty
+  task lists, missing workstreams, default settings, or a changed child state.
+  Workstream opens report a retryable failure rather than replacing saved
+  configuration, and processes that cannot read startup settings stop instead
+  of starting with defaults.
+- **MCP connections recover without leaving work behind.** Catalogs are read
+  beyond their first page; malformed tools do not cause reconnect loops; pooled
+  TLS and network failures count toward the circuit breaker; and shutdown or
+  server removal settles waiting calls. A failed initial connection remains
+  registered so it can be diagnosed and retried.
+- **Provider replay and recovery preserve the conversation.** Hosted searches
+  and citations survive replay, native search keeps working across rounds, and
+  history edits retain the right reasoning and system-message behavior.
+  Context meters account for server-side tools without inflating later turns.
+  Closing a client or failing a callback no longer strands its stream, and
+  bounded recovery reports incomplete task results instead of success.
+- **Approvals and rate limits leave the operator in control (#1325, #1338,
+  #1342, #1464).** Automatic evaluation moves to human attention as soon as a
+  decision requires it. Background CLI agents wait only for calls that actually
+  need a person. API rate limits are per signed-in user, exclude page assets,
+  and preserve the ability to stop running work.
+- **Attachments and speech fail clearly.** Transparent images are flattened
+  before model input, and binary web responses are refused as page content.
+  Local PDF processing works on supported desktop environments and reports
+  unavailable worker limits clearly. Speech synthesis uses bounded workers,
+  cancels abandoned requests, and reports oversized output without pretending
+  the node is unreachable.
+- **Malformed data is rejected at the boundary (#1456, #1458, #1459).** Deeply
+  nested JSON, oversized integers, recursive schemas, invalid model values,
+  and request bodies of the wrong shape produce bounded, useful errors rather
+  than recursion failures or partially processed requests.
+- **Everyday UI interactions are steadier.** Saved workstreams retain their
+  selected skill and settings; skill search reaches beyond the first page;
+  dialogs do not cover a new sign-in screen; typing in dialogs and shelves no
+  longer lags; and warning messages and narrow-pane forms remain readable.
+- **Deployment errors are actionable.** Database credentials and certificate
+  paths with punctuation work, migrations read the same settings as services,
+  and enabling TLS after startup takes effect. Literal SQLite paths now open
+  the filename they name: if a configured path contains `%` escapes or `?`,
+  verify the existing database's actual path before upgrading.
 
 ### Security
 
-- **No connection relies on the `certifi` bundle, which trusted the root of the compromised
-  eMudhra CAs.** The private keys of several eMudhra intermediate CAs can be recovered by anyone
-  (GHSA-6q48-6c7w-9gw2), so a client that trusts their root, emSign ECC Root CA - G3, accepts a
-  forged certificate for any host. Connections that don't name a CA of their own now verify against
-  the operating system's trust store (#1011), so a native install must update that store (Debian
-  13: `ca-certificates` 20250419+deb13u1, DSA-6572-1). `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces
-  the store for most of them, so a deployment that sets one must also remove the root from that
-  bundle; the Vault secret backend without `ca_cert`, certificate enrollment and the CA certificate
-  fetches ignore those variables and keep using the system store. Either way, restart Turnstone
-  afterwards: a running process keeps the roots it has already loaded.
-- **The Docker image no longer trusts the root of the compromised eMudhra CAs.** The image now
-  refuses to build with a `ca-certificates` older than 20250419+deb13u1 (DSA-6572-1), Debian's
-  update that removes the root from the system store. Its `pip`, which loads its own `certifi`
-  bundle beside the system store, moves to 26.2.2 or later, and its `uv`, which `uvx` uses to
-  fetch packages, moves to 0.13.4; both drop the root from their bundled lists. A virtual
-  environment made with `python -m venv` still starts with the base image's pip 26.2.1, which
-  trusts the root, until its pip is upgraded. Node.js, which `npx` uses, now checks the system
-  store instead of its built-in list, which still has the root: the image sets
-  `NODE_OPTIONS=--use-openssl-ca`, so a `NODE_OPTIONS` set at run time, in the container's
-  environment or in an MCP server's `env`, must keep that flag. Node also follows `SSL_CERT_FILE`
-  and `SSL_CERT_DIR` now. Images published before this release still trust the root.
-- **A remote MCP server can no longer have the console send plain-http requests to its loopback
-  ports.** The OAuth address check's localhost development lane (plain http to a localhost name
-  that resolves only to loopback) also covered URLs an MCP server's metadata or challenge named,
-  so with the private-network setting off a server could still have the console send blind
-  requests to any port and path on its own loopback, and time them to learn which ports answer.
-  A URL a remote document names now gets that lane only when the server URL the operator typed
-  is itself a localhost URL; otherwise it is judged like any other address. A server reached
-  through a localhost URL keeps the lane for every URL its documents name, so one that isn't a
-  local development server (a remote server behind a local forwarder, say) can still name the
-  console's loopback ports. A remote MCP server whose authorization server runs on the console's
-  host needs that server's Authorization Server URL set to it.
-- **A media tool's thumbnail URL can no longer reach the host's own services or cloud metadata
-  through an internationalized host name.** The channel thumbnail guard judged such a name as the
-  system resolver encodes it (IDNA 2003), while the fetch connects to the name's IDNA 2008 form,
-  and for some names (one holding `ß`, say) those are two different hosts. A tool result could
-  name such a host to get a GET, with a path of its choosing, sent to loopback or a cloud metadata
-  address over plain http; the answer reached the channel only when it was a 200 image. The guard
-  now resolves the name the fetch connects to, and refuses a URL whose host can't be sent.
-- **A compressed OAuth response can no longer exhaust memory.** The OAuth client checked a
-  response body's size only after reading and decompressing all of it, so a few hundred bytes of
-  brotli from an MCP server, or from the authorization server its metadata names, could decode to
-  gigabytes first and take the console or node down for every user; connecting to such a server
-  or refreshing a token against it set it off. Bytes sent after the end of a gzip stream piled up
-  the same way while decoding to nothing. The client now stops reading a body past 256 KiB
-  decoded, past 512 KiB received, or once the request's read timeout has passed while reading it,
-  and each request keeps its own, smaller or equal, size limit.
-- **The OAuth address check judges the host the client connects to.** It resolved an
-  internationalized host name the way the system resolver encodes it (IDNA 2003), while the HTTP
-  client connects to the name's IDNA 2008 form, and for some names (one holding `ß`, say) those
-  are two different hosts. An MCP server's metadata or challenge could name such a host, so the
-  check passed on one name's public address while the client connected to the other's internal
-  one: a TCP connection and TLS handshake to an internal host and port of the server's choosing,
-  which failed certificate verification before any request was sent. The check now resolves the
-  name the client connects to, and reads `[oidc] trusted_endpoint_hosts` the same way, so a host
-  there may be written in Unicode or as its `xn--` name.
-- **A user's bearer replaces the operator's Authorization header on per-user MCP servers.** On an
-  `oauth_user` or `oauth_obo` server whose headers held an Authorization header spelled otherwise
-  than `Authorization` (`authorization`, say), each user's connection sent that header beside the
-  user's bearer, and first. A server that reads the first one, as Starlette and the MCP SDK's
-  bearer middleware do, took every user for the operator's credential. The user's bearer now
-  replaces an operator Authorization header in any casing.
-- **The model reads only framework-written output-guard findings (#1291).** With the LLM stage on
-  (`judge.output_guard_llm`), the advisory after a flagged tool result carried the judge's
-  reasoning and its free-form flags: text the judge wrote after reading the attacker-controlled
-  output, delivered with operator-level trust. The advisory now names what the judge found with
-  symbols from a fixed vocabulary, each with one fixed sentence, and a flag outside the vocabulary
-  shows as `unclassified`; the judge's prompt lists the same vocabulary. The chip and the audit
-  rows keep the judge's reasoning and flags as it wrote them, and findings from the regex stage
-  read as before. Workstreams created before the upgrade keep the advisories already stored in
-  them, judge prose included.
-- **The model's own words replay as written (#1291).** The fold of operator turns, the shared
-  workstream's sender-label pass and the reasoning replayed to a vLLM model defanged fence markers
-  in the model's own text and reasoning, so the model read its history rewritten. They now clean
-  only what comes in (tool results, attachments, other participants' messages) and replay the
-  model's text, reasoning and tool-call arguments as it wrote them. The summarizer that writes a
-  compaction summary reads every turn with fence markers defanged and the session's tokens removed,
-  the model's own included, since another model reads them and nothing it reads is replayed; its
-  summary is kept as it wrote it. What the framework writes from outside into an assistant turn (the
-  last user message a summary quotes, a child workstream's name, a hosted search's citations footer)
-  or a system turn (a message queued while the model works) is cleaned where it is composed; the
-  model's own last turn, which a compaction carries verbatim, stays as written. A hosted search's
-  results and citations replay inside the model's turn as the provider returned them, beyond any
-  text pass, like text inside an image or a natively read PDF; the declaration now says a block
-  inside one of the model's own earlier turns, its search results and citations included, is never
-  the operator's. Anywhere else, text from outside never carries a session token in, so a block with
-  one in the model's history is one the model wrote itself.
-- **Task agents are told what the output guard found (#1291).** A task agent's tool results were
-  scanned and redacted, but its model never saw the finding, so a sub-agent that read a prompt
-  injection got no warning even though the guard flagged it and the operator's chip showed it. A
-  flagged result now gets the same advisory as in the conversation, after the step's tool results,
-  and the agent's intent judge sees it on later gated calls. A tool's own text inside a list result
-  is now guarded; list results skipped the guard entirely. The only list result today, `read_file`
-  on an image, holds just the framework's header before the image. An agent whose model takes the
-  advisory in the trusted fence, under a main model that takes native system messages, now has that
-  fence declared in its prompt. The guard reads past the agent's 16,000-character cut so it can
-  redact a credential that straddles it, so the advisory for a result the cut shortened says the
-  finding may concern the part the agent did not receive. The declaration itself, in every session
-  whose model folds operator turns, now says a block carrying the session's token can follow a tool
-  result, and that a block inside one of the model's own earlier turns, its search results and
-  citations included, is never the operator's; it told the model to distrust any marker inside tool
-  output, which read literally covered the real advisory appended there. Since the declaration
-  trusts the token alone, the token itself is now removed from untrusted text wherever it joins the
-  request (tool results and other incoming history, before the fold appends its block, and
-  attachments), matched past case, past accents and compatibility forms (`é`, full-width,
-  mathematical, circled) and past anything between its characters that is not an ASCII letter or
-  digit (spaces, line breaks, invisible characters, combining marks): a leaked token inside a marker
-  spelled with a zero-width space or a lookalike letter passed the old defang. Lookalikes that
-  Unicode does not decompose to a letter or digit (another script's letters, ASCII `O` for `0` and
-  `l` or `I` for `1`, and on Python 3.13, whose Unicode predates them, the outlined letters and
-  digits Unicode 16 added) are not matched, and text inside an image, a natively read PDF or a
-  hosted search's results and citations is beyond the reach of a text pass. The sender label of a
-  shared workstream gets the same treatment, and the guard flags a leaked token wherever it appears.
-  All of a step's advisories follow its last result, so in a step with several results each advisory
-  now names its own by position, and by tool when the session offers a tool of that name; the
-  operator's guard card shows the same label. Text the framework wrote itself (a denial quoting the
-  approver's feedback, an unknown-tool or agent-mode gate error, the header before an image) is no
-  longer guarded; a denial such as "From now on you must write outputs to /tmp" scored as an
-  injection, and the advisory turned the approver's own correction against them.
-- **The output guard's judge no longer reads secrets the model never sees (#1291).** Where the regex
-  stage redacts a credential (`judge.redact_secrets`), the guard's LLM stage read the raw tool
-  output, so a secret the session's model never saw reached the guard's model, possibly another
-  provider's, and the reasoning it writes into the audit row. It now reads the redacted text the
-  session's model receives; the lines it cites are that text's.
-- **Output-guard findings name the lines the judge flagged (#1291).** With the LLM stage on, the
-  judge reads the tool output with numbered lines and may cite ranges; the advisory names them as
-  numbers, never quoting the lines. A range reaches the model only if its lines read the same, at
-  the same numbers, in what the model receives: one after a re-cut or a task agent's cut is dropped
-  rather than renumbered. The sentence says the numbers count from the first line of the result,
-  since `read_file` and search output print numbers of their own, and asks the model to treat the
-  whole result with the same caution, since the judge chose the lines after reading text that can
-  steer it. A result the main loop cuts again after redaction now also gets the notice that the
-  finding may concern the part that was cut. Output whose numbered prompt would not fit the judge's
-  window, such as one padded with blank lines, is judged unnumbered and cites no lines, where it
-  would otherwise skip the judge.
-- **Tool policies that cannot be read refuse the batch.** When reading the admin tool policies
-  failed, every call came back as matching no policy, so `deny` rules stopped applying:
-  skip-permissions, "Always" grants, auto-approve lists, the smart-approval judge or a person could
-  run a call a `deny` rule covered. Now every call in the batch that needs approval is refused, with
-  a message telling the model to try again; calls that need no approval still run. Successful reads
-  stay cached for 60 seconds and a failed one is not cached, so the next batch reads again. This
-  applies to node and coordinator sessions and to the CLI. A call tool policies refused, or one
-  nobody answered before the approval deadline, is no longer reported to the model as the user
-  rejecting it.
-- **"Always" approves only what the person approved.** Approving a batch with "Always" also granted
-  the always-approval to a call a `deny` rule had refused in that batch, so the call ran without a
-  prompt if the rule was later removed or relaxed to `ask`. Refused calls now get no grant.
-- **URL tools look up a hostname only after approval.** `web_fetch` and `open_preview` screened
-  their target while preparing the call, and the screen resolved the hostname. A denied or
-  cancelled call had already sent that name to DNS, and a private or unresolvable answer was
-  returned to the model without any approval. Preparation now judges only what needs no lookup:
-  malformed URLs, metadata hostnames, and IP literals, which keep their current refusals and
-  private-network marking. A hostname is resolved and screened when the approved request is made,
-  and refusals keep their wording. With `tools.allow_private_network` on, a hostname that turns
-  out to be private is refused once with a request to repeat the call; the repeat is marked as
-  a private-network request, and approving it grants access. Tagged requests in task agents
-  now use the same approval gate and policies as the conversation. A granted hostname that
-  no longer answers wholly private is refused and forgotten; if it now answers only public
-  addresses, a retry can be approved as an ordinary request. The grant recheck and first fetch
-  hop share one DNS answer. Each hop connects only to its screened addresses, closing the
-  screen-to-connect rebinding gap while preserving the hostname for HTTP routing, TLS SNI,
-  and certificate verification. Proxy-routed requests are refused because a proxy could
-  resolve the destination independently; `NO_PROXY` exclusions can connect directly.
-- **Credential redaction covers JSON Web Tokens and credential query parameters.** A JWT after
-  `token=` or `access_token=` lost only its header to redaction, leaving its payload and signature,
-  and a query parameter such as `?access_token=ya29.…`, `?client_secret=…` or `?password=…` was not
-  redacted unless its value was 20 or more letters and digits. The output guard, its configurable
-  built-in rules (`credential_jwt`, `credential_query_param`), and the browser's display redaction
-  now redact a JWT whole where it stands on its own, also right after a percent-escape or a `\u`,
-  `\n`, `\r`, or `\t` escape, as inside an encoded URL or an escaped string, and a query or fragment
-  parameter named `token`, `access_token`, `refresh_token`, `id_token`, `auth_token`, `api_token`,
-  `session_token`, `bearer_token`, or `secret_token` (also without the underscore), `api_key`,
-  `secret`, `client_secret`, `password`, or `passwd` to the end of its value once it is at least 8
-  characters, also after an escaped `&amp;` or `\u0026` or percent-encoded inside another URL. Both
-  run before the key-prefix rules, so a token or query value that starts with a recognisable key is
-  still redacted whole. Bare `key` and `auth` parameters are still left alone, and a pagination
-  cursor passed as `?token=` is now redacted from tool output too. Audit details, persisted errors,
-  and tool-argument previews use the same redaction.
-- **Connection-string redaction stays fast on nested URLs.** Every `https://` in a long run of
-  nested URLs rescanned the rest of the run for an `@`, so redacting 128 KB of such tool output took
-  8.5 seconds, and the time grew with the square of the size. The output guard and the browser's
-  redaction now end a URL's password where another connection string could begin, which keeps the
-  scan linear and still redacts a password of any length, `/` and `://` included, unless the
-  password itself contains one of the recognised schemes, such as `https://`.
-- **The web UIs no longer fetch fonts from a third-party host.** The node UI, console and
-  coordinator pages loaded their two typefaces from an external font service on every page load.
-  Each load sent that service the viewer's IP address, user agent and the deployment's origin,
-  and the page stayed blank until the request finished or failed, which takes the full connection
-  timeout where outbound traffic is silently dropped. The same font files now ship in the package
-  (`shared_static/inter-4.001/`, `shared_static/jetbrains-mono-2.211/`) and are cached like the
-  other version-named vendor assets. Pages look the same where the service was reachable; where
-  it was blocked, they now get the intended typefaces instead of system fonts.
-- **Uploads without a Content-Length stop at their size limit.** Attachment, speech-to-text and
-  avatar uploads compared the Content-Length header with their limit before reading the body, but a
-  chunked upload carries none and was read in full, spooled to disk, before the limit applied. The
-  body is now counted as it arrives and refused once it passes the limit.
+- **Skills cannot grant themselves approvals.** Skills with `auto_approve` or
+  `allowed_tools` require an operator to load them, as high-risk skills do.
+  Activations recheck the skill after approval, and a batch cannot both change
+  and activate skills. The scanner examines current text, placeholder-expanded
+  variants, and complete hostnames without pathological slowdowns. Old reports
+  are rescanned at startup, so the first upgraded start may take longer.
+- **Output-guard advisories retain their trust boundary (#1291).** Models see
+  fixed, framework-written findings instead of the judge's free-form prose.
+  Task agents receive the same findings, judges see already-redacted content,
+  and incoming text cannot smuggle trusted session markers into history. The
+  model's own text and reasoning replay unchanged.
+- **Approvals apply only to approved actions.** Unreadable tool policies refuse
+  the batch, and an "Always" choice does not grant permissions to calls a deny
+  rule blocked. URL tools resolve hostnames only after approval and connect only
+  to the addresses they screened. Guarded fetches require a direct route;
+  deployments using a proxy must provide an appropriate `NO_PROXY` exclusion.
+- **Outbound credentials and URLs are checked consistently.** Per-user MCP
+  credentials replace operator Authorization headers regardless of casing.
+  Extra headers cannot override provider credentials. OAuth and thumbnail
+  guards validate the hostname actually used by the client, and remote metadata
+  cannot inherit the localhost development exception.
+- **Untrusted bodies stay bounded.** Compressed OAuth responses are limited
+  during download and decompression, and uploads without a Content-Length stop
+  at their size limit. Dependency and container updates address decompression
+  vulnerabilities and compromised trust roots. Native installations and custom
+  trust bundles must receive the corresponding CA updates too.
+- **Less sensitive data leaves the process.** Database errors omit bound values,
+  request logs remove control characters and secret-bearing URL components,
+  and browser fonts ship locally instead of contacting an external font host.
+
+### Documentation and verification
+
+- The architecture, SDK, OAuth storage, secret-reference, MCP, and deployment
+  guides describe the new ownership, transport, and configuration contracts.
+- Evaluation tools cover attached content, output-guard findings, and task-agent
+  behavior through the real runtime paths, with saved transcripts for review.
+- Contribution and release instructions now use `main`. Release helpers,
+  dependency updates, CI branch filters, and stable publication aliases follow
+  the single development branch. Stable aliases follow the newest final tag,
+  independently of the version under development on `main`.
 
 ## [1.8.3]
 

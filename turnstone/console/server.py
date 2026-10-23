@@ -236,6 +236,9 @@ def _parse_int(
 _JS_PROXY_SHIM = """\
 (function(){
   var _pfx = "PREFIX_PLACEHOLDER";
+  // Native media src/href requests bypass the fetch/EventSource wrappers.
+  // Publish this trusted page prefix so tool images can target the same node.
+  window.TURNSTONE_PROXY_PREFIX = _pfx;
   var _oF = window.fetch;
   window.fetch = function(u, o){
     if (typeof u === "string" && u.startsWith("/")) u = _pfx + u;
@@ -4816,6 +4819,18 @@ _RESTRICT_MAX_TOOL_NAME_LEN = 128
 _COORD_FANOUT_MAX_CONCURRENCY = 16
 
 
+def _stored_coordinator_child_ids(storage: StorageBackend, ws_id: str, owner_id: str) -> list[str]:
+    """Read all published direct children without changing registry membership.
+
+    Callers supply their request-bound storage and the coordinator's owner, which may differ
+    from the acting operator. Failed reads propagate so each operation applies its own policy.
+    """
+    if not owner_id:
+        raise ValueError("a coordinator owner is required to discover its children")
+    rows = storage.list_workstreams(parent_ws_id=ws_id, user_id=owner_id, limit=None)
+    return [row._mapping["ws_id"] for row in rows]
+
+
 async def _fanout_on_children(
     child_ids: list[str],
     coord_client: Any,
@@ -5066,8 +5081,8 @@ async def _cascade_cancel_to_children(
     cancelling a coordinator propagates down its spawned subtree — the
     cancellation appendix's "cancel flows down the subtree."  The
     coordinator's own session is already cancelled by ``make_cancel_handler``
-    before this runs; here we authorize + prepare the per-child fan-out and
-    hand it back as a ``BackgroundTask``.
+    before this runs; here we authorize and snapshot the registry plus the
+    stored children, then hand the per-child fan-out back as a ``BackgroundTask``.
 
     Returns a ``BackgroundTask`` (run AFTER the 200 is sent) or ``None``.
     Returning it rather than awaiting it inline is the "trigger, not drain"
@@ -5088,50 +5103,40 @@ async def _cascade_cancel_to_children(
     if _require_admin_coordinator(request, allow_service_bypass=False) is not None:
         log.debug("coordinator.cancel_cascade.skipped_unauthorized ws=%s", ws_id[:8])
         return None
-    from turnstone.console.coordinator_adapter import ChildrenUnreadableError
-
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
     if coord_adapter is None:
         return None
-    try:
-        child_ids = await asyncio.to_thread(coord_adapter.children_snapshot, ws_id)
-    except ChildrenUnreadableError:
-        # The coordinator's own cancel already happened. Its children can't
-        # be reached without their ids, so record that instead of skipping
-        # them quietly.
-        log.warning("coordinator.cancel_cascade.children_unreadable ws=%s", ws_id[:8])
-        audit_storage, _audit_err = require_storage_or_503(request)
-        if audit_storage is None:
-            return None
-        audit_user_id = _auth_user_id(request)
-        audit_host = request.client.host if request.client else ""
+    child_ids = await asyncio.to_thread(coord_adapter.registered_children_snapshot, ws_id)
 
-        async def _record_unreadable() -> None:
-            await _emit_coord_audit(
-                audit_storage,
-                audit_user_id,
-                "coordinator.cancel_cascaded",
-                ws_id,
-                {
-                    "src": "coordinator",
-                    "error": "the coordinator's children could not be read",
-                    "cancelled": [],
-                    "failed": [],
-                    "skipped": [],
-                },
-                audit_host,
+    storage, _storage_err = require_storage_or_503(request)
+    coord_user_id = ws.user_id
+    children_unreadable = storage is None or not coord_user_id
+    if not children_unreadable:
+        try:
+            stored_child_ids = await asyncio.to_thread(
+                _stored_coordinator_child_ids, storage, ws_id, coord_user_id
             )
-
-        return BackgroundTask(_record_unreadable)
-    if not child_ids:
+            # The query excludes creating reservations, but includes every published
+            # state. Keep this union local: seeding the registry would consume a
+            # delayed ws_created event before it could announce the child to the UI.
+            child_ids = sorted(set(child_ids).union(stored_child_ids))
+        except Exception:
+            # The known registry targets remain useful when this read fails. Each
+            # cancel still checks current ownership; never bypass that storage read.
+            children_unreadable = True
+            log.warning(
+                "coordinator.cancel_cascade.storage_read_failed ws=%s", ws_id[:8], exc_info=True
+            )
+    if children_unreadable:
+        log.warning("coordinator.cancel_cascade.children_unreadable ws=%s", ws_id[:8])
+    if not child_ids and not children_unreadable:
         return None
     session = getattr(ws, "session", None)
     coord_client: Any = getattr(session, "_coord_client", None) if session is not None else None
-    if coord_client is None:
+    if coord_client is None and not children_unreadable:
         return None
     # Capture the audit inputs now, while the request is fresh — the task
     # below runs after the response is sent.
-    storage, _storage_err = require_storage_or_503(request)
     user_id = _auth_user_id(request)
     client_host = request.client.host if request.client else ""
 
@@ -5145,12 +5150,20 @@ async def _cascade_cancel_to_children(
         # Restore the per-child forensic record the removed stop_cascade
         # wrote (the coordinator's own cancel is audited separately).
         if storage is not None:
+            detail: dict[str, Any] = {
+                "src": "coordinator",
+                "cancelled": ok,
+                "failed": failed,
+                "skipped": skipped,
+            }
+            if children_unreadable:
+                detail["error"] = "the coordinator's children could not be read"
             await _emit_coord_audit(
                 storage,
                 user_id,
                 "coordinator.cancel_cascaded",
                 ws_id,
-                {"src": "coordinator", "cancelled": ok, "failed": failed, "skipped": skipped},
+                detail,
                 client_host,
             )
         log.info(
@@ -5170,10 +5183,9 @@ _CLOSE_ALL_CHILDREN_MAX_REASON_LEN = 512
 async def coordinator_close_all_children(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/{ws_id}/close_all_children — soft-close the direct children.
 
-    Fans out over ``children_snapshot`` via ``_fanout_on_children`` and
-    returns ``{closed, failed, skipped}``.  Soft-close only: this does NOT
-    recurse into grandchildren (the coordinator's model tool asks for a
-    bounded teardown of its own direct fan-out).
+    Combines registered children with a fresh stored-child snapshot, then dispatches through
+    ``_fanout_on_children`` and returns ``{closed, failed, skipped}``. Discovery failures return
+    503 before any close is sent. Soft-close only: this does not recurse into grandchildren.
     """
     resolved = await _resolve_coord_session(request, allow_service_bypass=False)
     if isinstance(resolved, JSONResponse):
@@ -5183,7 +5195,6 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
     coord_mgr, err503 = _require_coord_mgr(request)
     if err503 is not None:
         return err503  # pragma: no cover — _resolve_coord_session already gated this
-    del coord_mgr  # children_snapshot moved to the adapter
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
 
     body = await read_json_or_400(request)
@@ -5202,22 +5213,29 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    from turnstone.console.coordinator_adapter import ChildrenUnreadableError
-
-    child_ids: list[str] = []
-    if coord_adapter is not None:
-        try:
-            child_ids = await asyncio.to_thread(coord_adapter.children_snapshot, ws_id)
-        except ChildrenUnreadableError:
-            return JSONResponse(
-                {
-                    "error": (
-                        "the coordinator's children could not be read, so none was "
-                        "closed; retry after storage recovers"
-                    )
-                },
-                status_code=503,
-            )
+    try:
+        coord_ws = coord_mgr.get(ws_id)
+        if coord_ws is None or coord_adapter is None:
+            raise RuntimeError("coordinator child discovery is unavailable")
+        child_ids = await asyncio.to_thread(coord_adapter.registered_children_snapshot, ws_id)
+        stored_child_ids = await asyncio.to_thread(
+            _stored_coordinator_child_ids, storage, ws_id, coord_ws.user_id
+        )
+        # Keep discovery local so delayed creation events can still announce their children.
+        child_ids = sorted(set(child_ids).union(stored_child_ids))
+    except Exception:
+        log.warning(
+            "coordinator.close_all_children.children_unreadable ws=%s", ws_id[:8], exc_info=True
+        )
+        return JSONResponse(
+            {
+                "error": (
+                    "the coordinator's children could not be read, so none was "
+                    "closed; retry after storage recovers"
+                )
+            },
+            status_code=503,
+        )
 
     coord_client: Any = getattr(session, "_coord_client", None)
     closed, failed, skipped = await _fanout_on_children(
