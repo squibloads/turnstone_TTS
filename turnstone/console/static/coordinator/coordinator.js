@@ -26,6 +26,7 @@
 // bits a pane doesn't want: the "Console" back-link, the theme toggle, and the
 // shared #toast (the console shell already provides theme + toast).
 // ---------------------------------------------------------------------------
+import { buildToolImages } from "/shared/composer_attachments.js";
 import {
   buildWatchResultCard,
   buildCompactionCard,
@@ -1726,6 +1727,8 @@ function createCoordinatorPane(root, wsId, opts) {
         callId: callId,
       });
       el.querySelector(".msg-body").appendChild(orphanCard);
+      const images = buildToolImages(opts && opts.attachments, { wsId: wsId });
+      if (images) el.querySelector(".msg-body").appendChild(images);
       if (callId) toolResultNodes.set(callId, { row: null, node: el });
       return el;
     }
@@ -1734,6 +1737,8 @@ function createCoordinatorPane(root, wsId, opts) {
       label: (isError ? "error · " : "") + (name || "tool"),
       callId: callId,
     });
+    const images = buildToolImages(opts && opts.attachments, { wsId: wsId });
+    if (images) el.querySelector(".msg-body").appendChild(images);
     if (callId) toolResultNodes.set(callId, { row: null, node: el });
     return el;
   }
@@ -2106,6 +2111,8 @@ function createCoordinatorPane(root, wsId, opts) {
     // across upgrade-in-place when the error came from a tool_result.
     if (isError) block.classList.add("conv-row-result--error");
     row.appendChild(block);
+    const images = buildToolImages(opts && opts.attachments, { wsId: wsId });
+    if (images) block.appendChild(images);
     // Accepted and replayed preview rows retain the transcript affordance even
     // when the result is an error/cancellation. Only the executor's
     // preliminary event may auto-open; this final projection is chip-only.
@@ -3993,6 +4000,7 @@ function createCoordinatorPane(root, wsId, opts) {
               accepted: ev.accepted === true,
               effectStatus: ev.effect_status,
               preview: ev.preview,
+              attachments: ev.attachments,
             },
           );
           recordAcceptedToolEvent(renderedToolEventIds, ev);
@@ -7185,6 +7193,7 @@ function createCoordinatorPane(root, wsId, opts) {
           accepted: true,
           effectStatus: m.effect_status,
           preview: m.preview,
+          attachments: m.attachments,
         };
         if (occurrence && occurrence.row) {
           const resultNode = _appendResultToRow(
