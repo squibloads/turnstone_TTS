@@ -290,3 +290,18 @@ def test_registry_validates_tuning_writes() -> None:
     with pytest.raises(ValueError):
         validate_value("audio.tts_profiles", json.dumps({"x": {"max_clips": 0}}))
     assert validate_value("audio.tts_profiles", "garbage", clamp_range=True) == "garbage"
+
+
+_UNHOLDABLE_JSON = [
+    '{"a": ' + "[" * 100_000 + "]" * 100_000 + "}",  # nested past the recursion limit
+    '{"a": {"speed": ' + "9" * 5000 + "}}",  # an integer past the conversion limit
+]
+
+
+@pytest.mark.parametrize("value", _UNHOLDABLE_JSON, ids=["too-deep", "huge-int"])
+def test_profiles_json_the_decoder_cannot_hold_is_malformed(value: str) -> None:
+    # The save refuses it like any bad JSON; the tolerant read falls back to no
+    # profiles instead of raising out of every speech request.
+    with pytest.raises(ValueError, match="not valid JSON"):
+        validate_profiles(value)
+    assert parse_profiles(value) == {}
