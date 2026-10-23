@@ -6533,7 +6533,7 @@ class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
             for ws_id, raw in ref_rows:
                 try:
                     ids = json.loads(raw) if raw else []
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, RecursionError):
                     continue
                 if not isinstance(ids, list):
                     continue

@@ -272,6 +272,7 @@ frozen.
 
 ### Changed
 
+<<<<<<< HEAD
 - **Read-aloud speaks a reply one block at a time** — headings, paragraphs and table rows
   are each read as their own clip with a pause after them (a heading or paragraph under 20 characters joins the clip that follows and takes no pause of its own; a whole list is one clip, see below), instead of
   running into the next sentence, and a code block is replaced by "Code omitted." (consecutive blocks by one marker). A diagram (a ```mermaid block, rendered or not) says "Diagram omitted." instead of reading its labels aloud, and inline SVG, images, canvas, video and audio are skipped. Inline code of
@@ -285,6 +286,20 @@ frozen.
   closes the live stream and the stream teardown also stopped the audio. It now stops on Stop,
   when the conversation is rebuilt from history, and when the pane is closed.
 - **Every finished reply has its own read-aloud button** — the speaker used to appear only on the latest reply and moved on with Retry. It now stays on each reply once it has finished (a reply still streaming gets it when it settles), so an earlier answer can be read, or keep playing, while a newer one arrives.
+=======
+- **`spawn_batch` sends every child's create at once (#1457).** It sent them one after another,
+  and each create waits up to 30 seconds for the console, which waits up to 30 seconds for the
+  node, so a stalled console or node held the coordinator's call for up to five minutes. A stall
+  now costs about one timeout, and the children bound for healthy nodes are still created. A Stop
+  or force-cancel holds back only a child whose create hasn't been sent, which once the batch has
+  started is usually none of them. The console's cancel cascade reaches only the children it had
+  registered when the Stop landed, so the batch cancels each child whose create returns after the
+  stop, and audits those cancels as `coordinator.cancel_cascaded` with `src: spawn_batch`. The
+  children can be created in any order (`results` stays keyed by input index). With a node's rate
+  limiting on, a batch's creates arrive together and count against their creator's bucket; a
+  create the limiter refuses is sent once more after the wait it names, and a second refusal is
+  reported as denied (#1464).
+>>>>>>> upstream/dev
 - **The denial nudge no longer waits out `memory.nudge_cooldown` (#924).** The note asking the
   model whether a rejected tool call reflects a lasting preference now follows each batch a person
   rejects; the cooldown spaces only the correction and completion nudges and the coordinator's
@@ -719,6 +734,35 @@ frozen.
 
 ### Fixed
 
+- **A node with rate limiting on gives each signed-in user their own bucket (#1464)** — it keyed
+  its buckets on the request's address, and the console forwards every caller's request from its
+  own, so every request the console forwarded to a node, from every user and coordinator, drew on
+  one bucket sized for a single client, and one busy user could starve the rest. A signed-in
+  request now draws on its user's bucket, whether it comes direct or through the console, and a
+  coordinator's on its creator's. A request to a public path, such as sign-in, is still limited
+  per client address, through `ratelimit.trusted_proxies`. A user's bucket now carries all of that
+  user's page loads, so the default `ratelimit.burst` rises from 20 to 50: reloading a page that
+  restores eight workstream panes makes about 30 API requests. A full table of buckets now evicts
+  the least recently used one instead of refusing every new caller.
+- **A node with rate limiting on no longer limits its page and static files (#1464)** — one load
+  of the node's page fetches more than 60 files (the page, its scripts and stylesheets, and the
+  modules they import), each revalidated on every load, so at the default burst of 20 half or more
+  of them were refused, a refused script or stylesheet isn't retried, and the page couldn't load,
+  whether opened directly or through the console. `/`, `/static/` and `/shared/` are now exempt,
+  like `/health` and `/metrics`.
+- **A Stop always lands on a node with rate limiting on (#1464)** — a coordinator's Stop cancels
+  each of its children on its creator's bucket, which the children's own creates may just have
+  drained, and a cancel the limiter refused left that child running. A cancel is no longer
+  limited: `/v1/api/workstreams/{ws_id}/cancel` and `/v1/api/watches/{watch_id}/cancel` are exempt.
+- **A coordinator sends a create the node's rate limiter refused once more (#1464)** — with rate
+  limiting on, `spawn_batch` sends every child's create at once, and a create past its creator's
+  burst was refused and reported as denied. A create the limiter refuses, from `spawn_batch` or
+  `spawn_workstream`, is now sent once more after the wait the refusal names, unless the
+  coordinator is stopped first, which cuts the wait short; the limiter answers before any handler
+  runs, so the refused create made nothing. A refusal that names no wait, or one longer than 5
+  seconds, comes back as before. Like `spawn_batch`, `spawn_workstream` now cancels a child whose
+  create returns after a Stop, which the console's cancel cascade can't reach, and audits the
+  cancel as `coordinator.cancel_cascaded` with `src: spawn_workstream`.
 - **The Python SDK presents its client certificate when `ca_cert` is also set (#1425)** — with
   both, the client certificate was dropped without a warning, so a node that requires one, such as
   a node with TLS on, refused the handshake.
@@ -870,6 +914,17 @@ frozen.
   carried no name, so the chip fell back to "account" until the page reloaded. Login and refresh now
   return the display name and avatar as whoami does. The chip's old two-letter initials also broke
   on names starting with an emoji, punctuation or ß; the one-letter avatar replaces them.
+- **Local PDF processing works on macOS.** macOS refuses the address-space limit the PDF worker sets
+  on itself, so every local PDF text extraction, page render and thumbnail there failed. The parent
+  now samples the worker's physical memory footprint every 10 ms and stops it above 384 MiB. This
+  sampled threshold can be exceeded between checks; the worker's CPU, file-size and core-dump limits
+  still apply. Linux keeps its kernel-enforced address-space limit and existing polling behaviour.
+- **Closing a model client mid-stream no longer leaves the stream hanging.** A model-registry reload
+  closes each provider's SDK client while a turn may still be streaming. The blocked read was left
+  waiting for the server's next byte on Linux and for the full read timeout on macOS, up to ten
+  minutes. Turnstone's SDK clients now shut each connection down before closing it, so the blocked
+  read fails at once with the retryable transport error that stream recovery already handles, on
+  every platform. (#1350)
 - **A host that can't run the PDF worker says so.** On macOS, which refuses a finite address-space
   limit, on any host whose sandbox blocks `setrlimit`, and on a host where the worker's temporary
   directory can't be created or the worker can't start, every PDF that needed local processing was
@@ -1324,10 +1379,10 @@ frozen.
   time, so a burst of uploads queues instead of flattening all at once; an image whose header
   declares no transparency skips the queue. The queue has no length limit, and a workstream create
   waiting its turn holds its workstream slot. On a node, rate limiting (`ratelimit.enabled`: per
-  IP, off by default) bounds how fast one client can add to the queue; the console's coordinator
-  uploads, open only to coordinator admins, have no rate limit. Images already in a conversation
-  are left as they are, so it keeps sending what it sent and its history and cached prompt prefix
-  don't change; attach such an image again to have it flattened.
+  signed-in user, off by default) bounds how fast one user can add to the queue; the console's
+  coordinator uploads, open only to coordinator admins, have no rate limit. Images already in a
+  conversation are left as they are, so it keeps sending what it sent and its history and cached
+  prompt prefix don't change; attach such an image again to have it flattened.
 - **`web_fetch` refuses images and other binary content instead of extracting from it (#1452).** A
   fetched body that wasn't a PDF was decoded as text, and an image's bytes decoded to characters
   that were largely replacement characters: a 23 KB JPEG became 22,395 characters, 10,883 of them
@@ -1406,6 +1461,62 @@ frozen.
   behind send, speech to text and the command route reads the workstream's row in a worker thread,
   so a slow database no longer stalls every request on the node. The console's create proxy and
   node detail route read storage in a worker thread too.
+- **JSON nested too deeply to parse is treated as malformed (#1456).** Python 3.13's JSON parser
+  raises `RecursionError` instead of a decode error for input nested about 10,000 levels deep, and
+  3.14 raises it when a thread's stack runs out. Most of the package's parse guards caught only the
+  decode error, so such input got past them: a request body answered a 500 where malformed JSON
+  answers 400, and a stored value, a reply from a node or provider, a command's output or a model's
+  tool arguments failed a read that handles an unparseable one. Every parse guard now treats input
+  too deep to parse as malformed, and a test keeps new guards covered. A stored setting nested too
+  deeply reads as invalid, as a malformed one does, instead of failing a node's startup. A skill's
+  `allowed_tools` that can't be parsed, or isn't a flat list of names, grants no tools: it was split
+  on commas, so a value too deep for one node's parser could grant tools nobody listed. Workstream
+  create, the re-enable approval card, the skill scanner and the skills tool now read it one way;
+  the card says when it can't be read, and a comma-separated value from before the JSON form scores
+  and lists like its JSON form.
+- **Request bodies of the wrong shape answer 400.** Admin token creation read a body it couldn't
+  parse as `{}` and minted a token with the default scopes; it now answers 400, as it does for a
+  body that isn't a JSON object and for fields of the wrong type. That includes a number or boolean
+  token name, which it used to store as text, and an `expires_days` that isn't a whole number of
+  days of at least 1: `false` minted a token that had already expired. Login, first-time setup,
+  admin user creation and the channel notify hook answer 400 instead of 500 for a body that isn't a
+  JSON object or holds a field of the wrong type, and the notify hook's malformed-body error reads
+  "Invalid JSON body". The console reference's token example sends `scopes` as the comma-separated
+  string the API takes.
+- **A request whose reply never came is no longer reported as unreachable.** A coordinator's
+  requests to the console, and the console's proxies to a node, called every transport failure
+  unreachable, a reply that timed out included. Both wait 30 seconds, so a create that took longer
+  could still make the child, and a model told the upstream was unreachable could spawn it again.
+  They now say unreachable only when the request never reached a handler that could act on it (a
+  connection that never opened, a request that couldn't be built or encoded, or a redirect from
+  something in front of the node); any other failure says no reply was read, so the request may have
+  been processed, and carries the code `upstream_no_reply`. `spawn_workstream` and `spawn_batch` add
+  that the coordinator should check with `list_workstreams` before retrying, after such a failure
+  and after any 5xx answer, since a gateway in front of the node can time out while the node
+  finishes. The console's create, verb, delete, attachment, node and watch-cancel proxies answer
+  this way, and the launcher's create, which said only that the dispatch failed, now says when the
+  workstream may exist. The task scheduler reads the same rule, so a firing whose create couldn't be
+  encoded is held for retry instead of recorded as unresolved.
+- **A model's tool arguments nested more than 100 levels deep read as malformed.** Arguments that
+  deep still parse, but break code that walks them one level at a time: three MCP calls nested 255
+  levels or more opened a static MCP server's circuit breaker for every session on the node, and on
+  a Python 3.13 node whose threads run on 2 MiB stacks an argument about 8,300 levels deep crashed
+  the process. The model is told the arguments couldn't be parsed and to retry.
+- **Handle deep values and recursive output schemas (#1458).** Complete tool inputs over 200 levels
+  deep are refused before replay capture, matching the streamed-input limit. Capabilities too deep
+  to compare count as changed for authorization and prevent calibration writes. A recursive MCP
+  output schema fails its tool call without opening the server's circuit breaker for other tools.
+- **Treat oversized JSON integers as malformed input (#1459).** Integers beyond the conversion
+  limit now receive the usual parse-error handling: invalid notification targets return 400,
+  malformed tool arguments fail replay validation, and SSE readers skip invalid events. Corrupt
+  heuristic-rule patterns reject a reload and preserve the cached rules; new sessions refuse to
+  start until those patterns are repaired. Pattern arrays must contain valid regex strings, and
+  unreadable scheduler locks prevent dispatch rather than allowing a takeover. Admin edits still
+  save and notify nodes when another corrupt rule prevents a local reload, with a warning that
+  allows administrators to repair rules one at a time.
+- **A force-cancelled `wait_for_workstream` stops.** A force-cancel gives the session a fresh
+  cancel event for its next turn, and the wait read the session's current one, so an abandoned wait
+  went on polling until its timeout, up to 600 seconds. It now checks the turn it belongs to.
 
 ### Security
 

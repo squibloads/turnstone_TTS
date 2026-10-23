@@ -554,17 +554,20 @@ def _build_registry() -> dict[str, SettingDef]:
             "ratelimit.enabled",
             "bool",
             False,
-            "Enable per-IP rate limiting",
+            "Enable per-user rate limiting",
             "ratelimit",
             restart_required=True,
             help="Limits how fast any single user can make requests, preventing abuse or "
-            "accidental overload. Uses a token bucket algorithm.",
+            "accidental overload. Uses a token bucket algorithm. Each signed-in user has their "
+            "own limit on each node, whether they connect directly or through the console; "
+            "requests to public paths, such as signing in, are limited per client address. The "
+            "web page, its static files and cancel requests are never limited.",
         ),
         SettingDef(
             "ratelimit.requests_per_second",
             "float",
             10.0,
-            "Max requests per second per IP",
+            "Max requests per second per user",
             "ratelimit",
             min_value=1.0,
             restart_required=True,
@@ -572,14 +575,15 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "ratelimit.burst",
             "int",
-            20,
+            50,
             "Burst allowance above rate limit",
             "ratelimit",
             min_value=1,
             restart_required=True,
             help="Allows short bursts of requests above the rate limit. For example, a user "
-            "can send 20 rapid requests before being throttled, then must stay under the "
-            "per-second limit.",
+            "can send 50 rapid requests before being throttled, then must stay under the "
+            "per-second limit. Reloading the page makes a few requests for each workstream "
+            "pane it restores.",
         ),
         SettingDef(
             "ratelimit.trusted_proxies",
@@ -588,8 +592,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "Trusted proxy CIDRs for X-Forwarded-For parsing (comma-separated)",
             "ratelimit",
             restart_required=True,
-            help="If your server is behind a load balancer or reverse proxy, list its IP "
-            "ranges here so rate limiting applies to the real client IP, not the proxy.",
+            help="Requests to public paths, such as signing in, are limited per client address. "
+            "If your server is behind a load balancer or reverse proxy, list its IP ranges "
+            "here so those requests are limited by the real client's address, not the proxy's.",
         ),
         # -- health ---------------------------------------------------------
         SettingDef(
@@ -1344,8 +1349,13 @@ def serialize_value(value: Any) -> str:
 
 
 def deserialize_value(key: str, json_str: str, *, clamp_range: bool = False) -> Any:
-    """JSON-decode and type-coerce against registry."""
-    raw = json.loads(json_str)
+    """JSON-decode and type-coerce against registry. A value nested too deeply to parse raises
+    ``ValueError``, as malformed JSON does, so a caller that skips an invalid value skips it too.
+    """
+    try:
+        raw = json.loads(json_str)
+    except RecursionError as exc:
+        raise ValueError(f"{key}: value nested too deeply to parse") from exc
     defn = SETTINGS.get(key)
     if defn is None:
         return raw  # Unknown key — return raw
