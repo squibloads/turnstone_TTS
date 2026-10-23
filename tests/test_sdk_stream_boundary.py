@@ -36,6 +36,7 @@ payloads are byte-exact regardless of source-encoding handling.
 """
 
 import contextlib
+import copy
 import json
 import socket
 import threading
@@ -90,6 +91,82 @@ ANTHROPIC_EVENTS = (
     + 'data: {"type":"content_block_delta","index":0,'
     '"delta":{"type":"text_delta","text":"hello"}}' + LF + LF
 )
+
+
+@pytest.mark.parametrize("block_type", ["tool_use", "server_tool_use"])
+@pytest.mark.parametrize("emission", ["start", "delta"])
+@pytest.mark.parametrize("container", ["object", "list"])
+@pytest.mark.parametrize("depth", [200, 201, 600])
+def test_tool_input_depth_is_bounded_before_replay_capture(block_type, emission, container, depth):
+    from turnstone.core.providers import drain_stream
+    from turnstone.core.providers._anthropic import AnthropicProvider
+
+    opening, closing = ('{"x":', "}") if container == "object" else ("[", "]")
+    raw_input = '{"x":' + opening * (depth - 1) + "0" + closing * (depth - 1) + "}"
+    expected_input = json.loads(raw_input)
+    block = {"type": block_type, "id": "tool_1", "name": "test", "input": {}}
+    if emission == "start":
+        block["input"] = expected_input
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "test",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": block},
+    ]
+    if emission == "delta":
+        events.append(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": raw_input},
+            }
+        )
+    events.extend(
+        [
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 1},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+    payload = "".join(
+        "event: " + event["type"] + LF + "data: " + json.dumps(event) + LF + LF for event in events
+    )
+    response = httpx2.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        stream=httpx2.ByteStream(payload.encode()),
+    )
+    with anthropic.Anthropic(
+        api_key="test-only",
+        max_retries=0,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(lambda request: response)),
+    ) as client:
+        stream = AnthropicProvider(compat=True).create_streaming(
+            client=client, model="test", messages=[{"role": "user", "content": "test"}]
+        )
+        if depth > 200:
+            error = "nested more than 200" if emission == "start" else "recursion limit exceeded"
+            with pytest.raises(ValueError, match=error):
+                drain_stream(stream)
+        else:
+            result = drain_stream(stream)
+            replay = copy.deepcopy(result.provider_blocks)
+            assert replay[0]["input"] == expected_input
+        assert response.is_closed
 
 
 @pytest.mark.parametrize("parts", [["Cannot", " help."], ["", "Cannot", "", " help.", ""]])
@@ -855,38 +932,38 @@ def test_closed_v3_default_client_creation_stays_unarmed(surface: str):
 
 
 def _loopback_lane(lane: str, port: int) -> tuple[Any, Any]:
-    """Real SDK client + provider for one streaming lane on a loopback server.
+    """Turnstone's own SDK client + provider for one streaming lane on a loopback server.
 
-    The Anthropic SDK appends ``/v1/messages`` to ``base_url`` itself; the
-    OpenAI SDK expects the ``/v1`` root.
+    Built through ``create_client`` so the HTTP client is the one production
+    closes during a registry reload. The Anthropic SDK appends ``/v1/messages``
+    to ``base_url`` itself; the OpenAI SDK expects the ``/v1`` root.
     """
-    from turnstone.core.providers import create_provider
+    from turnstone.core.providers import create_client, create_provider
 
+    origin = f"http://127.0.0.1:{port}"
     if lane == "anthropic":
-        client = anthropic.Anthropic(
-            api_key="probe", base_url=f"http://127.0.0.1:{port}", max_retries=0, timeout=5.0
-        )
-        return client, create_provider("anthropic")
-    client = openai.OpenAI(
-        api_key="probe", base_url=f"http://127.0.0.1:{port}/v1", max_retries=0, timeout=5.0
-    )
-    return client, create_provider("openai-compatible", api_surface=lane)
+        client = create_client("anthropic-compatible", base_url=origin, api_key="probe")
+        provider = create_provider("anthropic")
+    else:
+        client = create_client("openai-compatible", base_url=f"{origin}/v1", api_key="probe")
+        provider = create_provider("openai-compatible", api_surface=lane)
+    return client.with_options(max_retries=0, timeout=5.0), provider
 
 
 @pytest.mark.parametrize(
     ("lane", "payload"),
     [("chat", CHAT_CHUNK), ("responses", RESPONSES_EVENT), ("anthropic", ANTHROPIC_EVENTS)],
 )
-def test_cross_thread_default_client_close_then_wire_release_is_normalized(lane: str, payload: str):
-    """The ``ModelRegistry.reload()`` shape stays safe at the retry seam.
+def test_cross_thread_client_close_wakes_the_stream_read(lane: str, payload: str):
+    """The ``ModelRegistry.reload()`` shape ends a blocked stream at the retry seam.
 
     Neither OpenAI v3's nor Anthropic v1's synchronous HTTPX2 client promises
-    that cross-thread ``close()`` itself interrupts a blocked body read. Pin
-    the behavior Turnstone needs instead: closing from the admin thread
-    completes safely while a worker is in ``next()``, and the subsequent wire
-    release reaches ``transport_guarded`` as a provider-retryable
-    ``IncompleteStreamError`` for both OpenAI streaming adapters and the
-    Anthropic adapter.
+    that cross-thread ``close()`` interrupts a blocked body read, so Turnstone's
+    clients do it themselves. Closing from the admin thread while a worker is in
+    ``next()`` ends the read while the peer is still connected and silent, and
+    reaches ``transport_guarded`` as a provider-retryable ``IncompleteStreamError``
+    for both OpenAI streaming adapters and the Anthropic adapter. Without the
+    wake the read waits for the peer on Linux and for the read timeout on macOS.
     """
     from turnstone.core.providers import transport_guarded
     from turnstone.core.providers._protocol import IncompleteStreamError
@@ -968,11 +1045,11 @@ def test_cross_thread_default_client_close_then_wire_release_is_normalized(lane:
         assert reader_blocked.wait(timeout=10.0)
         assert close_done.wait(timeout=10.0)
         assert closer_errors == []
-        # The server has not closed its peer yet, proving close() completed
-        # safely rather than merely returning after an EOF unblocked it.
+        reader_thread.join(timeout=2.0)
+        assert not reader_thread.is_alive(), "close() did not wake the blocked read"
+        # The server has not closed its peer yet, so close() woke the read rather
+        # than an EOF from the peer.
         assert server_errors == []
-        release_peer.set()
-        reader_thread.join(timeout=10.0)
     finally:
         # Unblock and join every thread on every exit path so nothing
         # outlives the test (leaked-thread guard).

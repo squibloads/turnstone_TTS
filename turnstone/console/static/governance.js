@@ -4299,8 +4299,8 @@ function toggleHeuristicRule(ruleId, enabled) {
         });
       return r.json();
     })
-    .then(function () {
-      showToast(enabled ? "Rule enabled" : "Rule disabled");
+    .then(function (data) {
+      showToast(data.warning || (enabled ? "Rule enabled" : "Rule disabled"));
       loadJudgeHeuristicRules();
     })
     .catch(function (e) {
@@ -4331,8 +4331,8 @@ function deleteHeuristicRule(ruleId) {
             });
           return r.json();
         })
-        .then(function () {
-          showToast("Rule deleted");
+        .then(function (data) {
+          showToast(data.warning || "Rule deleted");
           loadJudgeHeuristicRules();
         })
         .catch(function (e) {
@@ -4423,8 +4423,10 @@ function disableBuiltinHeuristicRule(name) {
         });
       return r.json();
     })
-    .then(function () {
-      showToast("Built-in rule disabled \u2014 Reset to restore defaults");
+    .then(function (data) {
+      showToast(
+        data.warning || "Built-in rule disabled \u2014 Reset to restore defaults",
+      );
       loadJudgeHeuristicRules();
     })
     .catch(function (e) {
@@ -4457,8 +4459,8 @@ function resetHeuristicRule(ruleId) {
             });
           return r.json();
         })
-        .then(function () {
-          showToast("Rule reset to built-in defaults");
+        .then(function (data) {
+          showToast(data.warning || "Rule reset to built-in defaults");
           loadJudgeHeuristicRules();
         })
         .catch(function (e) {
@@ -4585,15 +4587,16 @@ function _submitHRShelf() {
         });
       return r.json();
     })
-    .then(function () {
+    .then(function (data) {
       window.TurnstoneHatch.setBusy(shelf, false);
       hideCreateHRModal();
       showToast(
-        ruleId
-          ? "Rule updated"
-          : isBuiltin
-            ? "Rule overridden"
-            : "Rule created",
+        data.warning ||
+          (ruleId
+            ? "Rule updated"
+            : isBuiltin
+              ? "Rule overridden"
+              : "Rule created"),
       );
       loadJudgeHeuristicRules();
     })
@@ -4789,8 +4792,8 @@ function toggleOGPattern(patternId, enabled) {
         });
       return r.json();
     })
-    .then(function () {
-      showToast(enabled ? "Pattern enabled" : "Pattern disabled");
+    .then(function (data) {
+      showToast(data.warning || (enabled ? "Pattern enabled" : "Pattern disabled"));
       loadJudgeOGPatterns();
     })
     .catch(function (e) {
@@ -4821,8 +4824,8 @@ function deleteOGPattern(patternId) {
             });
           return r.json();
         })
-        .then(function () {
-          showToast("Pattern deleted");
+        .then(function (data) {
+          showToast(data.warning || "Pattern deleted");
           loadJudgeOGPatterns();
         })
         .catch(function (e) {
@@ -4951,8 +4954,10 @@ function disableBuiltinOGPattern(name) {
         });
       return r.json();
     })
-    .then(function () {
-      showToast("Built-in pattern disabled \u2014 Reset to restore defaults");
+    .then(function (data) {
+      showToast(
+        data.warning || "Built-in pattern disabled \u2014 Reset to restore defaults",
+      );
       loadJudgeOGPatterns();
     })
     .catch(function (e) {
@@ -4985,8 +4990,8 @@ function resetOGPattern(patternId) {
             });
           return r.json();
         })
-        .then(function () {
-          showToast("Pattern reset to built-in defaults");
+        .then(function (data) {
+          showToast(data.warning || "Pattern reset to built-in defaults");
           loadJudgeOGPatterns();
         })
         .catch(function (e) {
@@ -5096,15 +5101,16 @@ function _submitOGPShelf() {
         });
       return r.json();
     })
-    .then(function () {
+    .then(function (data) {
       window.TurnstoneHatch.setBusy(shelf, false);
       hideCreateOGPModal();
       showToast(
-        patternId
-          ? "Pattern updated"
-          : isBuiltin
-            ? "Pattern overridden"
-            : "Pattern created",
+        data.warning ||
+          (patternId
+            ? "Pattern updated"
+            : isBuiltin
+              ? "Pattern overridden"
+              : "Pattern created"),
       );
       loadJudgeOGPatterns();
     })
