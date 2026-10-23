@@ -2018,6 +2018,7 @@ async def text_to_speech(request: Request) -> Response:
     )
     from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+    from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
@@ -2048,6 +2049,23 @@ async def text_to_speech(request: Request) -> Response:
     if not voice and config_store is not None:
         voice = (config_store.get("audio.tts_voice") or "").strip()
 
+    # On by default (the registry default applies); a missing config store
+    # means defaults, not "off".
+    if config_store is None or config_store.get("audio.tts_normalize"):
+        pronunciations = ""
+        if config_store is not None:
+            pronunciations = config_store.get("audio.tts_pronunciations") or ""
+        # Every rule is linear and the length cap bounds the work; a thread would
+        # not help (the regex holds the GIL).
+        text = normalize_for_speech(text, parse_pronunciations(pronunciations))
+        # Cleanup grows text (units and dates become words), and the cap is what
+        # sizes the backend call and the console's wait, so it bounds the text
+        # actually synthesized as well as the text sent.
+        if len(text) > _TTS_TEXT_CAP:
+            return JSONResponse(
+                {"error": f"text too long after speech cleanup (cap {_TTS_TEXT_CAP} chars)"},
+                status_code=400,
+            )
     capacity: _SpeechCapacity = request.app.state.tts
     if not capacity.try_admit():
         # Refused, not queued: see _SpeechCapacity.  429 like the node's other
