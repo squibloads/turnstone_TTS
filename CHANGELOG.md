@@ -272,7 +272,6 @@ frozen.
 
 ### Changed
 
-<<<<<<< HEAD
 - **Read-aloud speaks a reply one block at a time** — headings, paragraphs and table rows
   are each read as their own clip with a pause after them (a heading or paragraph under 20 characters joins the clip that follows and takes no pause of its own; a whole list is one clip, see below), instead of
   running into the next sentence, and a code block is replaced by "Code omitted." (consecutive blocks by one marker). A diagram (a ```mermaid block, rendered or not) says "Diagram omitted." instead of reading its labels aloud, and inline SVG, images, canvas, video and audio are skipped. Inline code of
@@ -286,7 +285,6 @@ frozen.
   closes the live stream and the stream teardown also stopped the audio. It now stops on Stop,
   when the conversation is rebuilt from history, and when the pane is closed.
 - **Every finished reply has its own read-aloud button** — the speaker used to appear only on the latest reply and moved on with Retry. It now stays on each reply once it has finished (a reply still streaming gets it when it settles), so an earlier answer can be read, or keep playing, while a newer one arrives.
-=======
 - **`spawn_batch` sends every child's create at once (#1457).** It sent them one after another,
   and each create waits up to 30 seconds for the console, which waits up to 30 seconds for the
   node, so a stalled console or node held the coordinator's call for up to five minutes. A stall
@@ -299,7 +297,6 @@ frozen.
   limiting on, a batch's creates arrive together and count against their creator's bucket; a
   create the limiter refuses is sent once more after the wait it names, and a second refusal is
   reported as denied (#1464).
->>>>>>> upstream/dev
 - **The denial nudge no longer waits out `memory.nudge_cooldown` (#924).** The note asking the
   model whether a rejected tool call reflects a lasting preference now follows each batch a person
   rejects; the cooldown spaces only the correction and completion nudges and the coordinator's
