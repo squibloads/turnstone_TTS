@@ -121,7 +121,6 @@ from turnstone.core.session_routes import (
     make_attachment_handlers,
     make_cancel_handler,
     make_close_handler,
-    make_command_handler,
     make_create_handler,
     make_dequeue_handler,
     make_detail_handler,
@@ -17868,11 +17867,6 @@ def create_app(
         # writes that match interactive's pattern.
         spawn_metrics=_coord_spawn_metrics,
         emit_message_queued=True,
-        # A coordinator composer has no separate command loop; a leading "/"
-        # on /send is a slash command, never chat (#1440). The pane also
-        # posts commands to the path-keyed route below, so a stale or
-        # blocked client cannot turn one into a model turn.
-        routes_slash_commands=True,
         events_replay=_coord_events_replay,
         create_supports_attachments=True,
         create_supports_user_id_override=False,
@@ -17988,16 +17982,6 @@ def create_app(
             restrict=coordinator_restrict,
             close_all_children=coordinator_close_all_children,
         ),
-    )
-    # Slash commands for hosted coordinators (#1440).  The node's
-    # POST /v1/api/command is body-keyed and not mounted on the console;
-    # this route reuses the same ChatSession.handle_command registry.
-    coord_workstream_routes.append(
-        Route(
-            "/api/workstreams/{ws_id}/command",
-            make_command_handler(coord_endpoint_config),
-            methods=["POST"],
-        )
     )
 
     app = Starlette(

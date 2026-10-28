@@ -3890,19 +3890,14 @@ class TestSessionModelHold:
         held_warns = [r for r in caplog.records if "session.model_held" in r.getMessage()]
         assert len(held_warns) == 1  # once per (alias, generation)
 
-    def test_coordinator_hold_offers_slash_model_remedy(self, tmp_db: str) -> None:
-        """A hosted coordinator routes slash commands (#1440), so its refusal
-        points at ``/model`` exactly like an interactive web session — but it
-        is hosted, not the CLI, so the remedy is not config.toml."""
+    def test_coordinator_hold_omits_slash_model_remedy(self, tmp_db: str) -> None:
+        """The coordinator routes no slash commands, so its refusal points
+        at the model's definition instead."""
         from turnstone.core.session import ModelNotLoadedError
 
         reg = self._registry()
         session = _make_durable_session(
-            registry=reg,
-            model_alias="gw",
-            kind=WorkstreamKind.COORDINATOR,
-            user_id="u1",
-            client_type=ClientType.WEB,
+            registry=reg, model_alias="gw", kind=WorkstreamKind.COORDINATOR, user_id="u1"
         )
         _client(session).chat.completions.create = MagicMock(side_effect=self._dead_client_error())
 
@@ -3912,9 +3907,8 @@ class TestSessionModelHold:
 
         message = session.ui.errors[-1]
         assert "This coordinator's model 'gw' isn't loaded" in message
-        assert "Switch to another model with /model <alias>" in message
+        assert "/model" not in message
         assert "check its definition" in message
-        assert "config.toml" not in message
 
     def test_a_secret_store_outage_suggests_trying_again(self, tmp_db: str) -> None:
         from turnstone.core.session import ModelNotLoadedError

@@ -5691,13 +5691,12 @@ class ChatSession:
         """Whether whoever reads this session's errors can run ``/model``: a person
         at the web UI or a CLI.
 
-        A hosted coordinator is a web reader with its own command route
-        (#1440), so it gets the same remedy. A coordinator's child is read by
-        the coordinator's model, which must never be steered to another
+        A coordinator routes no slash commands; a coordinator's child is read
+        by the coordinator's model, which must never be steered to another
         model; a scheduled run is unattended; chat sends every message as a
         message. An unknown surface gets the unattended answer too.
         """
-        if self._parent_ws_id:
+        if self._kind == WorkstreamKind.COORDINATOR or self._parent_ws_id:
             return False
         return self._client_type in (ClientType.WEB, ClientType.CLI)
 

@@ -7452,108 +7452,6 @@
         }
       }
     },
-    "/v1/api/workstreams/{ws_id}/command": {
-      "post": {
-        "summary": "Run a slash command on the coordinator session",
-        "operationId": "v1_api_workstreams_{ws_id}_command_post",
-        "tags": [
-          "Coordinator"
-        ],
-        "description": "Body ``{\"command\": \"/model <alias>\"}``.  The command runs on the same worker slot as a turn (mutual exclusion; ``409`` ``status: busy`` when a turn or another command holds it) and goes through the same registry as the interactive ``POST /v1/api/command``.  Results (including an unknown model alias) are delivered to the pane as ``info`` / ``error`` SSE events; the response only says whether the command was accepted.  ``/compact`` answers immediately; other commands are awaited up to 25 s and answer ``status: running`` after that.  A message that begins with ``/`` posted to ``/send`` is routed here instead of becoming a model turn.",
-        "parameters": [
-          {
-            "name": "ws_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CoordinatorCommandRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Error 400",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Error 403",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Error 404",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Error 409",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Error 500",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Error 503",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/api/workstreams/{ws_id}/attachments": {
       "post": {
         "summary": "Upload a file attachment to a coordinator workstream",
@@ -10992,21 +10890,6 @@
           }
         },
         "title": "CoordinatorCloseAllChildrenResponse",
-        "type": "object"
-      },
-      "CoordinatorCommandRequest": {
-        "description": "Body for POST /v1/api/workstreams/{ws_id}/command (coordinator).",
-        "properties": {
-          "command": {
-            "description": "Workstream-local slash command (for example /model, /clear or /instructions), including its arguments. It must begin with '/'. Lifecycle commands such as /new and /resume are local-CLI-only; the coordinator pane's /rewind and /retry use their path-keyed endpoints.",
-            "title": "Command",
-            "type": "string"
-          }
-        },
-        "required": [
-          "command"
-        ],
-        "title": "CoordinatorCommandRequest",
         "type": "object"
       },
       "CoordinatorCreateRequest": {
