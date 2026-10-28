@@ -15,8 +15,8 @@ serves the offer path's one query: a coordinator's reports by state.
 Idempotent in both directions.  Upgrade skips the DDL when an operator already
 has the table (a partial/manual install); downgrade only drops what it created.
 
-Revision ID: 085
-Revises: 084
+Revision ID: dt_voice_reports
+Revises: dt_voice_persona
 Create Date: 2026-10-18
 """
 
@@ -25,8 +25,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "085"
-down_revision = "084"
+revision = "dt_voice_reports"
+down_revision = "dt_voice_persona"
 branch_labels = None
 depends_on = None
 
