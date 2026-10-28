@@ -28,8 +28,8 @@ the old scope_id was discarded by design, deduped rows are gone, and a global
 row cannot say whether it was born global or promoted from voice.  There is no
 schema delta to undo either.
 
-Revision ID: 086
-Revises: 085
+Revision ID: dt_retire_voice_memory_scope
+Revises: dt_voice_reports
 Create Date: 2026-10-19
 """
 
@@ -38,8 +38,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "086"
-down_revision = "085"
+revision = "dt_retire_voice_memory_scope"
+down_revision = "dt_voice_reports"
 branch_labels = None
 depends_on = None
 
