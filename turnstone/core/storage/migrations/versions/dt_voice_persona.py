@@ -17,7 +17,7 @@ the built-in id is left untouched — it is an operator's persona, not this
 seed.  Downgrade deletes the row only while every seeded column still matches;
 once an operator edits or archives it, the row is theirs and survives.
 
-Revision ID: 084
+Revision ID: dt_voice_persona
 Revises: 083
 Create Date: 2026-10-18
 """
@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 import sqlalchemy as sa
 from alembic import op
 
-revision = "084"
+revision = "dt_voice_persona"
 down_revision = "083"
 branch_labels = None
 depends_on = None
