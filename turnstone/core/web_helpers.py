@@ -915,7 +915,6 @@ async def run_dictation[T](
     import asyncio
     import contextvars
     import time
-    from concurrent.futures import ThreadPoolExecutor
 
     from turnstone.core.audio import AudioBusyError
     from turnstone.core.log import get_logger
@@ -924,7 +923,7 @@ async def run_dictation[T](
         remaining = wait_s - (time.monotonic() - arrived)
         return call(**kwargs, admission_wait_s=max(0.0, remaining))
 
-    threads: ThreadPoolExecutor = request.app.state.stt
+    threads = request.app.state.stt
     context = contextvars.copy_context()
     work = threads.submit(context.run, _with_remaining_wait)
     result = asyncio.wrap_future(work)
@@ -946,7 +945,9 @@ async def run_dictation[T](
     return await result
 
 
-def _console_dictation(request: Request, arrived: float, call: Callable[..., Any], /, **kwargs: Any) -> Any:
+def _console_dictation(
+    request: Request, arrived: float, call: Callable[..., Any], /, **kwargs: Any
+) -> Any:
     """The console's dictation runner: :func:`run_dictation` with its own budget."""
     return run_dictation(
         request, arrived, call, wait_s=STT_ADMISSION_WAIT_S, max_threads=STT_MAX_THREADS, **kwargs
