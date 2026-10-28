@@ -71,6 +71,7 @@ class Upstream:
         self.seen_auth: list[str | None] = []
         self.drop_sessions = False  # answer a catalog list on a held session with a 404
         self.fail_method: tuple[str, int] | None = None  # answer this method with this status
+        self.discover_error: dict[str, Any] | None = None  # refuse server/discover at 400 with it
         self.stall_method: str | None = None  # hold this method's answer until released
         self.stalled = threading.Event()
         self.release = threading.Event()
@@ -131,6 +132,9 @@ class _Gate(BaseHTTPMiddleware):
             ):
                 error = {"code": -32601, "message": "Method not found"}
                 return JSONResponse({"jsonrpc": "2.0", "id": body["id"], "error": error})
+            if method == "server/discover" and self.upstream.discover_error is not None:
+                error = self.upstream.discover_error
+                return JSONResponse({"jsonrpc": "2.0", "id": None, "error": error}, 400)
             held = request.headers.get("mcp-session-id")
             if self.upstream.drop_sessions and held and method == "tools/list":
                 error = {"code": -32600, "message": "Session not found"}
@@ -223,9 +227,13 @@ def upstream() -> Iterator[tuple[str, Upstream]]:
             state.release.set()
 
 
-def _self_signed(tmp_path: Path) -> dict[str, str]:
+def _self_signed(tmp_path: Path, host: str = "127.0.0.1") -> dict[str, str]:
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)])
+    try:
+        san: x509.GeneralName = x509.IPAddress(ipaddress.ip_address(host))
+    except ValueError:
+        san = x509.DNSName(host)
     now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
@@ -235,10 +243,7 @@ def _self_signed(tmp_path: Path) -> dict[str, str]:
         .serial_number(x509.random_serial_number())
         .not_valid_before(now - datetime.timedelta(minutes=5))
         .not_valid_after(now + datetime.timedelta(days=1))
-        .add_extension(
-            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
-            critical=False,
-        )
+        .add_extension(x509.SubjectAlternativeName([san]), critical=False)
         .sign(key, hashes.SHA256())
     )
     cert_path, key_path = tmp_path / "cert.pem", tmp_path / "key.pem"
@@ -417,6 +422,20 @@ def test_a_server_refusing_discover_falls_back_to_initialize(
     assert probe.tools == ["alpha", "beta"]
 
 
+def test_a_server_refusing_discover_with_32000_falls_back_to_initialize(
+    upstream: tuple[str, Upstream],
+) -> None:
+    """Some servers refuse a request sent before their session with HTTP 400 and -32000, which the
+    SDK also uses for ``CONNECTION_CLOSED``. The connect still falls back to initialize (#1489)."""
+    base, state = upstream
+    state.discover_error = {"code": -32000, "message": "Bad Request: Server not initialized"}
+
+    probe = probe_http_server(f"{base}/mcp", name="srv")
+
+    assert probe.failure is None
+    assert probe.tools == ["alpha", "beta"]
+
+
 @pytest.mark.parametrize("status", [401, 403])
 def test_an_auth_status_on_discover_is_reported_without_a_fallback(
     upstream: tuple[str, Upstream], status: int
@@ -505,6 +524,19 @@ def test_an_untrusted_certificate_reports_tls(tmp_path: Path) -> None:
     assert probe.failure is not None
     assert probe.failure.kind == "tls"
     assert probe.failure.message.startswith("TLS handshake failed: certificate verify failed: ")
+
+
+def test_skipping_verification_accepts_any_certificate(tmp_path: Path) -> None:
+    """Neither the issuer nor the name is checked: a self-signed certificate for another host."""
+    with _serve(Upstream(), **_self_signed(tmp_path, host="kvm.example.com")) as port:
+        url = f"https://127.0.0.1:{port}/mcp"
+        verified = probe_http_server(url, name="srv")
+        skipped = probe_http_server(url, name="srv", tls_skip_verify=True)
+
+    assert verified.failure is not None
+    assert verified.failure.kind == "tls"
+    assert skipped.failure is None
+    assert skipped.tools == ["alpha", "beta"]
 
 
 def test_a_closed_port_is_unreachable() -> None:
@@ -949,6 +981,58 @@ def test_failed_add_stays_registered_and_the_health_loop_connects_it(
         assert mgr.get_server_status("srv")["tools"] == 2
     finally:
         mgr.shutdown()
+
+
+def test_a_saved_server_skips_verification_only_for_a_boolean_true(tmp_path: Path) -> None:
+    with _serve(Upstream(), **_self_signed(tmp_path)) as port:
+        url = f"https://127.0.0.1:{port}/mcp"
+        mgr = _manager({}, health_check_s=0)
+        mgr.start()
+        try:
+            mistyped = mgr.add_server_sync(
+                "typo", {"type": "streamable-http", "url": url, "tls_skip_verify": "true"}
+            )
+            skipped = mgr.add_server_sync(
+                "kvm", {"type": "streamable-http", "url": url, "tls_skip_verify": True}
+            )
+        finally:
+            mgr.shutdown()
+
+    assert mistyped["connected"] is False
+    assert mistyped["error"].startswith("TLS handshake failed: certificate verify failed: ")
+    assert skipped["connected"] is True
+    assert skipped["error"] == ""
+
+
+def test_the_connect_log_says_when_a_certificate_goes_unchecked(
+    tmp_path: Path, upstream: tuple[str, Upstream], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The node's own record of it: a configuration file's server shows nowhere else."""
+    base, _ = upstream
+    caplog.set_level(logging.INFO)
+    with _serve(Upstream(), **_self_signed(tmp_path)) as port:
+        mgr = _manager({}, health_check_s=0)
+        mgr.start()
+        try:
+            mgr.add_server_sync(
+                "kvm",
+                {
+                    "type": "streamable-http",
+                    "url": f"https://127.0.0.1:{port}/mcp",
+                    "tls_skip_verify": True,
+                },
+            )
+            mgr.add_server_sync("plain", {"type": "streamable-http", "url": f"{base}/mcp"})
+        finally:
+            mgr.shutdown()
+
+    connected = [r.getMessage() for r in caplog.records if "Connected MCP server" in r.getMessage()]
+    kvm = [line for line in connected if "'kvm'" in line]
+    plain = [line for line in connected if "'plain'" in line]
+    assert len(kvm) == 1
+    assert "(certificate not verified)" in kvm[0]
+    assert len(plain) == 1
+    assert "certificate" not in plain[0]
 
 
 def test_a_saved_web_page_fails_at_once(upstream: tuple[str, Upstream]) -> None:
