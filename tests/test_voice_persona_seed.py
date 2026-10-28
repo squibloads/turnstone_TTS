@@ -1,4 +1,4 @@
-"""Tests for the voice persona seed (migration 084 and ``personas/voice.md``).
+"""Tests for the voice persona seed (migration ``dt_voice_persona`` and ``personas/voice.md``).
 
 A voice session is a coordinator created with the ``voice`` persona (see
 ``turnstone.core.voice_config``).  The persona shelf is data, so these tests
@@ -59,7 +59,7 @@ def _persona_names(db_path: Path) -> set[str]:
 class TestVoicePersonaSeed:
     def test_seeded_as_an_unrestricted_coordinator(self, tmp_path: Path) -> None:
         db_path = tmp_path / "voice-seed.db"
-        command.upgrade(_alembic_cfg(db_path), "084")
+        command.upgrade(_alembic_cfg(db_path), "dt_voice_persona")
 
         row, err = _resolve(db_path, VOICE_PERSONA, "coordinator")
         assert err == ""
@@ -82,7 +82,7 @@ class TestVoicePersonaSeed:
 
     def test_refused_for_interactive(self, tmp_path: Path) -> None:
         db_path = tmp_path / "voice-kind.db"
-        command.upgrade(_alembic_cfg(db_path), "084")
+        command.upgrade(_alembic_cfg(db_path), "dt_voice_persona")
 
         row, err = _resolve(db_path, "voice", "interactive")
         assert row is None
@@ -93,7 +93,7 @@ class TestVoicePersonaSeed:
 
     def test_snapshot_freezes_the_voice_prompt(self, tmp_path: Path) -> None:
         db_path = tmp_path / "voice-snapshot.db"
-        command.upgrade(_alembic_cfg(db_path), "084")
+        command.upgrade(_alembic_cfg(db_path), "dt_voice_persona")
 
         row, err = _resolve(db_path, "voice", "coordinator")
         assert err == "" and row is not None
@@ -163,7 +163,7 @@ class TestVoicePersonaMigration:
         finally:
             engine.dispose()
 
-        command.upgrade(cfg, "084")
+        command.upgrade(cfg, "dt_voice_persona")
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
             with engine.connect() as conn:
@@ -183,7 +183,7 @@ class TestVoicePersonaMigration:
     def test_downgrade_removes_the_unmodified_seed(self, tmp_path: Path) -> None:
         db_path = tmp_path / "voice-downgrade.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "084")
+        command.upgrade(cfg, "dt_voice_persona")
         assert "voice" in _persona_names(db_path)
 
         command.downgrade(cfg, "083")
@@ -198,7 +198,7 @@ class TestVoicePersonaMigration:
         # not throw that work away.
         db_path = tmp_path / "voice-edited.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "084")
+        command.upgrade(cfg, "dt_voice_persona")
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
