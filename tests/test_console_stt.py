@@ -11,10 +11,9 @@ is not a coordinator must 404 rather than leak an interactive workstream.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,6 +30,9 @@ from turnstone.core.audio import (
     TranscriptionResult,
 )
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 COORD_ID = "abc123"
 INTERACTIVE_ID = "def456"
