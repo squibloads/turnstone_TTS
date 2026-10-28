@@ -2057,14 +2057,13 @@ model, and each turn records the message and then raises `ModelNotLoadedError`
 (a `ModelTurnLocalError`) before anything is dialed; `model_turn()` itself
 refuses a lane carrying that client before its admission slot or credential, so
 a call no check stopped never reaches the stand-in. The message names the model
-and a remedy for whoever reads it: `/model <alias>` on the web, in a hosted
-coordinator, and in the CLI, which reads its models from config.toml once; an
-admin for a coordinator's child (whose errors the coordinator's model reads, so
-they never name another model) and a scheduled run; and the channels' own
-advice in a chat conversation (`turnstone/core/model_remedies.py`), which says
-the message is kept, since chat has no `/retry`. `/model` prints the same
-message. The next send after the registry lists the model again rebinds it, and
-`/retry` re-sends
+and a remedy for whoever reads it: `/model <alias>` on the web and in the CLI,
+which reads its models from config.toml once; an admin for a coordinator, a
+coordinator's child (whose errors the coordinator's model reads, so they never
+name another model) and a scheduled run; and the channels' own advice in a chat
+conversation (`turnstone/core/model_remedies.py`), which says the message is
+kept, since chat has no `/retry`. `/model` prints the same message. The next
+send after the registry lists the model again rebinds it, and `/retry` re-sends
 a refused text message. A live session whose model a reload removes is held the
 same way: the binding is refreshed at the start of every send, every model round
 and every creation retry, so a model removed mid-send holds at its next round

@@ -758,42 +758,6 @@ It also starts background agents only when you ask for work, not when you
 think out loud. A voice session is easy to talk to in asides, and an aside
 like "I wonder whether the tests pass" should not turn into a fan-out.
 
-### Slash commands
-
-A voice session is a coordinator, and its composer runs the same slash-command
-registry as an interactive session. A message that begins with `/` is
-control-plane input: it is shown in the transcript as a command line and
-never sent to the model as chat.
-
-```
-/model deepseek-flash-high
-/reason low
-/compact
-```
-
-The rule is the interactive pane's: only a **leading** `/` counts. Text that
-merely contains one — a URL, a path inside a sentence — is ordinary chat. The
-same rule covers dictation: speech-to-text inserts the transcript into the
-composer, and a transcript that begins with a literal `/` is a command once
-sent. If the recognizer writes the word "slash" instead of the character, the
-result is prose, not a command.
-
-`/model <alias>` switches the session's model for the rest of the session and
-persists the choice, so a reopened coordinator keeps it. The switch is
-confirmed by a system message; `/model` with no argument shows the current
-alias and the available list, and an unknown alias answers with the name it
-tried plus the available aliases. `/help` lists the registry.
-
-Two commands need a browser control rather than a server command, and the
-coordinator composer routes them to the same path-keyed endpoints as the pane's
-rewind and retry controls: `/rewind <N>` drops the last N turns, and `/retry`
-re-runs the last turn. Commands that only make sense in the local CLI —
-`/new`, `/workstreams`, `/resume`, `/delete` — answer "only available in the
-local CLI", and `/exit` points at closing the tab. An unknown command answers
-`Unknown command: …` instead of silently doing nothing. Because command output
-is a system message, read-aloud does not speak it; the reply to your next turn
-is spoken as usual.
-
 ### Voice model role
 
 `coordinator.voice_model_alias` · default empty (use the Coordinator model) · set in **Models → Roles**

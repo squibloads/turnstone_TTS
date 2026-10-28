@@ -1194,54 +1194,6 @@ acknowledgement is lost.
 | 409    | `{"status": "cross_user_interjection", ...}`    | Another participant's turn is in flight |
 | 503    | `{"error": "workstream could not be read"}`     | Its record can't be read               |
 
-On a **coordinator** workstream (served by `turnstone-console`), a `message`
-whose first character is `/` never becomes a model turn: the route hands it
-to the session's command registry and answers with the command shape below.
-The pane also posts commands to the path-keyed route directly, so this guard
-is what keeps a stale or third-party client from asking the model to run its
-own `/model`.
-
----
-
-### `POST /v1/api/workstreams/{ws_id}/command`
-
-Runs a slash command on a **coordinator** workstream. Interactive
-workstreams use the node's body-keyed [`POST /v1/api/command`](#post-v1apicommand)
-instead; both call the same `ChatSession.handle_command` registry, so a
-command supported in one kind is available in the other unless noted below.
-
-**Path parameters:** `ws_id` — the coordinator workstream.
-
-**Request body:**
-
-```json
-{"command": "/model deepseek-flash-high"}
-```
-
-| Field     | Type   | Required | Description                                      |
-|-----------|--------|----------|--------------------------------------------------|
-| `command` | string | yes      | A slash command and its arguments; must begin `/` |
-
-**Response.** `{"status": "ok"}` means the command ran (or, for `/compact`,
-started). A command still running after 25 s answers `{"status": "running"}`
-and reports its result as SSE events. Results — including an unknown model
-alias or an unknown command — are delivered to the pane as `info` / `error`
-events; the HTTP body only says whether the command was accepted.
-
-| Status | Body | Condition |
-|--------|------|-----------|
-| 400 | `{"error": "Empty command"}` | No command text |
-| 400 | `{"error": "command must start with '/'"}` | The body is not a command |
-| 400 | `{"error": "… is not a coordinator command …"}` | `/rewind` or `/retry` (use the path-keyed mutation or the pane's control), `/new`, `/workstreams`, `/resume`, `/delete` (local CLI only), or `/exit` |
-| 404 | `{"error": "coordinator not found"}` | Unknown `ws_id` |
-| 409 | `{"status": "busy", "error": ...}` | A turn or another command holds the worker slot; nothing ran |
-| 503 | `{"status": "error", ...}` | The command worker could not be started |
-
-`/rewind` and `/retry` are deliberately rejected here: the pane's rewind and
-retry controls use `POST .../rewind` and `POST .../retry`, which emit
-`clear_ui` and re-dispatch the turn. The coordinator pane maps the typed
-forms to those endpoints itself.
-
 ---
 
 ### `POST /v1/api/workstreams/{ws_id}/approve`
