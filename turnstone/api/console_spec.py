@@ -1606,28 +1606,6 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[400, 403, 404, 409, 500, 503],
         tags=["Coordinator"],
     ),
-    EndpointSpec(
-        "/v1/api/workstreams/{ws_id}/command",
-        "POST",
-        "Run a slash command on the coordinator session",
-        description=(
-            'Body ``{"command": "/model <alias>"}``.  The command runs on '
-            "the same worker slot as a turn (mutual exclusion; ``409`` "
-            "``status: busy`` when a turn or another command holds it) and "
-            "goes through the same registry as the interactive "
-            "``POST /v1/api/command``.  Results (including an unknown model "
-            "alias) are delivered to the pane as ``info`` / ``error`` SSE "
-            "events; the response only says whether the command was "
-            "accepted.  ``/compact`` answers immediately; other commands are "
-            "awaited up to 25 s and answer ``status: running`` after that.  "
-            "A message that begins with ``/`` posted to ``/send`` is routed "
-            "here instead of becoming a model turn."
-        ),
-        request_model=CoordinatorCommandRequest,
-        response_model=StatusResponse,
-        error_codes=[400, 403, 404, 409, 500, 503],
-        tags=["Coordinator"],
-    ),
     # --- Coordinator attachments (P1.5: parity with interactive) ---
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/attachments",
@@ -1730,6 +1708,21 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         ),
         response_model=StatusResponse,
         error_codes=[400, 403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/command",
+        "POST",
+        "Run a slash command on the coordinator session",
+        description=(
+            "Runs ``/model`` on the coordinator's worker slot, as ``POST /v1/api/command`` "
+            "does on a node; any other command returns 400. A busy session returns 409, "
+            "and a command still running after 25 seconds answers ``running``. Gated on "
+            "``admin.coordinator``."
+        ),
+        request_model=CoordinatorCommandRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 403, 404, 409, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
@@ -1999,6 +1992,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
     CoordinatorApproveRequest,
+    CoordinatorCommandRequest,
     ApproveRequest,
     ApproveResponse,
     CancelRequest,
@@ -2015,7 +2009,6 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CoordinatorChildrenResponse,
     CoordinatorCloseAllChildrenRequest,
     CoordinatorCloseAllChildrenResponse,
-    CoordinatorCommandRequest,
     CoordinatorCreateRequest,
     CoordinatorCreateResponse,
     CoordinatorOpenResponse,

@@ -2090,6 +2090,45 @@ class TestSessionModelCommand:
         assert session.max_tokens == 2048
         assert session.reasoning_effort == "high"
 
+    @pytest.mark.parametrize(
+        ("kind", "expected"),
+        [(WorkstreamKind.COORDINATOR, "high"), (WorkstreamKind.INTERACTIVE, None)],
+    )
+    def test_model_switch_keeps_the_coordinator_effort_rung(
+        self,
+        kind: WorkstreamKind,
+        expected: str | None,
+        tmp_db: Any,
+        sqlite_backend_factory: Any,
+    ) -> None:
+        """A coordinator resolves effort through ``coordinator.reasoning_effort``
+        at creation; a ``/model`` switch keeps that rung, and saves it. Other
+        kinds never read it."""
+        from turnstone.core.config_store import ConfigStore
+
+        cs = ConfigStore(sqlite_backend_factory(str(tmp_db), create_tables=True))
+        cs.set("coordinator.reasoning_effort", "high", changed_by="test")
+        reg = ModelRegistry(
+            models={
+                "a": ModelConfig("a", "x", "x", "a-model"),
+                "b": ModelConfig("b", "y", "y", "b-model"),
+            },
+            default="a",
+        )
+        session = _make_durable_session(
+            registry=reg,
+            model_alias="a",
+            kind=kind,
+            user_id="u1",
+            config_store=cs,
+            client_type=ClientType.WEB,
+            reasoning_effort="high",
+        )
+        session.handle_command("/model b")
+        assert "Switched to" in session.ui.infos[-1]
+        assert session.reasoning_effort == expected
+        assert session._config_for_save()["reasoning_effort"] == (expected or "")
+
     def test_model_switch_storeless_keeps_explicit_knobs(self) -> None:
         """On a STORE-LESS session (the CLI), the current knobs are the
         user's explicit flags — the only authority that exists — so a
@@ -3890,10 +3929,10 @@ class TestSessionModelHold:
         held_warns = [r for r in caplog.records if "session.model_held" in r.getMessage()]
         assert len(held_warns) == 1  # once per (alias, generation)
 
-    def test_coordinator_hold_offers_slash_model_remedy(self, tmp_db: str) -> None:
-        """A hosted coordinator routes slash commands (#1440), so its refusal
-        points at ``/model`` exactly like an interactive web session — but it
-        is hosted, not the CLI, so the remedy is not config.toml."""
+    def test_coordinator_hold_names_slash_model_remedy(self, tmp_db: str) -> None:
+        """A coordinator's composer runs ``/model``, so its refusal names it,
+        and the ``/model`` readout repeats the refusal. Built WEB, as the
+        console factory builds every coordinator."""
         from turnstone.core.session import ModelNotLoadedError
 
         reg = self._registry()
@@ -3912,9 +3951,9 @@ class TestSessionModelHold:
 
         message = session.ui.errors[-1]
         assert "This coordinator's model 'gw' isn't loaded" in message
-        assert "Switch to another model with /model <alias>" in message
-        assert "check its definition" in message
-        assert "config.toml" not in message
+        assert "Switch to another model with /model <alias>, or ask an admin" in message
+        session.handle_command("/model")
+        assert message in session.ui.infos[-1]
 
     def test_a_secret_store_outage_suggests_trying_again(self, tmp_db: str) -> None:
         from turnstone.core.session import ModelNotLoadedError

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from turnstone.console.coordinator_alias import resolve_coordinator_alias
 from turnstone.core.log import get_logger
 from turnstone.core.model_turn import (
+    COORDINATOR_EFFORT_KEY,
     resolve_effort_setting,
     resolve_model_binding,
     resolve_temperature_setting,
@@ -220,7 +221,7 @@ def build_console_session_factory(
         # resolver treats an empty role key as "fall through to the global
         # rung", which would skip the Coordinator setting the voice role is
         # documented to inherit from.
-        effort_role_key = "coordinator.reasoning_effort"
+        effort_role_key = COORDINATOR_EFFORT_KEY
         if voice:
             voice_effort = (config_store.get("coordinator.voice_reasoning_effort") or "").strip()
             if voice_effort:

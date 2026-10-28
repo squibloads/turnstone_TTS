@@ -53,6 +53,7 @@ import {
   focusConvBatchHead,
   focusTemporarily,
   setToolOutputReviewState,
+  stripAnsi,
 } from "/shared/conversation.js";
 import {
   canAutoFoldTranscriptBatch,
@@ -1219,21 +1220,6 @@ function createCoordinatorPane(root, wsId, opts) {
 
   function appendText(role, text, opts) {
     return appendMsg(role, esc(text), opts);
-  }
-
-  // A slash command is control-plane input, not a conversational turn —
-  // echo it as the shared command chip, never as a user bubble.  The chip is
-  // deliberately not persisted: commands don't join the trajectory, so a
-  // bubble that vanished on reload would be a lie.  Same rendering as the
-  // interactive pane (``addCommandEcho``).
-  function appendCommandEcho(text) {
-    const el = document.createElement("div");
-    el.className = "msg command-echo";
-    el.setAttribute("aria-label", "command");
-    el.textContent = text;
-    messagesEl.appendChild(el);
-    _scheduleScroll();
-    return el;
   }
 
   // Structured ``.msg.watch-result`` card for a ``watch_triggered``
@@ -2932,44 +2918,17 @@ function createCoordinatorPane(root, wsId, opts) {
       composer.setProject(coordProjectName || "");
   }
 
-  // Run a slash command from the coordinator composer (#1440).  Commands are
-  // control-plane input: they never go to /send, so the model never sees one
-  // as chat.  Typed and dictated text take this path identically — dictation
-  // fills the composer, and only a literal leading "/" is a command (the
-  // interactive pane's rule); speech-to-text that writes the word "slash"
-  // instead of the character is ordinary prose.
-  function _runCoordCommand(text) {
+  // /model goes to the coordinator's /command route, never to /send: a
+  // command is control-plane input, not a turn. coordSend sends nothing else
+  // here (see its slash branch). Response arms mirror the interactive pane's
+  // sendMessage: busy and error ride non-2xx codes, so the body is read
+  // before any ok check.
+  function runCoordCommand(text) {
     if (busy) {
       appendText("info", "Session is busy — commands can't run mid-turn.", {
         label: "info",
       });
-      return false;
-    }
-    const parts = text.split(/\s+/);
-    const cmdWord = parts[0].toLowerCase();
-    // /rewind and /retry are path-keyed mutations, exactly as on the
-    // interactive pane.  The generic command route deliberately rejects them:
-    // handle_command's own implementations truncate history without the
-    // clear_ui re-render the pane needs.
-    if (cmdWord === "/rewind") {
-      const n = parseInt(parts[1], 10);
-      if (!Number.isInteger(n) || n < 1) {
-        appendText(
-          "error",
-          "Usage: /rewind <N> — N must be a positive integer",
-          { label: "error" },
-        );
-        composer.clear();
-        return false;
-      }
-      composer.clear();
-      _rewindToTurns(n);
-      return false;
-    }
-    if (cmdWord === "/retry") {
-      composer.clear();
-      _retryLast();
-      return false;
+      return;
     }
     authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/command", {
       method: "POST",
@@ -2978,8 +2937,6 @@ function createCoordinatorPane(root, wsId, opts) {
       body: JSON.stringify({ command: text }),
     })
       .then((r) =>
-        // Thread {ok, status} alongside the parsed body: busy (409) and
-        // start-failure (503) are loud arms below, not transport errors.
         r.json().then(
           (b) => ({ ok: r.ok, status: r.status, body: b || {} }),
           () => ({ ok: r.ok, status: r.status, body: {} }),
@@ -2988,13 +2945,11 @@ function createCoordinatorPane(root, wsId, opts) {
       .then(({ ok, status, body }) => {
         if (body.status === "busy") {
           appendText(
-            "error",
+            "info",
             body.error || "Session is busy — try again shortly.",
-            { label: "error" },
+            { label: "info" },
           );
         } else if (body.status === "running") {
-          // The command outlived the endpoint's completion backstop: the
-          // worker is still going, and its output arrives over SSE.
           appendText(
             "info",
             "Command is still running — results will appear here when it finishes.",
@@ -3015,13 +2970,21 @@ function createCoordinatorPane(root, wsId, opts) {
         }
       })
       .catch((err) => {
-        appendText("error", "Command failed: " + err.message, {
-          label: "error",
-        });
+        appendText(
+          "error",
+          "Command failed: " + (err && err.message ? err.message : err),
+          { label: "error" },
+        );
       });
-    appendCommandEcho(text);
+    // Echo as a command chip, not a user bubble: commands don't join the
+    // trajectory, so a bubble would vanish on reload.
+    const echo = document.createElement("div");
+    echo.className = "msg command-echo";
+    echo.setAttribute("aria-label", "command");
+    echo.textContent = text;
+    messagesEl.appendChild(echo);
+    scrollFollow.jumpToLatest();
     composer.clear();
-    return false;
   }
 
   function coordSend() {
@@ -3035,11 +2998,13 @@ function createCoordinatorPane(root, wsId, opts) {
       }
       return false;
     }
-    // Slash commands are control-plane input, not a conversational turn.
-    // Checked before the attachment gates: a command keeps any staged
-    // uploads for the next message instead of consuming them.
-    if (trimmed.startsWith("/")) {
-      return _runCoordCommand(trimmed);
+    // /model is the one slash command a coordinator runs (the server's
+    // _COORDINATOR_COMMANDS; change both together). Any other text, a
+    // leading "/" included (a path, another command word), goes to the
+    // coordinator as an ordinary message, as it always has.
+    if (/^\/model(\s|$)/i.test(trimmed)) {
+      runCoordCommand(trimmed);
+      return false;
     }
     // The live-turn interjection queue is text-only. Keep the input and chips
     // intact instead of optimistically clearing them before attachments_busy.
@@ -4309,15 +4274,22 @@ function createCoordinatorPane(root, wsId, opts) {
         }
         break;
       case "error":
-        appendText("error", ev.message || "(unknown error)", {
+        appendText("error", stripAnsi(ev.message || "(unknown error)"), {
           label: "error",
         });
         break;
       case "info":
         // .msg.info (think-indigo) is the intended variant for info
         // events; prior routing to "tool" gave them accent-tinted tool
-        // styling which mis-categorised them as tool calls.
-        appendText("info", ev.message || "", { label: "info" });
+        // styling which mis-categorised them as tool calls.  Command output
+        // (/model) is coloured when the console runs in a terminal; strip
+        // the escapes as the interactive pane does, and keep its line breaks
+        // (.msg-body collapses whitespace).
+        appendMsg(
+          "info",
+          esc(stripAnsi(ev.message || "")).replace(/\n/g, "<br>"),
+          { label: "info" },
+        );
         break;
       case "user_turn":
         acceptUserTurn(ev);

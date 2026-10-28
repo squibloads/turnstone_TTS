@@ -1194,54 +1194,6 @@ acknowledgement is lost.
 | 409    | `{"status": "cross_user_interjection", ...}`    | Another participant's turn is in flight |
 | 503    | `{"error": "workstream could not be read"}`     | Its record can't be read               |
 
-On a **coordinator** workstream (served by `turnstone-console`), a `message`
-whose first character is `/` never becomes a model turn: the route hands it
-to the session's command registry and answers with the command shape below.
-The pane also posts commands to the path-keyed route directly, so this guard
-is what keeps a stale or third-party client from asking the model to run its
-own `/model`.
-
----
-
-### `POST /v1/api/workstreams/{ws_id}/command`
-
-Runs a slash command on a **coordinator** workstream. Interactive
-workstreams use the node's body-keyed [`POST /v1/api/command`](#post-v1apicommand)
-instead; both call the same `ChatSession.handle_command` registry, so a
-command supported in one kind is available in the other unless noted below.
-
-**Path parameters:** `ws_id` — the coordinator workstream.
-
-**Request body:**
-
-```json
-{"command": "/model deepseek-flash-high"}
-```
-
-| Field     | Type   | Required | Description                                      |
-|-----------|--------|----------|--------------------------------------------------|
-| `command` | string | yes      | A slash command and its arguments; must begin `/` |
-
-**Response.** `{"status": "ok"}` means the command ran (or, for `/compact`,
-started). A command still running after 25 s answers `{"status": "running"}`
-and reports its result as SSE events. Results — including an unknown model
-alias or an unknown command — are delivered to the pane as `info` / `error`
-events; the HTTP body only says whether the command was accepted.
-
-| Status | Body | Condition |
-|--------|------|-----------|
-| 400 | `{"error": "Empty command"}` | No command text |
-| 400 | `{"error": "command must start with '/'"}` | The body is not a command |
-| 400 | `{"error": "… is not a coordinator command …"}` | `/rewind` or `/retry` (use the path-keyed mutation or the pane's control), `/new`, `/workstreams`, `/resume`, `/delete` (local CLI only), or `/exit` |
-| 404 | `{"error": "coordinator not found"}` | Unknown `ws_id` |
-| 409 | `{"status": "busy", "error": ...}` | A turn or another command holds the worker slot; nothing ran |
-| 503 | `{"status": "error", ...}` | The command worker could not be started |
-
-`/rewind` and `/retry` are deliberately rejected here: the pane's rewind and
-retry controls use `POST .../rewind` and `POST .../retry`, which emit
-`clear_ui` and re-dispatch the turn. The coordinator pane maps the typed
-forms to those endpoints itself.
-
 ---
 
 ### `POST /v1/api/workstreams/{ws_id}/approve`
@@ -1374,6 +1326,9 @@ the HTTP tenancy gates. Remote callers must use the dedicated create, open,
 fork (`resume_ws` on create), close, and delete endpoints. `/rewind` and
 `/retry` likewise use their path-keyed endpoints rather than `/command`.
 
+Coordinators use their own console route, described under
+`POST /v1/api/workstreams/{ws_id}/command` (Console) below.
+
 **Response:**
 
 ```json
@@ -1391,6 +1346,34 @@ or `{"status": "running"}` as above.
 | 409    | `{"status": "busy", "error": ...}`          | A turn/command holds the worker                  |
 | 503    | `{"status": "error", "error": ...}`         | The command worker could not be started (resource exhaustion) — the command did **not** run; retry shortly |
 | 503    | `{"error": "workstream could not be read"}` | Its record can't be read                         |
+
+---
+
+### `POST /v1/api/workstreams/{ws_id}/command` (Console)
+
+Runs a slash command in a coordinator session, with the same worker-slot rules
+as `POST /v1/api/command`. Coordinators run `/model` only. Requires
+`admin.coordinator`.
+
+**Request body:**
+
+```json
+{"command": "/model fast"}
+```
+
+**Response:** `{"status": "ok"}`, or `{"status": "running"}` for a command
+still running after 25 s.
+
+**Error responses:**
+
+| Status | Body                                                  | Condition                                  |
+|--------|-------------------------------------------------------|--------------------------------------------|
+| 400    | `{"error": "Empty command"}`                          | Command is empty                           |
+| 400    | `{"error": "/x is not available here. Available: /model."}` | Any command other than `/model`      |
+| 403    | `{"error": ...}`                                      | Caller lacks `admin.coordinator`           |
+| 404    | `{"error": ...}`                                      | No such coordinator, or not visible        |
+| 409    | `{"status": "busy", "error": ...}`                    | A turn/command holds the worker            |
+| 503    | `{"status": "error", "error": ...}`                   | The command worker could not be started    |
 
 ---
 
@@ -2730,7 +2713,7 @@ the `admin.settings` permission.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/v1/api/admin/mcp-servers` | List all MCP server definitions with live node status. Query: `?reveal=true` to show env/header secrets. |
-| POST | `/v1/api/admin/mcp-servers` | Create an MCP server definition. Body: `{name, transport, command?, args?, url?, headers?, env?, auto_approve?, enabled?}` |
+| POST | `/v1/api/admin/mcp-servers` | Create an MCP server definition. Body: `{name, transport, command?, args?, url?, headers?, env?, auto_approve?, enabled?, tls_skip_verify?}` |
 | GET | `/v1/api/admin/mcp-servers/{server_id}` | Get a single MCP server with per-node connection status. |
 | PUT | `/v1/api/admin/mcp-servers/{server_id}` | Update an MCP server definition. Partial updates supported. |
 | DELETE | `/v1/api/admin/mcp-servers/{server_id}` | Delete an MCP server definition. |
@@ -2748,12 +2731,42 @@ port out of range), or when a header name is not an HTTP token or a header value
 ASCII with no space at either end: no request could carry them. An update checks the URL only when
 it changes it or switches the transport to `streamable-http`, and only the header values it
 changes, so a row saved before these checks stays editable. Import reports such a server among its
-`errors` and imports the rest; a registry install answers `400`. When the URL's parse error would
-quote any of it before the host, where a password can sit, the error reads
-`url has an invalid host or port` instead.
+`errors` and imports the rest, as it does an entry that is not a JSON object; a registry install
+answers `400`. When the URL's parse error would quote any of it before the host, where a password
+can sit, the error reads `url has an invalid host or port` instead.
+
+`auto_approve` and `enabled` take `true`, `false`, `0` or `1`; create and update answer `400` for
+anything else, such as the string `"false"` or `null` (a null could mean clearing the flag as well
+as keeping it). Leave a field out to keep its stored value.
+
+`tls_skip_verify: true` makes the console and every node accept whatever certificate a Streamable
+HTTP server presents, checking neither its issuer nor its host name; the default `false` verifies
+it against the operating system's trust store. Create and update answer `400`, and import lists
+the server among its `errors`, when the value is not a JSON boolean (`null` included), or when it
+is `true` for a stdio server or for auth `oauth_user` or `oauth_obo`, whose per-user tokens need a
+verified certificate. Left out, it is `false` on create and import, and an update keeps the stored
+value, a new URL included. An update that moves a server to stdio or to per-user auth sets it back
+to `false`. See
+[Servers with self-signed certificates](tools.md#servers-with-self-signed-certificates) for when
+to use it.
+
+The `mcp_server.create`, `mcp_server.import` and `mcp_server.registry_install` audit events record
+where each Streamable HTTP server points, as `scheme://host:port`, never the URL's path or query: as
+`url`, or on an import as `origins` by server name. An update's `mcp_server.update` audit event
+lists the settings the write stores, changed or not: the console form re-sends every field with each
+save, so an event can list headers, flags and cleared OAuth settings (as `null`) that the edit left
+as they were. Headers, env and a stdio server's `args` appear only as `(updated)`. A changed URL
+appears only as `scheme://host:port`, never its path or query (`""` when the URL is cleared,
+`(updated)` when it is not an http or https URL with a host), and an unchanged URL is left out.
+An `oauth_audience` or `oauth_authorization_server_url` that holds an http or https URL also
+appears only as `scheme://host:port`. `tls_skip_verify` comes first, as `true`, on every edit of a
+server that skips verification, and as `false` on the edit that turns it off.
 
 Each server's `status` maps a node id (and `console`, for the console's own connection) to that
-connection's state. `has_error` is true while the last connect failed, and `error` says why.
+connection's state. `has_error` is true while the last connect failed, and `error` says why. A
+server from a node's configuration file has no row: it is listed with `source: "config"` and the
+transport its nodes report, and with placeholders for its other settings, such as an empty
+`command` and `url` and a `tls_skip_verify` of `false`.
 
 #### Test connection
 
@@ -2762,9 +2775,10 @@ connection's state. `has_error` is true while the last connect failed, and `erro
 Connects once to a Streamable HTTP server with auth `none` or `static`, the way a saved server's
 connect would, and lists its tools, resources and prompts. Nothing is saved and no catalog is
 published. The console runs the test from its own network position; nodes connect from theirs. Each
-test writes an `mcp_server.test` audit event with the scheme, host, port and outcome, never a header
-value or the rest of the URL; a header holding a `secret://` reference is recorded by name with the
-reference (`header_references`).
+test writes an `mcp_server.test` audit event with the scheme, host, port and outcome, and
+`tls_skip_verify: true` when the test skipped certificate verification, never a header value or the
+rest of the URL; a header holding a `secret://` reference is recorded by name with the reference
+(`header_references`).
 
 ```json
 {
@@ -2782,6 +2796,7 @@ reference (`header_references`).
 | `auth_type` | string | no (default `"static"`) | `"none"` or `"static"`. |
 | `transport` | string | no (default `"streamable-http"`) | Only `"streamable-http"` can be tested. |
 | `name` | string | no | Labels the server in error messages, and must be a valid server name; the URL's host stands in when empty. |
+| `tls_skip_verify` | boolean | no (default `false`) | `true` accepts any certificate, as a saved server with this setting does. |
 
 **Response:** `200` whether or not the server connected.
 
@@ -2809,11 +2824,11 @@ The request can take up to about a minute (the connect timeout, the session's te
 margin), so a client's timeout should be longer; a test still running then comes back with
 `kind` `timeout`.
 
-**Errors:** `400` (stdio transport, OAuth auth type, invalid name, URL or headers, or a `secret://`
-reference that is malformed, not the whole value, or refused by the store), `403` (no `admin.mcp`,
-or a `secret://` header without `admin.mcp` held explicitly, as from a service token), `429` (two
-tests are already running; the console runs at most two at once), `503` (the secret store cannot
-answer for a `secret://` header).
+**Errors:** `400` (stdio transport, OAuth auth type, invalid name, URL or headers, a
+`tls_skip_verify` that is not a JSON boolean, or a `secret://` reference that is malformed, not the
+whole value, or refused by the store), `403` (no `admin.mcp`, or a `secret://` header without
+`admin.mcp` held explicitly, as from a service token), `429` (two tests are already running; the
+console runs at most two at once), `503` (the secret store cannot answer for a `secret://` header).
 
 ---
 
