@@ -128,7 +128,9 @@ from turnstone.core.session_ui_base import (
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.trajectory import final_assistant_text
-from turnstone.core.web_helpers import TTS_TEXT_CAP as _TTS_TEXT_CAP  # noqa: F401 — the node's name for it
+from turnstone.core.web_helpers import (
+    TTS_TEXT_CAP as _TTS_TEXT_CAP,  # noqa: F401 — the node's name for it
+)
 from turnstone.core.web_helpers import RevalidatingStaticFiles
 from turnstone.core.web_helpers import SpeechCapacity as _SpeechCapacity
 from turnstone.core.web_helpers import version_html as _version_html
