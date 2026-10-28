@@ -120,6 +120,7 @@ from turnstone.core.session_routes import (
     make_send_handler,
     make_set_title_handler,
     register_session_routes,
+    run_slash_command,
 )
 from turnstone.core.session_ui_base import (
     AutoApproveReason,
@@ -1687,6 +1688,28 @@ async def list_available_models(request: Request) -> JSONResponse:
 
 _STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation clips
 
+# How long a dictation waits for one of its alias's max_concurrency slots before
+# the node answers 429.  It counts from the request's arrival, so the access
+# check and any wait for a dictation thread come out of it too; only the
+# transcode, usually tens of milliseconds, comes on top.  A dictation clip
+# transcribes in a second or so, so this covers a short queue of them, or a
+# generation on a shared alias that is about to end.  The console's wait for a
+# forwarded request is _PROXY_CLIENT_TIMEOUT_S (30 s), and this leaves half of it
+# for the transcode and the transcription, so a busy node says so instead of the
+# console reporting no reply.  test_dictation_wait_leaves_room_in_the_console_wait
+# pins the two numbers.
+_STT_ADMISSION_WAIT_S = 15.0
+
+# How many dictations a node admits at once.  Each transcodes, waits for its slot
+# and makes or opens its backend call on a thread of its own; a streamed
+# transcript is then read on the default executor, as before.  A dictation can
+# wait _STT_ADMISSION_WAIT_S for its slot, so these threads are a pool of their
+# own: on the default executor a burst would take the workers the service
+# heartbeat and every request's access check need.  More dictations wait for a
+# thread without holding one, within the same _STT_ADMISSION_WAIT_S, and are
+# refused with 429 when none comes free in time.
+_STT_MAX_THREADS = 4
+
 # Longest text one synthesis request may carry.  The browser's read-aloud sends a
 # whole message in one request, so this is also the longest message it can read.
 # A hosted backend may refuse first (OpenAI's speech models take at most 4,096
@@ -1713,7 +1736,8 @@ class _SpeechCapacity:
     replaces a play start the new one before the old one's abort lands.  On a
     backend that synthesizes one clip at a time, a play started beside a long one
     waits behind it there and can still time out: after 80 s of silence at the
-    node, or at the console's 90 s.
+    node, or at the console's 90 s.  A play also needs one of the TTS alias's
+    max_concurrency slots, and for the same reason is refused when none is free.
 
     Only the event loop admits and releases, so the count needs no lock.
     """
@@ -1771,6 +1795,96 @@ class _AbortOnExitStreamingResponse(StreamingResponse):
             self._abort_ref.abort()
 
 
+def _audio_busy(error: str) -> JSONResponse:
+    """The node's capacity answer for a voice call, which ``authFetch`` waits out
+    for ``Retry-After`` seconds and then retries."""
+    return JSONResponse({"error": error}, status_code=429, headers={"Retry-After": "5"})
+
+
+# How often a voice call asks whether its caller is still there.
+_AUDIO_DISCONNECT_POLL_S = 1.0
+
+
+async def _abort_when_caller_leaves(request: Request, abort_ref: Any, done: asyncio.Event) -> None:
+    """Stop a voice call when the caller hangs up.
+
+    A handler is not cancelled when its peer disconnects, and a thread cannot be
+    cancelled once it is inside the SDK read.  Aborting ``abort_ref`` is what
+    stops the work: a wait for the alias's admission slot gives up its place, and
+    the backend response the call published on ``abort_ref`` is closed, so the
+    next read raises and the worker returns instead of reading an answer nobody
+    is waiting for.  A read already waiting on a silent backend notices only when
+    bytes arrive, and before the backend sends headers there is no handle yet.
+    The backend call's own timeout bounds both: 80 s of silence for a play, and the
+    model client's timeout and retries for a dictation, by default 600 s an attempt.
+
+    The caller is the browser on a direct connection, or the console.  The
+    console closes its node request when the browser leaves a ``tts`` call
+    (``_proxy_tts``), and any forwarded call once its own wait runs out.  Polls
+    ``is_disconnected`` once a second.
+    """
+    while not done.is_set():
+        await asyncio.sleep(_AUDIO_DISCONNECT_POLL_S)
+        if await request.is_disconnected():
+            abort_ref.abort()
+            return
+
+
+@contextlib.asynccontextmanager
+async def _caller_watched(request: Request, abort_ref: Any) -> AsyncGenerator[None]:
+    """Run the block while :func:`_abort_when_caller_leaves` watches the caller."""
+    done = asyncio.Event()
+    watcher = asyncio.create_task(_abort_when_caller_leaves(request, abort_ref, done))
+    try:
+        yield
+    finally:
+        done.set()
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+
+
+async def _run_dictation[T](
+    request: Request, arrived: float, call: Callable[..., T], /, **kwargs: Any
+) -> T:
+    """Run a blocking transcription *call* on the node's dictation threads.
+
+    Two waits share one budget, _STT_ADMISSION_WAIT_S since the request *arrived*: the wait for
+    a free dictation thread, and the call's ``admission_wait_s`` for its model's slot.  A
+    dictation that gets no thread in time is refused as one that gets no slot is, so a node whose
+    threads are all held by long transcriptions still answers 429 before the console stops
+    waiting.  The context copy carries the request's log fields, as asyncio.to_thread does.
+    """
+    from turnstone.core.audio import AudioBusyError
+
+    def _with_remaining_wait() -> T:
+        remaining = _STT_ADMISSION_WAIT_S - (time.monotonic() - arrived)
+        return call(**kwargs, admission_wait_s=max(0.0, remaining))
+
+    threads: ThreadPoolExecutor = request.app.state.stt
+    context = contextvars.copy_context()
+    work = threads.submit(context.run, _with_remaining_wait)
+    result = asyncio.wrap_future(work)
+    # asyncio.wait cancels nothing it waits on, unlike wait_for: cancelling a shield whose inner
+    # call later fails makes asyncio log that failure as unhandled.
+    try:
+        done, _ = await asyncio.wait(
+            {result}, timeout=_STT_ADMISSION_WAIT_S - (time.monotonic() - arrived)
+        )
+    except asyncio.CancelledError:
+        result.cancel()  # as asyncio.to_thread does: a call still queued never runs
+        raise
+    if not done and work.cancel():
+        log.info(
+            "speech_to_text.no_free_thread",
+            threads=_STT_MAX_THREADS,
+            wait_seconds=round(time.monotonic() - arrived, 3),
+        )
+        raise AudioBusyError("No dictation thread came free in time")
+    # Done, or it started meanwhile and its own wait for a slot is bounded.
+    return await result
+
+
 async def speech_to_text(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/{ws_id}/speech-to-text — transcribe one audio clip.
 
@@ -1780,14 +1894,16 @@ async def speech_to_text(request: Request) -> JSONResponse:
     """
     from turnstone.core.audio import (
         AudioBackendError,
+        AudioBusyError,
         AudioUnavailableError,
         resolve_role_alias,
         transcribe,
     )
-    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
     from turnstone.core.web_helpers import read_multipart_file_or_400
 
+    arrived = time.monotonic()
     ws_id = request.path_params.get("ws_id", "")
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
@@ -1821,19 +1937,27 @@ async def speech_to_text(request: Request) -> JSONResponse:
     abort_ref = StreamAbortRef()
     backend_auth_resolver = _audio_backend_auth_resolver(request)
     try:
-        # Blocking SDK round-trip — offload so the shared event loop (and SSE
-        # streaming) stays responsive.
-        result = await asyncio.to_thread(
-            transcribe,
-            registry=registry,
-            alias=alias,
-            data=data,
-            filename=filename or "speech.webm",
-            prompt=stt_prompt,
-            config_store=config_store,
-            backend_auth_resolver=backend_auth_resolver,
-            cancel_ref=abort_ref,
-        )
+        # Blocking SDK round-trip, off the event loop.
+        async with _caller_watched(request, abort_ref):
+            result = await _run_dictation(
+                request,
+                arrived,
+                transcribe,
+                registry=registry,
+                alias=alias,
+                data=data,
+                filename=filename or "speech.webm",
+                prompt=stt_prompt,
+                config_store=config_store,
+                backend_auth_resolver=backend_auth_resolver,
+                cancel_ref=abort_ref,
+            )
+    except DeadlineCancelledError:
+        # Only the watcher aborts during the call, so the caller has gone.
+        log.debug("speech_to_text.caller_left")
+        return JSONResponse({"error": "Speech transcription was cancelled"}, status_code=499)
+    except AudioBusyError:
+        return _audio_busy("Speech transcription is busy; try again shortly")
     except BackendAuthUnavailableError:
         log.warning("speech_to_text.backend_auth_unavailable", exc_info=True)
         return JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
@@ -1870,14 +1994,16 @@ async def speech_to_text_stream(request: Request) -> Response:
     best-effort (a mid-stream backend error just ends the partial stream)."""
     from turnstone.core.audio import (
         AudioBackendError,
+        AudioBusyError,
         AudioUnavailableError,
         resolve_role_alias,
         transcribe_stream,
     )
-    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
     from turnstone.core.web_helpers import read_multipart_file_or_400
 
+    arrived = time.monotonic()
     ws_id = request.path_params.get("ws_id", "")
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
@@ -1911,19 +2037,31 @@ async def speech_to_text_stream(request: Request) -> Response:
     abort_ref = StreamAbortRef()
     backend_auth_resolver = _audio_backend_auth_resolver(request)
 
-    # Resolve + transcode + open the stream eagerly (off the event loop) so the
-    # common failures map to a clean status before any bytes are sent.
+    # Resolve + transcode + admission + open the stream eagerly (off the event
+    # loop) so the common failures map to a clean status before any bytes are
+    # sent.
     try:
-        deltas = await asyncio.to_thread(
-            transcribe_stream,
-            registry=registry,
-            alias=alias,
-            data=data,
-            prompt=stt_prompt,
-            config_store=config_store,
-            backend_auth_resolver=backend_auth_resolver,
-            cancel_ref=abort_ref,
-        )
+        async with _caller_watched(request, abort_ref):
+            deltas = await _run_dictation(
+                request,
+                arrived,
+                transcribe_stream,
+                registry=registry,
+                alias=alias,
+                data=data,
+                prompt=stt_prompt,
+                config_store=config_store,
+                backend_auth_resolver=backend_auth_resolver,
+                cancel_ref=abort_ref,
+            )
+    except DeadlineCancelledError:
+        # Only the watcher aborts during the call, so the caller has gone.
+        abort_ref.abort()
+        log.debug("speech_to_text_stream.caller_left")
+        return JSONResponse({"error": "Speech transcription was cancelled"}, status_code=499)
+    except AudioBusyError:
+        abort_ref.abort()
+        return _audio_busy("Speech transcription is busy; try again shortly")
     except BackendAuthUnavailableError:
         abort_ref.abort()
         log.warning("speech_to_text_stream.backend_auth_unavailable", exc_info=True)
@@ -1982,36 +2120,11 @@ async def speech_to_text_stream(request: Request) -> Response:
     )
 
 
-# How often the synthesis path asks whether its caller is still there.
-_TTS_DISCONNECT_POLL_S = 1.0
-
-
-async def _abort_when_caller_leaves(request: Request, abort_ref: Any, done: asyncio.Event) -> None:
-    """Stop synthesis when the caller hangs up.
-
-    A handler is not cancelled when its peer disconnects, and a thread cannot be
-    cancelled once it is inside the SDK read.  Closing the captured stream is
-    what stops the work: ``synthesize`` publishes the response handle on
-    ``abort_ref``, so closing it makes the next read raise and the worker return
-    instead of reading a clip nobody is waiting for.  A read already waiting on a
-    silent backend notices only when bytes arrive, and before the backend sends
-    headers there is no handle yet; the backend call's own timeout bounds both.
-
-    The caller is the browser on a direct connection, or the console, which
-    closes its node request when the browser leaves (``_proxy_tts``).  Polls
-    ``is_disconnected`` once a second.
-    """
-    while not done.is_set():
-        await asyncio.sleep(_TTS_DISCONNECT_POLL_S)
-        if await request.is_disconnected():
-            abort_ref.abort()
-            return
-
-
 async def text_to_speech(request: Request) -> Response:
     """POST /v1/api/tts — synthesize assistant text into playable audio."""
     from turnstone.core.audio import (
         AudioBackendError,
+        AudioBusyError,
         AudioUnavailableError,
         resolve_role_alias,
         synthesize,
@@ -2066,19 +2179,14 @@ async def text_to_speech(request: Request) -> Response:
                 {"error": f"text too long after speech cleanup (cap {_TTS_TEXT_CAP} chars)"},
                 status_code=400,
             )
+    # Refused, not queued, by the node's threads and by the alias's slots alike:
+    # see _SpeechCapacity.  429 like the node's other capacity refusals.
+    busy = "Speech synthesis is busy; try again shortly"
     capacity: _SpeechCapacity = request.app.state.tts
     if not capacity.try_admit():
-        # Refused, not queued: see _SpeechCapacity.  429 like the node's other
-        # capacity refusals, which the browser retries after Retry-After.
-        return JSONResponse(
-            {"error": "Speech synthesis is busy; try again shortly"},
-            status_code=429,
-            headers={"Retry-After": "5"},
-        )
+        return _audio_busy(busy)
 
     abort_ref = StreamAbortRef()
-    done = asyncio.Event()
-    watcher = asyncio.create_task(_abort_when_caller_leaves(request, abort_ref, done))
     try:
         call = functools.partial(
             synthesize,
@@ -2089,18 +2197,22 @@ async def text_to_speech(request: Request) -> Response:
             config_store=config_store,
             backend_auth_resolver=_audio_backend_auth_resolver(request),
             cancel_ref=abort_ref,
+            admission_wait_s=0,
         )
         # Blocking SDK round-trip, off the event loop.  The context copy carries
         # the request's log fields, as asyncio.to_thread does.
         context = contextvars.copy_context()
-        speech = await asyncio.get_running_loop().run_in_executor(
-            capacity.executor, context.run, call
-        )
+        async with _caller_watched(request, abort_ref):
+            speech = await asyncio.get_running_loop().run_in_executor(
+                capacity.executor, context.run, call
+            )
     except DeadlineCancelledError:
         # Only the watcher aborts during the call, so the caller has gone and
         # nobody reads this answer.
         log.debug("text_to_speech.caller_left")
         return JSONResponse({"error": "Speech synthesis was cancelled"}, status_code=499)
+    except AudioBusyError:
+        return _audio_busy(busy)
     except BackendAuthUnavailableError:
         log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
         return JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
@@ -2111,10 +2223,6 @@ async def text_to_speech(request: Request) -> Response:
         log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
         return JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
     finally:
-        done.set()
-        watcher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watcher
         abort_ref.abort()
         capacity.release()
 
@@ -2238,15 +2346,6 @@ async def metrics_endpoint(request: Request) -> Response:
     return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
-# Quick-command completion backstop.  MUST stay strictly below the
-# console proxy's client timeout (console/server.py
-# _PROXY_CLIENT_TIMEOUT_S = 30) or the degraded ``running`` answer can
-# never traverse a proxied pane — the proxy aborts first, the pane's
-# dispatch swallows the 5xx, and the caller sees nothing at all.  The
-# inequality is pinned by a test importing both constants.
-_COMMAND_RESPONSE_BACKSTOP_S = 25
-
-
 def _capture_cancel_forensics(session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]:
     """Snapshot in-flight session state for the cancel response.
 
@@ -2324,280 +2423,45 @@ async def command(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
     assert ws.session is not None
 
-    try:
-        # Permission gate for conversation-modifying commands
-        cmd_word = cmd.strip().split(None, 1)[0].lower()
-        # ``/rewind`` and ``/retry`` were lifted to path-keyed endpoints
-        # (POST /v1/api/workstreams/{ws_id}/rewind|retry, issue #549).
-        # Reject them here so a stale web client gets a clear pointer
-        # instead of a half-applied mutation: ``handle_command`` below
-        # would still rewind/retry, but the web-specific clear_ui emit +
-        # retry re-dispatch no longer live in this handler. The terminal
-        # CLI keeps dispatching these through ``handle_command`` in-process.
-        if cmd_word in ("/rewind", "/retry"):
-            verb = cmd_word[1:]
-            return JSONResponse(
-                {
-                    "error": (
-                        f"{cmd_word} is no longer served by /command; "
-                        f"use POST /v1/api/workstreams/{{ws_id}}/{verb}"
-                    )
-                },
-                status_code=400,
-            )
-
-        if cmd_word in {"/new", "/workstreams", "/resume", "/delete"}:
-            # These are local-CLI lifecycle helpers, not remote conversation
-            # commands.  Their implementations enumerate or mutate storage
-            # globally and predate the HTTP surface's tenant/project gates.
-            # Reject here before dispatching a worker so alternate/test
-            # Session implementations cannot bypass ChatSession's matching
-            # defence-in-depth guard.
-            return JSONResponse(
-                {"error": "This workstream command is only available in the local CLI."},
-                status_code=400,
-            )
-
-        from turnstone.core import session_worker
-
-        session = ws.session
-        cmd_ui = ui
-        command_principal = _auth_user_id(request).strip()
-        busy_hit = False
-
-        def _reject_busy() -> None:
-            # Worker already running (a turn or another command is in
-            # flight).  Commands aren't queueable work — surface "busy"
-            # instead.  Server-side mirror of the composer's client guard,
-            # and a strict improvement for API callers: the old inline path
-            # let /clear & co. mutate the session mid-turn.
-            nonlocal busy_hit
-            busy_hit = True
-
-        def _dispatch_command(
-            run: Callable[[], None], thread_name: str, busy_hint: str
-        ) -> JSONResponse | None:
-            """Dispatch a command worker; return the refusal response or None.
-
-            One envelope for both command branches: the unknown-workstream
-            404 and the busy refusal differ only in the retry hint.  The
-            worker slot is claimed with ``worker_kind="command"`` — the
-            /send route DEFERS (never queues) while that kind holds the
-            slot, so the mid-turn interjection queue and its turn-shaped
-            semantics (length cap, cross-user guard) are unreachable for
-            the whole command window; messages sent mid-command are
-            answered ``queued`` immediately and dispatched as ordinary
-            full-fidelity sends by the pending-send drain when the window
-            closes.
-            """
-            try:
-                dispatched = session_worker.send(
-                    ws,
-                    enqueue=_reject_busy,
-                    run=run,
-                    expected_session=session,
-                    thread_name=thread_name,
-                    worker_kind="command",
+    cmd_word = cmd.strip().split(None, 1)[0].lower()
+    # ``/rewind`` and ``/retry`` were lifted to path-keyed endpoints
+    # (POST /v1/api/workstreams/{ws_id}/rewind|retry, issue #549).
+    # Reject them here so a stale web client gets a clear pointer
+    # instead of a half-applied mutation: ``handle_command`` (reached
+    # through ``run_slash_command``) would still rewind/retry, but the
+    # web-specific clear_ui emit + retry re-dispatch no longer live in
+    # this handler. The terminal CLI keeps dispatching these through
+    # ``handle_command`` in-process.
+    if cmd_word in ("/rewind", "/retry"):
+        verb = cmd_word[1:]
+        return JSONResponse(
+            {
+                "error": (
+                    f"{cmd_word} is no longer served by /command; "
+                    f"use POST /v1/api/workstreams/{{ws_id}}/{verb}"
                 )
-            except Exception:
-                # Thread.start failed (exhaustion, MemoryError) — the
-                # dispatcher rolled the slot claim back and re-raised.
-                # Answer 503, NOT the endpoint's generic 200-ok arm: a
-                # command worker that never spawned must be as loud as
-                # the busy 409 below — a status-code-only SDK caller
-                # would otherwise believe its /clear or /name applied
-                # and silently run against un-changed state.
-                log.exception("command.worker_spawn_failed ws=%s", ws.id[:8])
-                return JSONResponse(
-                    {
-                        "status": "error",
-                        "error": "Command worker could not be started — retry shortly.",
-                    },
-                    status_code=503,
-                )
-            if not dispatched:
-                return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-            if busy_hit:
-                # 409, not 200: the refusal is deliberate (mutual exclusion
-                # replaced the old inline mid-turn interleave) but it must
-                # be LOUD — a status-code-only SDK caller treats a 200 as
-                # "command ran" and silently loses the rename/clear/config
-                # change.  Same shape as /send's cross-user 409.
-                return JSONResponse(
-                    {
-                        "status": "busy",
-                        "error": (
-                            "Session is busy — wait for the current turn to "
-                            f"finish, then {busy_hint}."
-                        ),
-                    },
-                    status_code=409,
-                )
-            return None
+            },
+            status_code=400,
+        )
 
-        if cmd_word == "/compact":
-            # Manual compaction runs LLM summary calls — seconds to minutes.
-            # It gets the send path's worker dispatch instead of an inline
-            # call so (a) the event loop stays free to stream the compaction
-            # progress events this very command produces (inline, they only
-            # flushed in one burst after the blocking call returned — the
-            # "no visible indicator" bug), and (b) a message sent
-            # mid-compaction takes the existing queue path instead of racing
-            # the history swap on a second worker.  compact_now() carries
-            # send()'s generation discipline, so a force-abandoned compact
-            # thread goes stale instead of swapping history under a
-            # successor, and a cancel aimed at it is consumed on exit.
-            # Fire-and-forget: the response returns as soon as the worker is
-            # dispatched and NO completion bound applies — a large context
-            # can legitimately compact for many minutes; progress streams
-            # over SSE and Stop cancels it.  (The 25s wait below is for the
-            # quick commands only.)
-
-            def _run_compact() -> None:
-                me = threading.current_thread()
-                # Snapshot for the exit restore: with the slot free to
-                # claim, only IDLE or ERROR are reachable here (the live
-                # states imply a held slot and _dispatch_command refuses
-                # busy).  ERROR is the user-investigatable badge (same
-                # carve-out the orphan reaper honors) and /compact neither
-                # retries nor resolves the failed turn — the old inline
-                # /compact never touched ws.state — so the badge must
-                # survive the window; everything else exits to idle.
-                prev_state = ws.state
-                try:
-                    cmd_ui.on_state_change("thinking")
-                    session.compact_now(principal_id=command_principal)
-                except GenerationCancelled:
-                    # User stopped it — including a Stop that landed in the
-                    # completion tail, which compact_now re-raises after
-                    # consuming.
-                    pass
-                finally:
-                    # Abandoned-worker guard — mirrors the send/retry
-                    # closures: a force-cancelled compact thread must not
-                    # touch state a successor worker now owns.
-                    if ws.worker_thread is me:
-                        try:
-                            # Backstop only: sends during the command window
-                            # DEFER in the /send route (they cannot reach the
-                            # interjection queue — see _dispatch_command), so
-                            # anything found here predates the window (a
-                            # message stranded by a dying send worker's
-                            # closing race).  Record it in the transcript
-                            # rather than leaving it invisible.
-                            if session.flush_queued_messages():
-                                log.warning("ws.compact.stranded_queue_flushed ws=%s", ws.id[:8])
-                        except Exception:
-                            log.exception("ws.compact.exit_seam_failed ws=%s", ws.id[:8])
-                        cmd_ui.on_state_change(
-                            "error" if prev_state is WorkstreamState.ERROR else "idle"
-                        )
-
-            refusal = _dispatch_command(
-                _run_compact, f"compact-worker-{ws.id[:8]}", "run /compact again"
-            )
-            if refusal is not None:
-                return refusal
-            return JSONResponse({"status": "ok"})
-
-        # Every other command ALSO runs on the workstream's worker slot —
-        # the inline call this replaced was serialized by the event loop
-        # itself (nothing else could interleave with it); to_thread alone
-        # would let /clear & co. race a running /compact worker, a live
-        # send, or another command.  The slot restores that mutual
-        # exclusion with an explicit busy answer, and the endpoint awaits
-        # completion off-loop so the response still reflects the outcome.
-        loop = asyncio.get_running_loop()
-        done = asyncio.Event()
-
-        def _run_cmd() -> None:
-            me = threading.current_thread()
-            try:
-                should_exit = session.handle_command(
-                    cmd,
-                    principal_id=command_principal,
-                )
-                # Post-command follow-ups run HERE, on the worker, not
-                # after the endpoint's done-wait: past the 25s backstop the
-                # endpoint has already answered {"status": "running"}, and
-                # follow-ups parked there were silently skipped — every pane
-                # kept rendering a transcript the command had changed, and the
-                # workstream list kept a stale name.
-                # Abandoned-worker guard, mirroring every sibling closure:
-                # a force-cancelled wedged command that unwedges minutes
-                # later must not fire clear_ui into a successor turn's live
-                # stream (every pane would wipe mid-answer) nor write a
-                # post-swap name from a stale session read.
-                if ws.worker_thread is me:
-                    if should_exit:
-                        cmd_ui.on_info("Session ended. You can close this tab.")
-                    if cmd_word == "/clear":
-                        # clear_ui signals the frontend to re-fetch history
-                        # via REST.
-                        cmd_ui._enqueue({"type": "clear_ui"})
-                    if cmd_word == "/name":
-                        # Sync the in-memory workstream name after any
-                        # command that can change it, so /api/workstreams
-                        # and future page loads see the right name.
-                        from turnstone.core.memory import get_workstream_display_name
-
-                        updated_name = get_workstream_display_name(session.ws_id)
-                        if updated_name:
-                            ws.name = updated_name
-            except GenerationCancelled:
-                # Defense-in-depth, the sibling of _run_initial's arm (no
-                # generic command claims a generation today, so this is
-                # effectively unreachable).  ``session_worker._runner``
-                # catches only ``Exception`` — without this arm a stray
-                # cancel would kill the worker thread via
-                # ``threading.excepthook``; the finally below still
-                # unblocks the endpoint either way.
-                if ws.worker_thread is me:
-                    cmd_ui.on_info("Command cancelled.")
-            except Exception as e:
-                # Same guard: a late "Command error:" from an abandoned
-                # worker would land mid-successor-turn.
-                if ws.worker_thread is me:
-                    cmd_ui.on_error(f"Command error: {e}")
-            finally:
-                # Unblock the endpoint response.  Suppress the loop-closed
-                # RuntimeError (process shutdown mid-command): nobody is
-                # waiting anymore.  No queue drain here: sends during the
-                # command window DEFER in the /send route (the interjection
-                # queue is unreachable while worker_kind == "command"), so
-                # the pending-send drain dispatches them as ordinary sends
-                # when this worker exits — the stranded-message backstop
-                # lives on the /compact seam, the only command window long
-                # enough to matter.
-                with contextlib.suppress(RuntimeError):
-                    loop.call_soon_threadsafe(done.set)
-
-        refusal = _dispatch_command(_run_cmd, f"command-worker-{ws.id[:8]}", "retry the command")
-        if refusal is not None:
-            return refusal
-        # Commands are quick (the long-runner, /compact, took the branch
-        # above); the bound is a backstop so a wedged command can't hold
-        # this request open forever — the worker keeps running, its output
-        # reaches the pane via SSE, and the post-command follow-ups run on
-        # the worker itself, so a late completion still refreshes the
-        # panes.  Loop-native wait (call_soon_threadsafe from the worker's
-        # finally): a thread parked in Event.wait via to_thread would hold
-        # a shared default-executor slot for the whole wait per wedged
-        # command.  The bound (_COMMAND_RESPONSE_BACKSTOP_S) sits strictly
-        # under the console proxy's client timeout so the degraded
-        # ``running`` answer can actually traverse a proxied pane — at 60s
-        # the proxy aborted first, the pane's dispatch swallowed the 5xx,
-        # and the user saw nothing at all (the same bounded-caller
-        # reasoning that redesigned /send's command-window path).
-        try:
-            async with asyncio.timeout(_COMMAND_RESPONSE_BACKSTOP_S):
-                await done.wait()
-        except TimeoutError:
-            return JSONResponse({"status": "running"})
-    except Exception as e:
-        ui.on_error(f"Command error: {e}")
-
-    return JSONResponse({"status": "ok"})
+    if cmd_word in {"/new", "/workstreams", "/resume", "/delete"}:
+        # These are local-CLI lifecycle helpers, not remote conversation
+        # commands.  Their implementations enumerate or mutate storage
+        # globally and predate the HTTP surface's tenant/project gates.
+        # Reject here before dispatching a worker so alternate/test
+        # Session implementations cannot bypass ChatSession's matching
+        # defence-in-depth guard.
+        return JSONResponse(
+            {"error": "This workstream command is only available in the local CLI."},
+            status_code=400,
+        )
+    return await run_slash_command(
+        ws,
+        ui,
+        ws.session,
+        cmd,
+        principal_id=_auth_user_id(request).strip(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3343,7 +3207,8 @@ async def _interactive_create_post_install(
                 # (session.py:6474), and an orphaned/superseded cancel returns
                 # WITHOUT re-raising — so this arm carries no direct unit test,
                 # its non-triggering being send's own contract.  Kept for
-                # symmetry with the _run/_run_cmd/_run_compact siblings and to
+                # symmetry with the _run sibling and session_routes'
+                # run_slash_command closures (_run_cmd/_run_compact), and to
                 # settle a stray GenerationCancelled to idle rather than leak it.
                 if ws.worker_thread is me and isinstance(ws.ui, WebUI):
                     ws.ui.on_stream_end()
@@ -3375,7 +3240,7 @@ async def _interactive_create_post_install(
                     session.ensure_error_recorded(exc)
             finally:
                 # Deliberately NOT owner-gated, unlike the except arms above
-                # and the _run_cmd/_run_compact follow-ups: those mutate
+                # and the run_slash_command follow-ups: those mutate
                 # live slot/UI state a successor now owns, while the notify
                 # is workstream-scoped — an outward signal that this
                 # workstream's initial turn ran to completion and its
@@ -5802,6 +5667,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
             log.warning("server.daemon_thread_join_timeout", thread=_t.name)
     app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
     app.state.tts.shutdown()
+    app.state.stt.shutdown(wait=True, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -6255,8 +6121,9 @@ def create_app(
     app.state.config_store = config_store
     app.state.advertise_url = advertise_url
     # Built here rather than in the lifespan so every app, test apps included,
-    # runs synthesis through it; its threads start on first use.
+    # runs synthesis and dictation through them; their threads start on first use.
     app.state.tts = _SpeechCapacity()
+    app.state.stt = ThreadPoolExecutor(max_workers=_STT_MAX_THREADS, thread_name_prefix="stt")
 
     from turnstone.core.auth import LoginRateLimiter
 
