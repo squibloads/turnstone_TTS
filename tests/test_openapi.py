@@ -262,11 +262,11 @@ class TestConsoleSpec:
             "/v1/api/workstreams/{ws_id}",
             "/v1/api/workstreams/{ws_id}/open",
             "/v1/api/workstreams/{ws_id}/send",
-            "/v1/api/workstreams/{ws_id}/command",
             "/v1/api/workstreams/{ws_id}/approve",
             "/v1/api/workstreams/{ws_id}/cancel",
             "/v1/api/workstreams/{ws_id}/rewind",
             "/v1/api/workstreams/{ws_id}/retry",
+            "/v1/api/workstreams/{ws_id}/command",
             "/v1/api/workstreams/{ws_id}/close",
             "/v1/api/workstreams/{ws_id}/events",
             "/v1/api/workstreams/{ws_id}/history",
@@ -451,6 +451,34 @@ def test_model_update_key_and_url_schemas_offer_no_null() -> None:
     ]
     for name in ("base_url", "api_key"):
         assert props[name]["type"] == "string"
+        assert "anyOf" not in props[name]
+        assert "default" not in props[name]
+
+
+def test_mcp_update_authority_schemas_offer_no_null() -> None:
+    """The MCP server update handler refuses a JSON null auto_approve, enabled or
+    tls_skip_verify (400), so the advertised schema must not offer one."""
+    from turnstone.api.console_spec import build_console_spec
+
+    props = build_console_spec()["components"]["schemas"]["UpdateMcpServerRequest"]["properties"]
+    for name in ("auto_approve", "enabled", "tls_skip_verify"):
+        assert props[name]["type"] == "boolean"
+        assert "anyOf" not in props[name]
+        assert "default" not in props[name]
+
+
+def test_skill_update_authority_schemas_offer_no_null() -> None:
+    """The skill update handler refuses a JSON null auto_approve, enabled or allowed_tools (400),
+    so the advertised schema must not offer one."""
+    from turnstone.api.console_spec import build_console_spec
+
+    props = build_console_spec()["components"]["schemas"]["UpdateSkillRequest"]["properties"]
+    for name, json_type in (
+        ("auto_approve", "boolean"),
+        ("enabled", "boolean"),
+        ("allowed_tools", "string"),
+    ):
+        assert props[name]["type"] == json_type
         assert "anyOf" not in props[name]
         assert "default" not in props[name]
 

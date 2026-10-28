@@ -183,6 +183,7 @@ from turnstone.core.model_backend_auth import (
 from turnstone.core.model_registry import ModelClientConstructionError, models_table
 from turnstone.core.model_remedies import CHAT_MODEL_REMEDY
 from turnstone.core.model_turn import (
+    COORDINATOR_EFFORT_KEY,
     TRAILING_INFO_SEPARATOR,
     ModelAdmissionError,
     ModelContextLimitError,
@@ -4551,7 +4552,9 @@ class ChatSession:
         cs = self._config_store
         if cs:
             self.temperature = resolve_temperature_setting(cfg, cs)
-            self.reasoning_effort = resolve_effort_setting(cfg, cs)
+            # A coordinator keeps the role rung its factory resolved it with.
+            role_key = COORDINATOR_EFFORT_KEY if self._kind == WorkstreamKind.COORDINATOR else ""
+            self.reasoning_effort = resolve_effort_setting(cfg, cs, role_key=role_key)
         else:
             if cfg.temperature is not None:
                 self.temperature = cfg.temperature
@@ -5689,13 +5692,12 @@ class ChatSession:
 
     def _reader_routes_slash_commands(self) -> bool:
         """Whether whoever reads this session's errors can run ``/model``: a person
-        at the web UI or a CLI.
+        at the web UI or a CLI, a coordinator's composer included.
 
-        A hosted coordinator is a web reader with its own command route
-        (#1440), so it gets the same remedy. A coordinator's child is read by
-        the coordinator's model, which must never be steered to another
-        model; a scheduled run is unattended; chat sends every message as a
-        message. An unknown surface gets the unattended answer too.
+        A coordinator's child is read by the coordinator's model, which must
+        never be steered to another model; a scheduled run is unattended; chat
+        sends every message as a message. An unknown surface gets the
+        unattended answer too.
         """
         if self._parent_ws_id:
             return False
