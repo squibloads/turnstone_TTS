@@ -1218,21 +1218,6 @@ function createCoordinatorPane(root, wsId, opts) {
     return appendMsg(role, esc(text), opts);
   }
 
-  // A slash command is control-plane input, not a conversational turn —
-  // echo it as the shared command chip, never as a user bubble.  The chip is
-  // deliberately not persisted: commands don't join the trajectory, so a
-  // bubble that vanished on reload would be a lie.  Same rendering as the
-  // interactive pane (``addCommandEcho``).
-  function appendCommandEcho(text) {
-    const el = document.createElement("div");
-    el.className = "msg command-echo";
-    el.setAttribute("aria-label", "command");
-    el.textContent = text;
-    messagesEl.appendChild(el);
-    _scheduleScroll();
-    return el;
-  }
-
   // Structured ``.msg.watch-result`` card for a ``watch_triggered``
   // operator-context system turn — command-preview header + shell-output body
   // + poll-counter footer.  ``content`` is the formatted watch body (the system
@@ -2929,98 +2914,6 @@ function createCoordinatorPane(root, wsId, opts) {
       composer.setProject(coordProjectName || "");
   }
 
-  // Run a slash command from the coordinator composer (#1440).  Commands are
-  // control-plane input: they never go to /send, so the model never sees one
-  // as chat.  Typed and dictated text take this path identically — dictation
-  // fills the composer, and only a literal leading "/" is a command (the
-  // interactive pane's rule); speech-to-text that writes the word "slash"
-  // instead of the character is ordinary prose.
-  function _runCoordCommand(text) {
-    if (busy) {
-      appendText("info", "Session is busy — commands can't run mid-turn.", {
-        label: "info",
-      });
-      return false;
-    }
-    const parts = text.split(/\s+/);
-    const cmdWord = parts[0].toLowerCase();
-    // /rewind and /retry are path-keyed mutations, exactly as on the
-    // interactive pane.  The generic command route deliberately rejects them:
-    // handle_command's own implementations truncate history without the
-    // clear_ui re-render the pane needs.
-    if (cmdWord === "/rewind") {
-      const n = parseInt(parts[1], 10);
-      if (!Number.isInteger(n) || n < 1) {
-        appendText(
-          "error",
-          "Usage: /rewind <N> — N must be a positive integer",
-          { label: "error" },
-        );
-        composer.clear();
-        return false;
-      }
-      composer.clear();
-      _rewindToTurns(n);
-      return false;
-    }
-    if (cmdWord === "/retry") {
-      composer.clear();
-      _retryLast();
-      return false;
-    }
-    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/command", {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command: text }),
-    })
-      .then((r) =>
-        // Thread {ok, status} alongside the parsed body: busy (409) and
-        // start-failure (503) are loud arms below, not transport errors.
-        r.json().then(
-          (b) => ({ ok: r.ok, status: r.status, body: b || {} }),
-          () => ({ ok: r.ok, status: r.status, body: {} }),
-        ),
-      )
-      .then(({ ok, status, body }) => {
-        if (body.status === "busy") {
-          appendText(
-            "error",
-            body.error || "Session is busy — try again shortly.",
-            { label: "error" },
-          );
-        } else if (body.status === "running") {
-          // The command outlived the endpoint's completion backstop: the
-          // worker is still going, and its output arrives over SSE.
-          appendText(
-            "info",
-            "Command is still running — results will appear here when it finishes.",
-            { label: "info" },
-          );
-        } else if (body.status === "error") {
-          appendText(
-            "error",
-            body.error || "Command failed to start — retry shortly.",
-            { label: "error" },
-          );
-        } else if (!ok) {
-          appendText(
-            "error",
-            body.error || "Command failed (HTTP " + status + ")",
-            { label: "error" },
-          );
-        }
-      })
-      .catch((err) => {
-        appendText("error", "Command failed: " + err.message, {
-          label: "error",
-        });
-      });
-    appendCommandEcho(text);
-    composer.clear();
-    return false;
-  }
-
   function coordSend() {
     const text = composer.value;
     const trimmed = (text || "").trim();
@@ -3031,12 +2924,6 @@ function createCoordinatorPane(root, wsId, opts) {
         });
       }
       return false;
-    }
-    // Slash commands are control-plane input, not a conversational turn.
-    // Checked before the attachment gates: a command keeps any staged
-    // uploads for the next message instead of consuming them.
-    if (trimmed.startsWith("/")) {
-      return _runCoordCommand(trimmed);
     }
     // The live-turn interjection queue is text-only. Keep the input and chips
     // intact instead of optimistically clearing them before attachments_busy.
