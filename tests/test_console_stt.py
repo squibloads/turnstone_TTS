@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -71,6 +73,17 @@ def _storage() -> MagicMock:
     return storage
 
 
+# The dictation pools the clients below create, shut down after each test.
+_pools: list[ThreadPoolExecutor] = []
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_pools() -> Iterator[None]:
+    yield
+    while _pools:
+        _pools.pop().shutdown(wait=True, cancel_futures=True)
+
+
 def _client(
     *,
     settings: dict[str, str] | None = None,
@@ -98,6 +111,9 @@ def _client(
         coord_mgr = mgr
     app.state.coord_mgr = coord_mgr
     app.state.auth_storage = _storage()
+    # Dictation runs on the console's own threads (web_helpers.run_dictation).
+    app.state.stt = ThreadPoolExecutor(max_workers=2, thread_name_prefix="stt")
+    _pools.append(app.state.stt)
     client = TestClient(app)
     client.headers.update({"X-Test-User": "userA", "X-Test-Perms": _PERMS})
     return client

@@ -20,7 +20,7 @@
     <link rel="stylesheet" href="/static/voice_cleanup.css" />
     <link rel="stylesheet" href="/static/voice_styles.css" />
     <link rel="stylesheet" href="/shared/shell.css" />
-    <link rel="stylesheet" href="/shared/katex-0.19.0/katex.min.css" />
+    <link rel="stylesheet" href="/shared/katex-0.19.1/katex.min.css" />
     <link rel="stylesheet" href="/static/coordinator/coordinator.css" />
     <link rel="stylesheet" href="/static/coordinator/coord-chrome.css" />
     <link rel="stylesheet" href="/shared/interactive.css" />
@@ -2902,6 +2902,35 @@
                   <span class="toggle-track" aria-hidden="true"></span>
                   <span class="toggle-label">Enabled</span>
                 </label>
+                <label
+                  class="toggle-switch"
+                  id="mcp-tls-skip-verify-row"
+                  hidden
+                >
+                  <input
+                    type="checkbox"
+                    id="mcp-tls-skip-verify"
+                    aria-describedby="mcp-tls-skip-verify-hint"
+                  />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span class="toggle-label"
+                    >Skip certificate verification</span
+                  >
+                </label>
+                <p
+                  id="mcp-tls-skip-verify-hint"
+                  class="label-hint hint-block"
+                  hidden
+                >
+                  Accepts any certificate at this URL, checking neither who
+                  issued it nor the name on it. The connection stays encrypted,
+                  but anyone who can intercept it can pose as this server: read
+                  or change what is sent, credentials included, and hand the
+                  model tool results of their own. Prefer adding the server's
+                  certificate authority to the trust store. Use this only for a
+                  server on a network you control when that isn't possible, such
+                  as a device that makes its own self-signed certificate.
+                </p>
               </div>
               <div
                 id="mcp-test-result"
@@ -4302,7 +4331,7 @@
     <script type="module" src="/shared/composer_attachments.js"></script>
     <script type="module" src="/shared/composer_queue.js"></script>
     <script type="module" src="/shared/status_bar.js"></script>
-    <script src="/shared/katex-0.19.0/katex.min.js"></script>
+    <script src="/shared/katex-0.19.1/katex.min.js"></script>
     <script src="/shared/hljs-11.12.0/highlight.min.js"></script>
     <script type="module" src="/shared/renderer.js"></script>
 

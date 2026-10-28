@@ -103,7 +103,7 @@ turnstone/
     discord/          Discord adapter (bot, cog, views, streaming, config)
     slack/            Slack adapter (Socket Mode bot, DM routing, approval buttons)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
-    katex-0.19.0/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
+    katex-0.19.1/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
     inter-4.001.1/   Vendored UI typeface (SIL OFL 1.1, upright/italic woff2 subsets)
     jetbrains-mono-2.304/  Vendored monospace typeface (SIL OFL 1.1, upright/italic woff2 subsets)
     dejavu-sans-2.37/  Vendored UI symbol fallback (font license, woff2 subset)
@@ -1320,7 +1320,15 @@ role carries the same gate on its `ModelLane`, so main turns, judges, task
 agents, perception, compaction, and background generation coordinate through
 one FIFO. Endpoint reranking carries the same gate on its `RerankLane`, so a
 reranker alias cannot exceed that cap or bypass capacity shared with another
-role. Two aliases never share a gate implicitly, even when their URLs are
+role. Speech-to-text and speech synthesis call the client directly
+(`turnstone/core/audio.py`) and take the lane's gate themselves, after the
+transcode; a streamed transcript holds its slot until the stream closes. A
+voice request waits only as long as its browser caller allows (`acquire`'s
+`timeout`: 15 seconds for dictation, counted from the request's arrival, and 0
+for read-aloud, refused at once), then gets 429. Dictation waits for its
+slot on four threads of its own per node, so those waits never hold the shared
+workers the heartbeat and access checks use; a streamed transcript is still read
+on them. Two aliases never share a gate implicitly, even when their URLs are
 identical. For calls with context-first request admission, `model_turn()`
 admits the request before materializing attachment fallbacks; an oversized
 refusal therefore invokes neither attachment resolution nor nested
@@ -2057,9 +2065,9 @@ model, and each turn records the message and then raises `ModelNotLoadedError`
 (a `ModelTurnLocalError`) before anything is dialed; `model_turn()` itself
 refuses a lane carrying that client before its admission slot or credential, so
 a call no check stopped never reaches the stand-in. The message names the model
-and a remedy for whoever reads it: `/model <alias>` on the web and in the CLI,
-which reads its models from config.toml once; an admin for a coordinator, a
-coordinator's child (whose errors the coordinator's model reads, so they never
+and a remedy for whoever reads it: `/model <alias>` on the web (coordinators
+too) and in the CLI, which reads its models from config.toml once; an admin for
+a coordinator's child (whose errors the coordinator's model reads, so they never
 name another model) and a scheduled run; and the channels' own advice in a chat
 conversation (`turnstone/core/model_remedies.py`), which says the message is
 kept, since chat has no `/retry`. `/model` prints the same message. The next
