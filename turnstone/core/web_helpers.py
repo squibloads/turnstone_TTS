@@ -16,7 +16,7 @@ from starlette.responses import FileResponse, PlainTextResponse, Response, Strea
 from starlette.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 
     from starlette.middleware import Middleware
     from starlette.requests import Request
@@ -464,7 +464,8 @@ class SpeechCapacity:
     replaces a play start the new one before the old one's abort lands.  On a
     backend that synthesizes one clip at a time, a play started beside a long one
     waits behind it there and can still time out: after 80 s of silence at the
-    node, or at the console's 90 s.
+    node, or at the console's 90 s.  A play also needs one of the TTS alias's
+    max_concurrency slots, and for the same reason is refused when none is free.
 
     The node and the console each hold one: the console serves coordinator
     read-aloud itself and must not borrow a node's threads.
@@ -491,18 +492,27 @@ class SpeechCapacity:
         self.executor.shutdown(wait=True, cancel_futures=True)
 
 
+def audio_busy(error: str) -> Response:
+    """The capacity answer for a voice call, which ``authFetch`` waits out for
+    ``Retry-After`` seconds and then retries."""
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    return _JSONResponse({"error": error}, status_code=429, headers={"Retry-After": "5"})
+
+
 async def _abort_when_caller_leaves(
     request: Request, abort_ref: Any, done: Any, poll_s: float
 ) -> None:
-    """Stop synthesis when the caller hangs up.
+    """Stop a voice call when the caller hangs up.
 
     A handler is not cancelled when its peer disconnects, and a thread cannot be
-    cancelled once it is inside the SDK read.  Closing the captured stream is
-    what stops the work: ``synthesize`` publishes the response handle on
-    ``abort_ref``, so closing it makes the next read raise and the worker return
-    instead of reading a clip nobody is waiting for.  A read already waiting on a
-    silent backend notices only when bytes arrive, and before the backend sends
-    headers there is no handle yet; the backend call's own timeout bounds both.
+    cancelled once it is inside the SDK read.  Aborting ``abort_ref`` is what
+    stops the work: a wait for the alias's admission slot gives up its place, and
+    the backend response the call published on ``abort_ref`` is closed, so the
+    next read raises and the worker returns instead of reading an answer nobody
+    is waiting for.  A read already waiting on a silent backend notices only when
+    bytes arrive, and before the backend sends headers there is no handle yet.
+    The backend call's own timeout bounds both.
 
     The caller is the browser on a direct connection, or the console, which
     closes its node request when the browser leaves (``_proxy_tts``).  Polls
@@ -515,6 +525,22 @@ async def _abort_when_caller_leaves(
         if await request.is_disconnected():
             abort_ref.abort()
             return
+
+
+@contextlib.asynccontextmanager
+async def caller_watched(request: Request, abort_ref: Any, poll_s: float) -> AsyncIterator[None]:
+    """Run the block while :func:`_abort_when_caller_leaves` watches the caller."""
+    import asyncio
+
+    done = asyncio.Event()
+    watcher = asyncio.create_task(_abort_when_caller_leaves(request, abort_ref, done, poll_s))
+    try:
+        yield
+    finally:
+        done.set()
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
 
 
 def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
@@ -561,6 +587,7 @@ async def text_to_speech_response(
 
     from turnstone.core.audio import (
         AudioBackendError,
+        AudioBusyError,
         AudioUnavailableError,
         resolve_role_alias,
         synthesize,
@@ -616,18 +643,13 @@ async def text_to_speech_response(
                 status_code=400,
             )
 
+    # Refused, not queued, by the process's threads and by the alias's slots
+    # alike: see SpeechCapacity.  429 like the node's other capacity refusals.
+    busy = "Speech synthesis is busy; try again shortly"
     if not capacity.try_admit():
-        # Refused, not queued: see SpeechCapacity.  429 like the node's other
-        # capacity refusals, which the browser retries after Retry-After.
-        return _JSONResponse(
-            {"error": "Speech synthesis is busy; try again shortly"},
-            status_code=429,
-            headers={"Retry-After": "5"},
-        )
+        return audio_busy(busy)
 
     abort_ref = StreamAbortRef()
-    done = asyncio.Event()
-    watcher = asyncio.create_task(_abort_when_caller_leaves(request, abort_ref, done, poll_s))
     try:
         call = functools.partial(
             synthesize,
@@ -638,18 +660,22 @@ async def text_to_speech_response(
             config_store=config_store,
             backend_auth_resolver=audio_backend_auth_resolver(request),
             cancel_ref=abort_ref,
+            admission_wait_s=0,
         )
         # Blocking SDK round-trip, off the event loop.  The context copy carries
         # the request's log fields, as asyncio.to_thread does.
         context = contextvars.copy_context()
-        speech = await asyncio.get_running_loop().run_in_executor(
-            capacity.executor, context.run, call
-        )
+        async with caller_watched(request, abort_ref, poll_s):
+            speech = await asyncio.get_running_loop().run_in_executor(
+                capacity.executor, context.run, call
+            )
     except DeadlineCancelledError:
         # Only the watcher aborts during the call, so the caller has gone and
         # nobody reads this answer.
         log.debug("text_to_speech.caller_left")
         return _JSONResponse({"error": "Speech synthesis was cancelled"}, status_code=499)
+    except AudioBusyError:
+        return audio_busy(busy)
     except BackendAuthUnavailableError:
         log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
         return _JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
@@ -660,10 +686,6 @@ async def text_to_speech_response(
         log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
         return _JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
     finally:
-        done.set()
-        watcher.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await watcher
         abort_ref.abort()
         capacity.release()
 
@@ -679,6 +701,72 @@ STT_UPLOAD_CAP = 25 * 1024 * 1024  # 25 MiB — generous for short dictation cli
 _STT_NOT_CONFIGURED = (
     "Speech-to-text is not configured. Assign an STT model role in Models → Roles."
 )
+
+# The console's dictation budget and threads, which it uses for coordinator
+# dictation; the node passes its own (_STT_ADMISSION_WAIT_S / _STT_MAX_THREADS in
+# turnstone/server.py, where the reasoning for both numbers lives).
+STT_ADMISSION_WAIT_S = 15.0
+STT_MAX_THREADS = 4
+
+
+async def run_dictation[T](
+    request: Request,
+    arrived: float,
+    call: Callable[..., T],
+    /,
+    *,
+    wait_s: float,
+    max_threads: int,
+    **kwargs: Any,
+) -> T:
+    """Run a blocking transcription *call* on the process's dictation threads.
+
+    Two waits share one budget, *wait_s* since the request *arrived*: the wait for a
+    free dictation thread (``app.state.stt``), and the call's ``admission_wait_s``
+    for its model's slot.  A dictation that gets no thread in time is refused as
+    one that gets no slot is, so a process whose threads are all held by long
+    transcriptions still answers 429 before the console stops waiting.  The
+    context copy carries the request's log fields, as asyncio.to_thread does.
+    """
+    import asyncio
+    import contextvars
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from turnstone.core.audio import AudioBusyError
+    from turnstone.core.log import get_logger
+
+    def _with_remaining_wait() -> T:
+        remaining = wait_s - (time.monotonic() - arrived)
+        return call(**kwargs, admission_wait_s=max(0.0, remaining))
+
+    threads: ThreadPoolExecutor = request.app.state.stt
+    context = contextvars.copy_context()
+    work = threads.submit(context.run, _with_remaining_wait)
+    result = asyncio.wrap_future(work)
+    # asyncio.wait cancels nothing it waits on, unlike wait_for: cancelling a shield whose inner
+    # call later fails makes asyncio log that failure as unhandled.
+    try:
+        done, _ = await asyncio.wait({result}, timeout=wait_s - (time.monotonic() - arrived))
+    except asyncio.CancelledError:
+        result.cancel()  # as asyncio.to_thread does: a call still queued never runs
+        raise
+    if not done and work.cancel():
+        get_logger(__name__).info(
+            "speech_to_text.no_free_thread",
+            threads=max_threads,
+            wait_seconds=round(time.monotonic() - arrived, 3),
+        )
+        raise AudioBusyError("No dictation thread came free in time")
+    # Done, or it started meanwhile and its own wait for a slot is bounded.
+    return await result
+
+
+def _console_dictation(request: Request, arrived: float, call: Callable[..., Any], /, **kwargs: Any) -> Any:
+    """The console's dictation runner: :func:`run_dictation` with its own budget."""
+    return run_dictation(
+        request, arrived, call, wait_s=STT_ADMISSION_WAIT_S, max_threads=STT_MAX_THREADS, **kwargs
+    )
 
 
 class AbortOnExitStreamingResponse(StreamingResponse):
@@ -705,6 +793,8 @@ async def speech_to_text_response(
     *,
     registry: Any | None,
     authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
+    run: Callable[..., Awaitable[Any]] = _console_dictation,
+    poll_s: float = 1.0,
 ) -> JSONResponse:
     """Serve ``POST /v1/api/workstreams/{ws_id}/speech-to-text`` against *registry*.
 
@@ -713,23 +803,27 @@ async def speech_to_text_response(
     A node and the console hold their registries under different ``app.state``
     names and authorise ``ws_id`` differently (interactive vs coordinator), so
     both are injected; ``authorize`` returns an error response or ``None``.
+    *run* runs the transcription on the process's dictation threads within its
+    admission budget (:func:`run_dictation`); the node passes its own budget.
     Everything else is one contract so the coordinator mic behaves like a node's.
     """
-    import asyncio
+    import time
 
     from starlette.responses import JSONResponse as _JSONResponse
 
     from turnstone.core.audio import (
         AudioBackendError,
+        AudioBusyError,
         AudioUnavailableError,
         resolve_role_alias,
         transcribe,
     )
-    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
     from turnstone.core.log import get_logger
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 
     log = get_logger(__name__)
+    arrived = time.monotonic()
     ws_id = request.path_params.get("ws_id", "")
     if not ws_id:
         return _JSONResponse({"error": "ws_id is required"}, status_code=400)
@@ -755,19 +849,27 @@ async def speech_to_text_response(
     abort_ref = StreamAbortRef()
     backend_auth_resolver = audio_backend_auth_resolver(request)
     try:
-        # Blocking SDK round-trip — offload so the shared event loop (and SSE
-        # streaming) stays responsive.
-        result = await asyncio.to_thread(
-            transcribe,
-            registry=registry,
-            alias=alias,
-            data=data,
-            filename=filename or "speech.webm",
-            prompt=stt_prompt,
-            config_store=config_store,
-            backend_auth_resolver=backend_auth_resolver,
-            cancel_ref=abort_ref,
-        )
+        # Blocking SDK round-trip, off the event loop.
+        async with caller_watched(request, abort_ref, poll_s):
+            result = await run(
+                request,
+                arrived,
+                transcribe,
+                registry=registry,
+                alias=alias,
+                data=data,
+                filename=filename or "speech.webm",
+                prompt=stt_prompt,
+                config_store=config_store,
+                backend_auth_resolver=backend_auth_resolver,
+                cancel_ref=abort_ref,
+            )
+    except DeadlineCancelledError:
+        # Only the watcher aborts during the call, so the caller has gone.
+        log.debug("speech_to_text.caller_left")
+        return _JSONResponse({"error": "Speech transcription was cancelled"}, status_code=499)
+    except AudioBusyError:
+        return audio_busy("Speech transcription is busy; try again shortly")
     except BackendAuthUnavailableError:
         log.warning("speech_to_text.backend_auth_unavailable", exc_info=True)
         return _JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
@@ -801,6 +903,8 @@ async def speech_to_text_stream_response(
     *,
     registry: Any | None,
     authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
+    run: Callable[..., Awaitable[Any]] = _console_dictation,
+    poll_s: float = 1.0,
 ) -> Response:
     """Serve ``POST .../speech-to-text/stream``: the transcript as plain-text deltas.
 
@@ -811,20 +915,23 @@ async def speech_to_text_stream_response(
     """
     import asyncio
     import threading
+    import time
 
     from starlette.responses import JSONResponse as _JSONResponse
 
     from turnstone.core.audio import (
         AudioBackendError,
+        AudioBusyError,
         AudioUnavailableError,
         resolve_role_alias,
         transcribe_stream,
     )
-    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
     from turnstone.core.log import get_logger
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 
     log = get_logger(__name__)
+    arrived = time.monotonic()
     ws_id = request.path_params.get("ws_id", "")
     if not ws_id:
         return _JSONResponse({"error": "ws_id is required"}, status_code=400)
@@ -850,19 +957,31 @@ async def speech_to_text_stream_response(
     abort_ref = StreamAbortRef()
     backend_auth_resolver = audio_backend_auth_resolver(request)
 
-    # Resolve + transcode + open the stream eagerly (off the event loop) so the
-    # common failures map to a clean status before any bytes are sent.
+    # Resolve + transcode + admission + open the stream eagerly (off the event
+    # loop) so the common failures map to a clean status before any bytes are
+    # sent.
     try:
-        deltas = await asyncio.to_thread(
-            transcribe_stream,
-            registry=registry,
-            alias=alias,
-            data=data,
-            prompt=stt_prompt,
-            config_store=config_store,
-            backend_auth_resolver=backend_auth_resolver,
-            cancel_ref=abort_ref,
-        )
+        async with caller_watched(request, abort_ref, poll_s):
+            deltas = await run(
+                request,
+                arrived,
+                transcribe_stream,
+                registry=registry,
+                alias=alias,
+                data=data,
+                prompt=stt_prompt,
+                config_store=config_store,
+                backend_auth_resolver=backend_auth_resolver,
+                cancel_ref=abort_ref,
+            )
+    except DeadlineCancelledError:
+        # Only the watcher aborts during the call, so the caller has gone.
+        abort_ref.abort()
+        log.debug("speech_to_text_stream.caller_left")
+        return _JSONResponse({"error": "Speech transcription was cancelled"}, status_code=499)
+    except AudioBusyError:
+        abort_ref.abort()
+        return audio_busy("Speech transcription is busy; try again shortly")
     except BackendAuthUnavailableError:
         abort_ref.abort()
         log.warning("speech_to_text_stream.backend_auth_unavailable", exc_info=True)
