@@ -1,4 +1,4 @@
-"""Tests for alembic migration 085 (voice_reports).
+"""Tests for alembic migration ``dt_voice_reports``.
 
 Drives ``command.upgrade``/``downgrade`` against an isolated SQLite database
 per test (the 083/084 harness pattern), then asserts the table, its state
@@ -46,7 +46,7 @@ class TestMigration085:
     def test_creates_the_table_and_index(self, tmp_path: Path) -> None:
         db_path = tmp_path / "085-up.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "085")
+        command.upgrade(cfg, "dt_voice_reports")
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
             inspector = sa.inspect(engine)
@@ -78,7 +78,7 @@ class TestMigration085:
         # No generated parity test exists for new tables; this pins the two
         # hand-maintained definitions together at the point they are added.
         db_path = tmp_path / "085-schema.db"
-        command.upgrade(_alembic_cfg(db_path), "085")
+        command.upgrade(_alembic_cfg(db_path), "dt_voice_reports")
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
             migrated = {c["name"] for c in sa.inspect(engine).get_columns("voice_reports")}
@@ -88,7 +88,7 @@ class TestMigration085:
 
     def test_rejects_an_unknown_state(self, tmp_path: Path) -> None:
         db_path = tmp_path / "085-check.db"
-        command.upgrade(_alembic_cfg(db_path), "085")
+        command.upgrade(_alembic_cfg(db_path), "dt_voice_reports")
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
             with pytest.raises(sa.exc.IntegrityError):
@@ -99,7 +99,7 @@ class TestMigration085:
     def test_is_idempotent_in_both_directions(self, tmp_path: Path) -> None:
         db_path = tmp_path / "085-idem.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "084")
+        command.upgrade(cfg, "dt_voice_persona")
         # A concurrent/manual install may already own the table; upgrading must
         # not fail on the duplicate DDL.
         engine = sa.create_engine(f"sqlite:///{db_path}")
@@ -116,17 +116,17 @@ class TestMigration085:
                 )
         finally:
             engine.dispose()
-        command.upgrade(cfg, "085")
+        command.upgrade(cfg, "dt_voice_reports")
 
-        command.downgrade(cfg, "084")
+        command.downgrade(cfg, "dt_voice_persona")
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
             assert "voice_reports" not in sa.inspect(engine).get_table_names()
         finally:
             engine.dispose()
 
-        command.upgrade(cfg, "085")
-        command.upgrade(cfg, "085")  # already at head — a no-op
+        command.upgrade(cfg, "dt_voice_reports")
+        command.upgrade(cfg, "dt_voice_reports")  # already applied — a no-op
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
             assert "voice_reports" in sa.inspect(engine).get_table_names()
