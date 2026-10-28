@@ -1,4 +1,4 @@
-"""Tests for alembic migration 086 (retire the voice memory scope).
+"""Tests for alembic migration ``dt_retire_voice_memory_scope`` (retire the voice memory scope).
 
 Drives ``command.upgrade`` from a programmatic Alembic config against an
 isolated SQLite database per test (the 061/085 harness pattern), then asserts:
@@ -106,7 +106,7 @@ class TestMigration086:
     ) -> None:
         db_path = tmp_path / "086-move.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "085")
+        command.upgrade(cfg, "dt_voice_reports")
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
@@ -117,7 +117,7 @@ class TestMigration086:
                 _seed_memory(conn, "m-coord", "kettle", "coordinator", "u1")
                 _seed_memory(conn, "m-global", "other", "global", "")
 
-            command.upgrade(cfg, "086")
+            command.upgrade(cfg, "dt_retire_voice_memory_scope")
 
             mems = _all_memories(engine)
             assert mems["m-voice"] == ("kettle", "global", "", "content of m-voice")
@@ -131,7 +131,7 @@ class TestMigration086:
     def test_older_voice_row_yields_to_an_existing_global_row(self, tmp_path: Path) -> None:
         db_path = tmp_path / "086-global-wins.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "085")
+        command.upgrade(cfg, "dt_voice_reports")
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
@@ -155,7 +155,7 @@ class TestMigration086:
                     content="newer global plan",
                 )
 
-            command.upgrade(cfg, "086")
+            command.upgrade(cfg, "dt_retire_voice_memory_scope")
 
             mems = _all_memories(engine)
             assert "m-voice" not in mems
@@ -166,7 +166,7 @@ class TestMigration086:
     def test_newer_voice_row_replaces_an_existing_global_row(self, tmp_path: Path) -> None:
         db_path = tmp_path / "086-voice-wins.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "085")
+        command.upgrade(cfg, "dt_voice_reports")
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
@@ -190,7 +190,7 @@ class TestMigration086:
                     content="stale global plan",
                 )
 
-            command.upgrade(cfg, "086")
+            command.upgrade(cfg, "dt_retire_voice_memory_scope")
 
             mems = _all_memories(engine)
             assert "m-global" not in mems
@@ -201,7 +201,7 @@ class TestMigration086:
     def test_equal_updated_breaks_the_tie_on_memory_id(self, tmp_path: Path) -> None:
         db_path = tmp_path / "086-tie.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "085")
+        command.upgrade(cfg, "dt_voice_reports")
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
@@ -223,7 +223,7 @@ class TestMigration086:
                     updated="2026-06-03T00:00:00",
                 )
 
-            command.upgrade(cfg, "086")
+            command.upgrade(cfg, "dt_retire_voice_memory_scope")
 
             mems = _all_memories(engine)
             assert "m-a" not in mems
@@ -234,7 +234,7 @@ class TestMigration086:
     def test_same_name_across_voice_users_keeps_the_newest(self, tmp_path: Path) -> None:
         db_path = tmp_path / "086-two-users.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "085")
+        command.upgrade(cfg, "dt_voice_reports")
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
@@ -264,7 +264,7 @@ class TestMigration086:
                     updated="2026-06-01T00:00:00",
                 )
 
-            command.upgrade(cfg, "086")
+            command.upgrade(cfg, "dt_retire_voice_memory_scope")
 
             mems = _all_memories(engine)
             assert "m-old" not in mems
@@ -276,7 +276,7 @@ class TestMigration086:
     def test_drops_voice_workstream_index_snapshots_only(self, tmp_path: Path) -> None:
         db_path = tmp_path / "086-snapshots.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "085")
+        command.upgrade(cfg, "dt_voice_reports")
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
@@ -286,7 +286,7 @@ class TestMigration086:
                 _seed_snapshot(conn, "voice-consumer")
                 _seed_snapshot(conn, "plain-coordinator")
 
-            command.upgrade(cfg, "086")
+            command.upgrade(cfg, "dt_retire_voice_memory_scope")
 
             with engine.connect() as conn:
                 remaining = {
@@ -302,15 +302,15 @@ class TestMigration086:
     def test_downgrade_is_a_noop(self, tmp_path: Path) -> None:
         db_path = tmp_path / "086-downgrade.db"
         cfg = _alembic_cfg(db_path)
-        command.upgrade(cfg, "085")
+        command.upgrade(cfg, "dt_voice_reports")
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
         try:
             with engine.begin() as conn:
                 _seed_memory(conn, "m-voice", "kettle", "voice", "u1")
 
-            command.upgrade(cfg, "086")
-            command.downgrade(cfg, "085")
+            command.upgrade(cfg, "dt_retire_voice_memory_scope")
+            command.downgrade(cfg, "dt_voice_reports")
 
             assert _all_memories(engine)["m-voice"] == (
                 "kettle",
