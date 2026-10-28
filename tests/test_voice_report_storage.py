@@ -1,7 +1,7 @@
 """Tests for the voice-report storage CRUD (both backends via the ``db`` fixture).
 
 A voice session never blocks on a child agent; a finished child leaves a report
-row behind (``turnstone.core.storage.migrations.versions.085_voice_reports``)
+row behind (``turnstone.core.storage.migrations.versions.dt_voice_reports``)
 that survives the session.  These tests pin the row shape, the state filter and
 the storage-edge size guards.
 """
