@@ -8033,6 +8033,98 @@
         }
       }
     },
+    "/v1/api/workstreams/{ws_id}/command": {
+      "post": {
+        "summary": "Run a slash command on the coordinator session",
+        "operationId": "v1_api_workstreams_{ws_id}_command_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Runs ``/model`` on the coordinator's worker slot, as ``POST /v1/api/command`` does on a node; any other command returns 400. A busy session returns 409, and a command still running after 25 seconds answers ``running``. Gated on ``admin.coordinator``.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoordinatorCommandRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/workstreams/{ws_id}/close": {
       "post": {
         "summary": "Soft-close the coordinator (unload from memory; storage preserved)",
@@ -10308,6 +10400,21 @@
           "approved"
         ],
         "title": "CoordinatorApproveRequest",
+        "type": "object"
+      },
+      "CoordinatorCommandRequest": {
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/command.",
+        "properties": {
+          "command": {
+            "description": "Slash command with its argument, for example ``/model fast``. Coordinators run ``/model`` only.",
+            "title": "Command",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "title": "CoordinatorCommandRequest",
         "type": "object"
       },
       "ApproveRequest": {
@@ -12981,6 +13088,11 @@
             "title": "Enabled",
             "type": "boolean"
           },
+          "tls_skip_verify": {
+            "default": false,
+            "title": "Tls Skip Verify",
+            "type": "boolean"
+          },
           "created_by": {
             "default": "",
             "title": "Created By",
@@ -13231,6 +13343,11 @@
             "title": "Enabled",
             "type": "boolean"
           },
+          "tls_skip_verify": {
+            "default": false,
+            "title": "Tls Skip Verify",
+            "type": "boolean"
+          },
           "auth_type": {
             "default": "static",
             "title": "Auth Type",
@@ -13412,28 +13529,19 @@
             "title": "Env"
           },
           "auto_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Auto Approve"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Auto Approve",
+            "type": "boolean"
           },
           "enabled": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Enabled"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "tls_skip_verify": {
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Tls Skip Verify",
+            "type": "boolean"
           },
           "auth_type": {
             "anyOf": [
@@ -13627,6 +13735,11 @@
             "default": "",
             "title": "Name",
             "type": "string"
+          },
+          "tls_skip_verify": {
+            "default": false,
+            "title": "Tls Skip Verify",
+            "type": "boolean"
           }
         },
         "required": [
@@ -16042,16 +16155,9 @@
             "title": "Version"
           },
           "auto_approve": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Auto Approve"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Auto Approve",
+            "type": "boolean"
           },
           "notify_on_complete": {
             "anyOf": [
@@ -16066,16 +16172,9 @@
             "title": "Notify On Complete"
           },
           "enabled": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Enabled"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Enabled",
+            "type": "boolean"
           },
           "priority": {
             "anyOf": [
@@ -16090,16 +16189,9 @@
             "title": "Priority"
           },
           "allowed_tools": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Allowed Tools"
+            "description": "Omit to leave the stored value unchanged; JSON null is refused (400).",
+            "title": "Allowed Tools",
+            "type": "string"
           },
           "license": {
             "anyOf": [
