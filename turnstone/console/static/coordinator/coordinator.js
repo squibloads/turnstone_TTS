@@ -586,6 +586,10 @@ function createCoordinatorPane(root, wsId, opts) {
   let voiceSetup = null;
   // null until probed; true when the player's stream/play runs expose `done`.
   let voiceDoneProbe = null;
+  // audio.stt_auto_stop, read on the same probe as the setting.  With it on,
+  // the mic button becomes voice mode's mic on/off switch; with it off the
+  // press is still how a spoken turn ends, so dictation keeps it.
+  let voiceAutoStop = false;
   const mic = createMicController({
     composer: composer,
     base: "",
@@ -597,6 +601,7 @@ function createCoordinatorPane(root, wsId, opts) {
     onState: (state) => {
       if (voiceLoop) voiceLoop.onMicState(state);
     },
+    onToggle: () => _voiceMicToggle(),
   });
   // The Voice button joins the mic in the composer action row; the status
   // line sits under the row.  Built once and reused for the pane's lifetime.
@@ -2823,6 +2828,9 @@ function createCoordinatorPane(root, wsId, opts) {
     if (edge && !next) queue.onIdleEdge();
     // The mic produces composer input the user can only send when idle.
     mic.syncBusy();
+    // In voice mode the button is the mute switch, which matters most while
+    // a turn runs, so it stays pressable (the press never records then).
+    if (voiceModeOn && voiceAutoStop && mic.button) mic.button.disabled = false;
     // Voice mode follows the turn: a busy edge closes the mic (half-duplex)
     // and a quiet edge is one of the two conditions for listening again.
     if (voiceLoop) voiceLoop.onBusy(next);
@@ -7018,7 +7026,10 @@ function createCoordinatorPane(root, wsId, opts) {
     if (typeof authFetch !== "function") return Promise.resolve(true);
     return authFetch("/v1/api/stt/config")
       .then((r) => (r.ok ? r.json() : null))
-      .then((body) => !body || body.voice_mode_enabled !== false)
+      .then((body) => {
+        voiceAutoStop = !!body && body.auto_stop === true;
+        return !body || body.voice_mode_enabled !== false;
+      })
       .catch(() => true);
   }
 
@@ -7047,6 +7058,7 @@ function createCoordinatorPane(root, wsId, opts) {
       transcribing: "Transcribing\u2026",
       thinking: "Thinking\u2026",
       speaking: "Speaking\u2026",
+      muted: "Mic off \u2014 replies still play",
     };
     const label = labels[state] || "";
     voiceStatusEl.textContent = label;
@@ -7103,6 +7115,7 @@ function createCoordinatorPane(root, wsId, opts) {
     voiceBtn.setAttribute("aria-label", "Disable hands-free voice mode");
     if (!voiceLoop) _voiceCreateLoop();
     voiceLoop.enable();
+    _voicePaintMute();
   }
 
   function _voiceTurnOff() {
@@ -7117,6 +7130,33 @@ function createCoordinatorPane(root, wsId, opts) {
     // keep auto-playing into the pane.
     _cancelTtsStream();
     _voiceSetStatus("off");
+    _voicePaintMute();
+  }
+
+  // The mic button inside voice mode: mute/unmute the mic without leaving
+  // the mode, so replies and worker reports still play while the user talks
+  // to someone else.  Returns true when it claimed the press.
+  function _voiceMicToggle() {
+    if (!voiceModeOn || !voiceLoop || !voiceAutoStop) return false;
+    voiceLoop.setMuted(!voiceLoop.muted);
+    _voicePaintMute();
+    return true;
+  }
+
+  function _voicePaintMute() {
+    const b = mic && mic.button;
+    if (!b) return;
+    const on = !!(voiceModeOn && voiceLoop && voiceLoop.muted);
+    if (on) b.classList.add("is-muted");
+    else b.classList.remove("is-muted");
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+    const label = on
+      ? "Microphone off \u2014 press to listen again"
+      : voiceModeOn && voiceAutoStop
+        ? "Turn the microphone off (voice mode keeps playing replies)"
+        : "Record speech to text";
+    b.title = label;
+    b.setAttribute("aria-label", label);
   }
 
   function _voiceToggle() {

@@ -368,3 +368,131 @@ console.log(JSON.stringify({ opened, afterIdle, afterRepeat, state: deferred.sta
 """
     )
     assert out == {"opened": 0, "afterIdle": 1, "afterRepeat": 1, "state": "listening"}
+
+
+# --- mic mute: voice mode stays on, the mic stays shut -----------------------
+
+
+def test_muting_while_listening_closes_the_mic_and_keeps_voice_mode() -> None:
+    out = _run(
+        """
+loop.enable();
+calls.length = 0;
+loop.setMuted(true);
+console.log(JSON.stringify({ calls, state: state(), muted: loop.muted }));
+"""
+    )
+    assert out["calls"] == ["stop", ["status", "muted"]]
+    assert out["state"] == "listening"
+    assert out["muted"] is True
+
+
+def test_a_muted_turn_still_plays_and_then_does_not_reopen_the_mic() -> None:
+    """The reason to mute: a reply (a worker's report) still plays, but the
+    mic stays shut afterwards so a side conversation is not sent."""
+    out = _run(
+        """
+loop.enable();
+loop.setMuted(true);
+loop.onBusy(true);                 // a notification turn starts
+loop.onReplyStarted();
+const mid = state();
+loop.onPlaybackDone({ reason: "finished", heard: ["x"] });
+calls.length = 0;
+loop.onBusy(false);
+console.log(JSON.stringify({ mid, calls, state: state() }));
+"""
+    )
+    assert out["mid"] == "speaking"
+    assert "start" not in out["calls"]
+    assert out["calls"] == [["status", "muted"]]
+    assert out["state"] == "listening"
+
+
+def test_unmuting_while_listening_opens_the_mic() -> None:
+    out = _run(
+        """
+loop.enable();
+loop.setMuted(true);
+calls.length = 0;
+loop.setMuted(false);
+console.log(JSON.stringify({ calls, muted: loop.muted }));
+"""
+    )
+    assert out["calls"] == [["status", "listening"], "start"]
+    assert out["muted"] is False
+
+
+def test_muting_mid_turn_only_takes_effect_when_the_turn_ends() -> None:
+    out = _run(
+        """
+loop.enable();
+loop.onTranscript("hello");
+loop.onBusy(true);
+calls.length = 0;
+loop.setMuted(true);               // no mic to close, status stays "thinking"
+const mid = calls.slice();
+loop.onBusy(false);                // no reply run: turn over
+console.log(JSON.stringify({ mid, calls, state: state() }));
+"""
+    )
+    assert out["mid"] == []
+    assert "start" not in out["calls"]
+    assert out["state"] == "listening"
+
+
+def test_unmuting_mid_turn_reopens_the_mic_on_the_normal_edge() -> None:
+    out = _run(
+        """
+loop.enable();
+loop.setMuted(true);
+loop.onBusy(true);
+loop.setMuted(false);
+calls.length = 0;
+loop.onBusy(false);
+console.log(JSON.stringify({ calls }));
+"""
+    )
+    assert out["calls"] == [["status", "listening"], "start"]
+
+
+def test_a_transcript_arriving_after_mute_is_dropped() -> None:
+    """A clip already uploading when the user muted must not be sent."""
+    out = _run(
+        """
+loop.enable();
+loop.onMicState("transcribing");
+loop.setMuted(true);
+calls.length = 0;
+loop.onTranscript("talking to someone else");
+console.log(JSON.stringify({ calls, state: state() }));
+"""
+    )
+    assert out["calls"] == []
+    assert out["state"] == "listening"
+
+
+def test_disable_clears_mute_so_the_next_session_listens() -> None:
+    out = _run(
+        """
+loop.enable();
+loop.setMuted(true);
+loop.disable();
+calls.length = 0;
+loop.enable();
+console.log(JSON.stringify({ calls, muted: loop.muted }));
+"""
+    )
+    assert out["muted"] is False
+    assert out["calls"] == [["status", "listening"], "start"]
+
+
+def test_mute_while_off_is_ignored() -> None:
+    out = _run(
+        """
+loop.setMuted(true);
+console.log(JSON.stringify({ calls, muted: loop.muted }));
+"""
+    )
+    assert out["calls"] == []
+    assert out["muted"] is False
