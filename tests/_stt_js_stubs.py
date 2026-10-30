@@ -152,7 +152,12 @@ class FakeAudioWorkletNode {
       close() { self.portOpen = false; },
       // The worklet posts mono chunks; a test stands in for the processor by
       // handing the main-thread handler the samples it would have posted.
-      deliver(samples) { self.port.onmessage({ data: { type: "samples", samples } }); },
+      // A real port stops calling a handler that was cleared on teardown, so
+      // a late message after stop() is dropped rather than thrown at null.
+      deliver(samples) {
+        if (typeof self.port.onmessage !== "function") return;
+        self.port.onmessage({ data: { type: "samples", samples } });
+      },
     };
     frameLog.nodes.push(this);
   }

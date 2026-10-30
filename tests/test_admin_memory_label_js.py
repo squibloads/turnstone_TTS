@@ -38,9 +38,9 @@ assert.deepEqual(
   _memoryScopeTarget({{scope: "user", scope_id: "u1", scope_label: "alice"}}),
   {{text: "alice", title: "u1"}},
 );
-// Voice memories are user-keyed exactly like user / coordinator ones.
+// Coordinator memories are user-keyed exactly like user-scope ones.
 assert.deepEqual(
-  _memoryScopeTarget({{scope: "voice", scope_id: "u1", scope_label: "alice"}}),
+  _memoryScopeTarget({{scope: "coordinator", scope_id: "u1", scope_label: "alice"}}),
   {{text: "alice", title: "u1"}},
 );
 // Unknown / deleted user: the server falls back to the id, so the cell keeps
@@ -82,7 +82,7 @@ _renderAdminMemories(
   [
     {{memory_id: "m1", type: "user", name: "named", scope: "user",
       scope_id: "u1", scope_label: "alice", description: "", updated: ""}},
-    {{memory_id: "m2", type: "user", name: "unknown", scope: "voice",
+    {{memory_id: "m2", type: "user", name: "unknown", scope: "coordinator",
       scope_id: uuid, scope_label: uuid, description: "", updated: ""}},
     {{memory_id: "m3", type: "user", name: "global", scope: "global",
       scope_id: "", scope_label: "", description: "", updated: ""}},

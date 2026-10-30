@@ -75,6 +75,9 @@ function _voiceRefresh() {}
 function _voiceMicToggle() { return false; }
 let voiceLoop = null;
 let voiceModeOn = false, voiceAutoStop = false;
+// The spectrum strip is covered by test_voice_viz_wiring_js; here it is a
+// no-op so the sliced functions that now reach it resolve.
+const voiceViz = { show() {}, hide() {}, detach() {}, attachStream() {}, attachAudio() {}, setSpeaker() {}, resumeFromGesture() { return Promise.resolve(); } };
 """
 
 _COORD_FNS = "\n".join(

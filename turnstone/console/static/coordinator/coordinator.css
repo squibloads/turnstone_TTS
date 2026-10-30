@@ -32,6 +32,28 @@
   margin-bottom: 18px;
 }
 
+/* ==========================================================================
+   Spectrum strip - the live voice band above CHILDREN, shown only in a voice
+   session.  Fixed height and flex-shrink: 0, so showing it adds exactly one
+   band and cannot squeeze the children list or move anything below it.  The
+   canvas is painted per frame in the speaker's token (see voice_viz.js), so
+   the stylesheet only sets the frame.
+   ========================================================================== */
+.voice-viz {
+  height: 48px;
+  flex-shrink: 0;
+  margin-bottom: 10px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  background: var(--panel-2);
+  overflow: hidden;
+}
+.voice-viz-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
 .side-label {
   padding: 0 8px 6px;
   font-size: 10px;
