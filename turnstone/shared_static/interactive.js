@@ -3121,7 +3121,9 @@ class Pane {
   }
 
   _addTtsAction(el) {
-    addTtsAction(el, (btn) => this._playMessageTTS(el, btn));
+    // The style probe rides the same transport base as the TTS POST: a console
+    // pane's replies live on its node, not on the console.
+    addTtsAction(el, (btn) => this._playMessageTTS(el, btn), () => this._base);
   }
 
   // Speaker on every finished assistant reply, not just the retry holder (the
@@ -3134,6 +3136,7 @@ class Pane {
       this.messagesEl,
       this.currentAssistantEl,
       (el, btn) => this._playMessageTTS(el, btn),
+      () => this._base,
     );
   }
 
