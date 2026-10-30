@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "1.9.0a2",
+    "version": "1.9.0a3",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -1781,6 +1781,27 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/tts/styles": {
+      "get": {
+        "summary": "List the speaking styles the read-aloud UI may offer.  Names and in_menu flags only; instruction text stays server-side.  instructions_supported is false when no TTS role is configured or the configured model does not accept instructions.",
+        "operationId": "v1_api_tts_styles_get",
+        "tags": [
+          "Chat"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TextToSpeechStylesResponse"
                 }
               }
             }
@@ -4833,6 +4854,19 @@
             "description": "Optional voice override (else audio.tts_voice setting)",
             "title": "Voice",
             "type": "string"
+          },
+          "style": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional speaking-style name from audio.tts_styles.  Null or absent uses the audio.tts_style default; an unknown name (or \"\") sends no instruction, never an error.  Only applied when the configured TTS model accepts instructions.",
+            "title": "Style"
           }
         },
         "required": [
@@ -5520,6 +5554,63 @@
           "deleted"
         ],
         "title": "WorkstreamDeleteResponse",
+        "type": "object"
+      },
+      "TextToSpeechStylesResponse": {
+        "description": "The style choices a read-aloud client may offer for the TTS role.",
+        "properties": {
+          "styles": {
+            "description": "Every configured style, in stored order; instruction text stays server-side",
+            "items": {
+              "$ref": "#/components/schemas/TextToSpeechStyleInfo"
+            },
+            "title": "Styles",
+            "type": "array"
+          },
+          "default": {
+            "type": "string",
+            "description": "Default style name from audio.tts_style (empty = no instruction)",
+            "title": "Default"
+          },
+          "instructions_supported": {
+            "description": "Whether the configured TTS model accepts instructions; false when no TTS role is configured",
+            "title": "Instructions Supported",
+            "type": "boolean"
+          },
+          "playback_rate": {
+            "default": 1.0,
+            "description": "Read-aloud playback speed from audio.tts_playback_rate (0.5-2.0)",
+            "title": "Playback Rate",
+            "type": "number"
+          }
+        },
+        "required": [
+          "styles",
+          "default",
+          "instructions_supported"
+        ],
+        "title": "TextToSpeechStylesResponse",
+        "type": "object"
+      },
+      "TextToSpeechStyleInfo": {
+        "description": "One configured speaking style, as offered to the read-aloud UI.",
+        "properties": {
+          "name": {
+            "description": "Style name (the value to send as `style`)",
+            "title": "Name",
+            "type": "string"
+          },
+          "in_menu": {
+            "description": "Whether the picker should offer this style",
+            "title": "In Menu",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "in_menu"
+        ],
+        "title": "TextToSpeechStyleInfo",
         "type": "object"
       },
       "AuthWhoamiResponse": {

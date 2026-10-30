@@ -1799,6 +1799,18 @@ async def text_to_speech(request: Request) -> Response:
     )
 
 
+async def list_tts_styles(request: Request) -> JSONResponse:
+    """GET /v1/api/tts/styles — speaking styles the read-aloud picker may offer."""
+    from turnstone.core.web_helpers import tts_styles_payload
+
+    return JSONResponse(
+        tts_styles_payload(
+            config_store=getattr(request.app.state, "config_store", None),
+            registry=getattr(request.app.state, "registry", None),
+        )
+    )
+
+
 def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
     """Count workstream states for health/metrics endpoints."""
     counts = dict.fromkeys((state.value for state in WorkstreamState), 0)
@@ -5485,6 +5497,7 @@ def create_app(
         )
     )
     v1_routes.append(Route("/api/tts", text_to_speech, methods=["POST"]))
+    v1_routes.append(Route("/api/tts/styles", list_tts_styles))
 
     app = Starlette(
         routes=[

@@ -16,7 +16,7 @@ from starlette.responses import FileResponse, PlainTextResponse, Response, Strea
 from starlette.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 
     from starlette.middleware import Middleware
     from starlette.requests import Request
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from starlette.types import Receive, Scope, Send
 
     from turnstone.core.storage import WorkstreamLeaseHeldError, WorkstreamLeaseLostError
+    from turnstone.core.voice_config import DictionaryEntry
 
 
 def latin1_safe_filename(name: str, *, fallback: str = "attachment") -> str:
@@ -568,6 +569,73 @@ def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | 
     return _resolve
 
 
+def tts_style_instruction(
+    *, config_store: Any, registry: Any | None, alias: str, style_name: str
+) -> str:
+    """The ``instructions`` text for one read-aloud request ("" = send none).
+
+    ``style_name`` is the caller's selection — the request's ``style``, or
+    ``audio.tts_style`` when the request omitted one.  An empty or unknown
+    name, a style with no instruction, and a model whose definition lacks
+    ``supports_speech_instructions`` all resolve to no instruction: a stored
+    default can outlive the style it names, and speech must never fail over a
+    preference.
+    """
+    from turnstone.core.audio import model_supports_speech_instructions
+    from turnstone.core.voice_config import parse_styles, resolve_style
+
+    if config_store is None or registry is None or not alias:
+        return ""
+    style = resolve_style(parse_styles(config_store.get("audio.tts_styles") or ""), style_name)
+    if style is None or not style.instruction:
+        return ""
+    if not model_supports_speech_instructions(registry.get_config(alias)):
+        return ""
+    return style.instruction
+
+
+def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, Any]:
+    """The body of ``GET /v1/api/tts/styles``: the style picker's choices, plus
+    the admin playback rate every read-aloud plays at.
+
+    Instruction text never leaves the server; the browser only needs names and
+    ``in_menu``.  ``instructions_supported`` is the exact gate the POST path
+    applies, so the picker can hide itself rather than offer choices the
+    configured model would ignore.  An unconfigured TTS role reads as
+    unsupported.
+    """
+    from turnstone.core.audio import model_supports_speech_instructions, resolve_role_alias
+    from turnstone.core.voice_config import parse_styles
+
+    styles = parse_styles(config_store.get("audio.tts_styles") or "") if config_store else []
+    alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
+    supported = bool(
+        alias
+        and registry is not None
+        and model_supports_speech_instructions(registry.get_config(alias))
+    )
+    return {
+        "styles": [{"name": s.name, "in_menu": s.in_menu} for s in styles],
+        "default": str(config_store.get("audio.tts_style") or "") if config_store else "",
+        "instructions_supported": supported,
+        "playback_rate": _tts_playback_rate(config_store),
+    }
+
+
+def _tts_playback_rate(config_store: Any) -> float:
+    """``audio.tts_playback_rate`` for the player; anything unusable reads as 1.0.
+
+    It rides the styles probe because that is the one read-aloud config fetch
+    the player already makes per transport base.
+    """
+    raw = config_store.get("audio.tts_playback_rate") if config_store is not None else None
+    try:
+        rate = float(raw) if raw is not None else 1.0
+    except (TypeError, ValueError):
+        return 1.0
+    return rate if 0.5 <= rate <= 2.0 else 1.0
+
+
 async def text_to_speech_response(
     request: Request, *, registry: Any | None, capacity: SpeechCapacity, poll_s: float = 1.0
 ) -> Response:
@@ -596,6 +664,7 @@ async def text_to_speech_response(
     from turnstone.core.log import get_logger
     from turnstone.core.model_backend_auth import BackendAuthUnavailableError
     from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
+    from turnstone.core.voice_config import parse_dictionary
 
     log = get_logger(__name__)
     body = await read_json_or_400(request)
@@ -625,15 +694,34 @@ async def text_to_speech_response(
     if not voice and config_store is not None:
         voice = (config_store.get("audio.tts_voice") or "").strip()
 
+    # An absent/null ``style`` takes the configured default; an explicit name
+    # (including "") is resolved as given.  Unknown names are never an error.
+    style = body.get("style")
+    if style is None and config_store is not None:
+        style = config_store.get("audio.tts_style")
+    instructions = tts_style_instruction(
+        config_store=config_store,
+        registry=registry,
+        alias=alias,
+        style_name=str(style or ""),
+    )
+
     # On by default (the registry default applies); a missing config store
     # means defaults, not "off".
     if config_store is None or config_store.get("audio.tts_normalize"):
         pronunciations = ""
+        dictionary = ""
         if config_store is not None:
             pronunciations = config_store.get("audio.tts_pronunciations") or ""
+            dictionary = config_store.get("audio.voice_dictionary") or ""
         # Every rule is linear and the length cap bounds the work; a thread would
-        # not help (the regex holds the GIL).
-        text = normalize_for_speech(text, parse_pronunciations(pronunciations))
+        # not help (the regex holds the GIL).  Both parsers are tolerant, so a
+        # bad stored value never breaks read-aloud.
+        text = normalize_for_speech(
+            text,
+            parse_pronunciations(pronunciations),
+            parse_dictionary(dictionary),
+        )
         # Cleanup grows text (units and dates become words), and the cap is what
         # sizes the backend call and the console's wait, so it bounds the text
         # actually synthesized as well as the text sent.
@@ -657,6 +745,7 @@ async def text_to_speech_response(
             alias=alias,
             text=text,
             voice=voice,
+            instructions=instructions,
             config_store=config_store,
             backend_auth_resolver=audio_backend_auth_resolver(request),
             cancel_ref=abort_ref,
@@ -770,6 +859,49 @@ def _console_dictation(
     )
 
 
+def stt_dictionary(config_store: Any) -> list[DictionaryEntry]:
+    """The voice dictionary dictation uses, parsed tolerantly.
+
+    ``[]`` when no config store is present or the stored value is unusable: a
+    dictionary that predates a rule change must never break dictation.
+    """
+    if config_store is None:
+        return []
+    from turnstone.core.voice_config import parse_dictionary
+
+    return parse_dictionary(config_store.get("audio.voice_dictionary") or "")
+
+
+def stt_prompt(config_store: Any, dictionary: Sequence[DictionaryEntry]) -> str:
+    """The transcription prompt: ``audio.stt_prompt``, plus dictionary terms.
+
+    The terms are appended only when ``audio.stt_dictionary_hint`` is on.  A
+    missing config store keeps the old behaviour (no prompt); with a store, the
+    registry defaults apply, so both voice settings default on.
+    """
+    if config_store is None:
+        return ""
+    prompt = (config_store.get("audio.stt_prompt") or "").strip()
+    if dictionary and config_store.get("audio.stt_dictionary_hint"):
+        from turnstone.core.dictation_text import dictionary_prompt
+
+        prompt = dictionary_prompt(prompt, dictionary)
+    return prompt
+
+
+def correct_stt_transcript(
+    config_store: Any, dictionary: Sequence[DictionaryEntry], text: str
+) -> str:
+    """Apply the dictionary's ``also_hears`` replacements when enabled."""
+    if config_store is None or not dictionary:
+        return text
+    if not config_store.get("audio.stt_dictionary_correct"):
+        return text
+    from turnstone.core.dictation_text import correct_transcript
+
+    return correct_transcript(text, dictionary)
+
+
 class AbortOnExitStreamingResponse(StreamingResponse):
     """Abort an upstream audio stream even before body iteration begins.
 
@@ -844,9 +976,8 @@ async def speech_to_text_response(
     if not data:
         return _JSONResponse({"error": "Empty audio upload"}, status_code=400)
 
-    stt_prompt = ""
-    if config_store is not None:
-        stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
+    dictionary = stt_dictionary(config_store)
+    prompt = stt_prompt(config_store, dictionary)
     abort_ref = StreamAbortRef()
     backend_auth_resolver = audio_backend_auth_resolver(request)
     try:
@@ -860,7 +991,7 @@ async def speech_to_text_response(
                 alias=alias,
                 data=data,
                 filename=filename or "speech.webm",
-                prompt=stt_prompt,
+                prompt=prompt,
                 config_store=config_store,
                 backend_auth_resolver=backend_auth_resolver,
                 cancel_ref=abort_ref,
@@ -890,10 +1021,11 @@ async def speech_to_text_response(
         # rather than treating a healthy backend as a bad gateway.
         return _JSONResponse({"error": "No speech detected"}, status_code=422)
 
+    transcript = correct_stt_transcript(config_store, dictionary, result.transcript)
     return _JSONResponse(
         {
             "status": "ok",
-            "transcript": result.transcript,
+            "transcript": transcript,
             "model_alias": result.model_alias,
         }
     )
@@ -912,7 +1044,10 @@ async def speech_to_text_stream_response(
     Lower perceived latency than the JSON route.  Resolve/transcode failures
     surface as 503 / 502 before any bytes are sent; once streaming begins the
     body is best-effort (a mid-stream backend error just ends the partial
-    stream).  *registry* / *authorize* as in :func:`speech_to_text_response`.
+    stream).  Dictionary terms are hinted in the prompt like the JSON route,
+    but transcript correction is JSON-route only — this route has no final
+    event, only raw deltas.  *registry* / *authorize* as in
+    :func:`speech_to_text_response`.
     """
     import asyncio
     import threading
@@ -952,9 +1087,13 @@ async def speech_to_text_stream_response(
     if not data:
         return _JSONResponse({"error": "Empty audio upload"}, status_code=400)
 
-    stt_prompt = ""
-    if config_store is not None:
-        stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
+    # The dictionary hint applies here exactly as on the JSON route.  The
+    # correction does not: this route emits raw content deltas and the browser
+    # appends each one straight into the composer, so there is no final or
+    # complete transcript event to rewrite (and a phrase may span two deltas,
+    # which no per-delta rewrite could match).  Raw deltas are left alone.
+    dictionary = stt_dictionary(config_store)
+    prompt = stt_prompt(config_store, dictionary)
     abort_ref = StreamAbortRef()
     backend_auth_resolver = audio_backend_auth_resolver(request)
 
@@ -970,7 +1109,7 @@ async def speech_to_text_stream_response(
                 registry=registry,
                 alias=alias,
                 data=data,
-                prompt=stt_prompt,
+                prompt=prompt,
                 config_store=config_store,
                 backend_auth_resolver=backend_auth_resolver,
                 cancel_ref=abort_ref,
