@@ -6624,6 +6624,16 @@ const MODEL_ROLES = [
     fallbackKind: "default",
   },
   {
+    // Voice is a coordinator persona, so both blanks inherit the Coordinator
+    // row rather than the system default; the description says which.
+    label: "Voice",
+    description:
+      "Voice-mode coordinator sessions. Empty = use the Coordinator model.",
+    aliasKey: "coordinator.voice_model_alias",
+    effortKey: "coordinator.voice_reasoning_effort",
+    fallbackKind: "inherit",
+  },
+  {
     label: "Judge",
     description:
       "Intent-validation judge that scores tool calls before approval. Also runs the output guard when no output guard judge is set.",

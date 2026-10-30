@@ -730,17 +730,19 @@ change the other.
 A voice session is a coordinator created with the `voice` persona. Use it when
 the conversation is spoken rather than typed: you talk to it, its replies are
 read aloud, and it is expected to answer briefly instead of producing a
-document. It is a coordinator persona, so start it from the console's
-**Coordinator** launcher with **Voice** selected in the persona picker, or
-pass `persona` on `POST /v1/api/workstreams/new`:
+document. Start it from the console dashboard's **Voice** tab: the tab forces
+the persona, and the optional opening line you type becomes the session's
+first message. The same create is available from the **Coordinator** tab with
+**Voice** selected in the persona picker, or by passing `persona` on
+`POST /v1/api/workstreams/new`:
 
 ```json
 {"persona": "voice", "initial_message": "What needs my attention today?"}
 ```
 
-The persona changes the session's instructions and its memory namespace, not
-the speech pipeline. Dictation, read-aloud, cleanup and pacing behave exactly
-as described above.
+The persona changes the session's instructions and which memory scopes it may
+use, not the speech pipeline. Dictation, read-aloud, cleanup and pacing behave
+exactly as described above.
 
 ### Spoken replies
 
@@ -756,23 +758,62 @@ It also starts background agents only when you ask for work, not when you
 think out loud. A voice session is easy to talk to in asides, and an aside
 like "I wonder whether the tests pass" should not turn into a fan-out.
 
+### Voice model role
+
+`coordinator.voice_model_alias` · default empty (use the Coordinator model) · set in **Models → Roles**
+
+The model alias coordinators created with the `voice` persona run on. It is a
+role, not a per-session pick: the **Voice** row in Models → Roles sets the
+default for every voice session. When empty, a voice session walks the ordinary
+coordinator chain — `coordinator.model_alias`, then `model.default_alias`, then
+the console's `[model].default`. A model chosen for one session in the launcher
+still wins over the role.
+
+Point it at a smaller or faster model when spoken turns should feel immediate;
+leave it empty when voice and text coordinators share a model. Like the
+Coordinator role, the alias is not checked against what is loaded: a stale or
+misspelled value makes creating the voice session fail with
+`model_not_loaded` instead of quietly launching on another model.
+
+### Voice reasoning effort
+
+`coordinator.voice_reasoning_effort` · default empty (use the Coordinator setting) · set in **Models → Roles**
+
+Reasoning effort for voice-persona coordinators, using the same choices as the
+Coordinator role. When empty, a voice session uses `coordinator.reasoning_effort`
+and then the normal ladder: the model's own setting, `model.reasoning_effort`,
+and the model's declared or serving-side default. A value set here applies only
+to voice sessions; text coordinators keep their own setting.
+
+Spoken turns are usually short and latency-sensitive, so a lower value than the
+Coordinator role is often the right trade. Use `none` to disable reasoning
+where the model supports that.
+
 ### Voice memories
 
-A voice session keeps its memories in the `voice` scope, keyed by the acting
-user. Every voice session that user opens shares the namespace; text
-coordinators keep using `coordinator`, and the two do not mix. The split is
-deliberate: a coordinator's memory accumulates working habits — "always
-research first", "read the whole file before editing", "run the narrowed test
-file" — that make text work reliable and a spoken conversation exhausting. A
-voice session should remember how you like to be talked to and what you asked
-it to keep, not a playbook for changing a repository. Separating the scopes
-also means a terse correction spoken out loud cannot silently reprogram the
-coordinator you use for code review.
+A voice session does not have a memory scope of its own. It uses the same
+scopes as an interactive session: `global`, its own `workstream`, `user`, and
+the attached `project`. A voice conversation is for spitballing and setting
+work up for an orchestrator, so the point is that what you say is visible where
+the work continues — an orchestrator or interactive session can read a memory
+saved by voice, and every voice session that user opens sees the same
+`global`/`user` rows. An unscoped save follows the interactive rule too: it
+lands in the attached `project` when there is one, otherwise in `global`.
 
-The scope is durable and per user, not per session: closing and reopening the
-voice session does not lose it. It uses the same body-free metadata index and
-`memory(action='get', ...)` read path as any other scope; see
-[Structured Memory](memory.md#memory-scopes) for the mechanics.
+A voice coordinator is still a coordinator by kind, but it can never read or
+write the `coordinator` scope. That private namespace accumulates working
+habits — "always research first", "read the whole file before editing", "run
+the narrowed test file" — which are useful for text work and exhausting in a
+spoken conversation. Keeping the gate on both kind and persona means a spoken
+aside can neither see those rows nor plant one for the text coordinator to
+read later.
+
+Voice memories use the same body-free metadata index and
+`memory(action='get', ...)` read path as every other scope; the initial index
+lists exactly the rows an interactive session for the same user would see. See
+[Structured Memory](memory.md#memory-scopes) for the mechanics. Rows written
+under the retired `voice` scope during earlier releases were migrated into the
+`global` scope.
 
 ### Starting agents
 
@@ -783,7 +824,7 @@ them.
 | Setting | Default | Range | Effect |
 |---------|---------|-------|--------|
 | `coordinator.voice_max_agents_per_turn` | `1` | 0–10 | Child agents one spoken turn may start. A further spawn call is refused with a note telling the model to ask you first. `0` stops voice sessions starting agents at all. |
-| `coordinator.voice_max_requested_agents` | `4` | 0–10 | Ceiling for a turn in which you explicitly named a number of agents and the model set `user_requested_count`. |
+| `coordinator.voice_max_requested_agents` | `4` | 0–10 | Ceiling on the budget a turn may take from a count you name; the budget is that count, never more than this and never less than `coordinator.voice_max_agents_per_turn`. |
 | `coordinator.voice_child_model` | `deepseek-flash-high` | any model alias; empty means the normal default | Model an agent starts on when the voice coordinator names none. |
 
 The default cap is one because spoken asides are easy to mistake for
@@ -796,16 +837,19 @@ such as while driving.
 
 `coordinator.voice_max_requested_agents` keeps the per-turn cap from
 overruling a request you actually made. When a spawn call sets
-`user_requested_count`, the turn's budget becomes the larger of this ceiling
-and the normal cap, so "chunk it up to four different agents" can start four
-in one turn instead of needing three more. The guard does not take the model's
-word for it: the latest genuine user message must itself name the count — a
-digit or a spoken number up to ten, near "agents" or "each". A flag without
-that evidence falls back to the normal cap. A refusal tells the model to ask
-you to confirm the number and then retry once with the flag, so an ambiguous
-request costs one spoken sentence rather than a silent fan-out. Set this
-ceiling to `0` to refuse explicitly requested wider turns; a normal cap of `0`
-is still a hard stop.
+`user_requested_count` and you named a count, the turn's budget becomes that
+count — never more than this ceiling and never less than the normal cap — so
+"chunk it up to four different agents" can start four in one turn instead of
+needing three more. The guard does not take the model's word for it: the
+latest genuine user message must itself name the count, as a digit or a
+spoken number up to ten directly before "agent" or "agents" (one adjective,
+as in "four different agents", is allowed). A number elsewhere in the
+sentence, a standalone "each" and two different counts in one message all
+fall back to the normal cap, so "one agent is enough" cannot be stretched into
+a larger fan-out. A refusal that follows the flag tells the model to ask you
+to confirm the number and then retry once with the flag; without the flag it
+just asks whether to start another. Set this ceiling to `0` to refuse
+explicitly requested wider turns; a normal cap of `0` is still a hard stop.
 
 `coordinator.voice_child_model` keeps a spoken spawn from waiting on a model
 that is not loaded. The default is a fast model suited to background work.
@@ -955,6 +999,70 @@ refuses the module — dictation falls back to click-to-stop and
 The mic reads these three settings when it first needs them on a page, so a
 saved change reaches recordings started after a page reload.
 
+## Frame capture (speaker gate groundwork)
+
+Voice mode is being taught to tell speakers apart: a later release will check
+each short stretch of speech against the enrolled user before it becomes a
+turn. That needs raw audio in small pieces, and dictation captures one
+compressed clip per turn — a codec stream only means something as a whole. This
+section is the groundwork: while a recording runs, the page can tap the same
+microphone through an AudioWorklet and send fixed 32 ms frames (16 kHz mono
+PCM) to the server.
+
+Transcription does not change. The compressed clip still goes to the
+speech-to-text model exactly as before; the frames are a second, parallel tap
+used only by the future speaker gate. The page cuts the frame stream into short
+segments at the [segment gap](#segment-gap); the server buffers the frames in
+memory per recording and stops accepting them at the [capture cap](#capture-caps).
+The buffer is in memory only and expires a short while after the cap. Nothing is
+written to disk, nothing is scored yet, and the feature is off by default.
+
+### Turning frame capture on
+
+`audio.stt_frame_capture` · default off · boolean
+
+On, each dictation recording also streams raw frames to the server. Off keeps
+today's behavior exactly: no worklet is created, no extra request is made, and
+the only audio leaving the page is the clip you already sent for transcription.
+Turn it on only to exercise the speaker-gate groundwork; the turn itself is
+still assembled from the clip.
+
+Frame capture is best-effort. A browser without AudioWorklet, a worklet that
+fails to load, or a server that refuses a batch ends the frame tap and leaves
+the recorder running — the dictation still uploads and transcribes. The
+settings are read when the recording starts, so a saved change reaches the next
+recording after a page reload.
+
+### Segment gap
+
+`audio.stt_segment_gap_ms` · default `250` · range 100–2000
+
+How long a pause ends one segment. Segments are the unit a speaker verdict will
+be attached to, so they have to be short enough that a new voice gets a fresh
+check quickly, while a natural pause inside one person's sentence should not
+split it. This is deliberately separate from
+[`audio.stt_silence_ms`](#how-long-you-must-be-quiet): that clock stops the
+recorder after 900 ms by default, and stopping a recording is not the same as
+cutting it into segments.
+
+Raise the gap when a speaker's ordinary pauses split their sentences into
+several segments; lower it when two voices follow each other faster than the
+gate can react.
+
+### Capture caps
+
+`audio.stt_frame_capture_max_seconds` · default `300` · range 10–3600
+
+The hard limit on one recording's buffered frames, in seconds — about 32 KB per
+second on the server, so 300 seconds is roughly 9.6 MB. At the cap the capture
+closes and further batches are refused; the recording, the clip upload and the
+transcript continue untouched. A capture also expires automatically a short
+while after its cap, so a closed tab cannot pin memory.
+
+The browser stops sending at the same cap. The server is the authority: it
+rejects any batch that would cross the cap, even if an older page keeps
+sending.
+
 ## Streaming read-aloud
 
 By default a reply is read aloud only after it is finished: the speaker button
@@ -967,13 +1075,16 @@ has arrived. It holds the trailing partial sentence back — a delta that stops
 in the middle of a word, or on a full stop that might still become "3.14" or
 "Dr." — and hands each completed sentence to the speech backend immediately.
 At the end of the turn the remainder is flushed, so a reply that trails off is
-still spoken in full. A cancel, a stop, or a new reply drops every clip that
-was queued but not yet played.
+still spoken in full. A cancel or a stop drops every clip that was queued but
+not yet played; a new reply arriving in voice mode queues instead (see
+[Queued replies](#queued-replies)).
 
 Streaming and finished-reply playback share the same voice, style, playback
 rate and pacing profile, and the same one-request-at-a-time rule: the next
 sentence is synthesized while the current one plays. Only one reading plays at
-a time on a page, so starting a new reply stops anything still speaking. The
+a time on a page. Outside voice mode, starting a new streamed reply stops
+anything still speaking; in voice mode the new reply waits its turn, and a
+speaker-button press — not a later reply — is what stops the one playing. The
 speaker button on finished replies is unchanged; it reads the whole reply again
 from the beginning.
 
@@ -986,6 +1097,21 @@ browser with the rest of the read-aloud configuration, so a saved change
 applies after a page reload. The browser may refuse to start audio that no
 click preceded — a page that has had no interaction yet — in which case the
 speaker on the finished reply still works.
+
+### Queued replies
+
+In a voice session, a reply that arrives while another is being read aloud
+waits its turn instead of cutting in. Replies are spoken in arrival order, and
+each keeps accumulating its text while it waits, so a burst of worker reports
+is heard in full. Up to ten replies wait, far more than a real burst produces;
+only an eleventh arrival drops the oldest waiting one. Stop, or pressing any
+speaker button, clears the whole queue.
+
+A speaker-button press is you taking over, so it still supersedes: the reply
+being spoken stops, every waiting reply is dropped, and the chosen reply
+speaks immediately. Leaving voice mode or closing the pane stops playback
+through the same path. Text panes that read every message aloud keep the old
+behaviour, where a new message stops the one playing.
 
 ## Voice mode
 
@@ -1058,6 +1184,39 @@ is over.
 Pressing **Voice** again turns the mode off immediately. A recording in flight
 is discarded rather than transcribed, playback stops, and nothing else fires.
 Closing the pane does the same.
+
+### The spectrum strip
+
+While voice mode is on, a thin strip sits at the top of the right panel, above
+**Children**. Its bars are the live frequency content of whoever is talking,
+read from the audio itself rather than animated: orange bars are the
+coordinator speaking, grey-blue bars are your microphone, and a flat grey line
+means nobody is. The bars cover the speech range from 80 Hz to 8 kHz on a log
+scale, so a low voice and a high one both move across the strip.
+
+When you finish a spoken turn, the strip hands off: from the moment the heard
+text is sent, while the coordinator is thinking, the bars cross-fade from your
+grey-blue to the reply's orange over about half a second. The reply's first
+audio starts with the bars already orange, so the colour does not jump when
+the voice begins; a cancel or an error returns them to grey-blue instead.
+
+The microphone is read through a branch that never reaches the speakers, so
+nothing is echoed back and the browser does not ask for the microphone a second
+time. A reply is read through its own audio element: the element is routed
+through the page's audio graph, which reaches the speakers, so the strip reads
+exactly what you hear. The tap is made once per element, not once per sentence,
+so a segmented reply is read continuously across its clips. If the browser has
+not let the page start audio yet, the element keeps its native playback path
+until it has, so a reply is never muted to draw a strip.
+
+The bar colour is read from the console's own tokens rather than hard-coded,
+and a theme switch repaints the strip in the new theme. When the microphone
+closes or the reply stops, the bars fall back to the resting line instead of
+holding the last frame, and the strip stops animating once they have settled.
+The strip only does work while something is speaking or settling and the tab
+is visible, and it is removed when voice mode ends. With reduced motion
+turned on in your system settings, the bars give way to a single level meter
+that still falls when the audio stops.
 
 ### The setting
 

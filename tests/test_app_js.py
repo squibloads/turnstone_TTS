@@ -16,7 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from tests._js_harness_helpers import run_node_source, slice_braced_block
+from tests._js_harness_helpers import (
+    FAKE_DOM,
+    extract_braced,
+    run_node_source,
+    slice_braced_block,
+)
 from tests._js_harness_helpers import strip_js_comments as _strip_js_comments
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
@@ -854,6 +859,72 @@ def test_perception_role_surfaced_in_admin_and_filtered_from_settings() -> None:
         "the Settings role-key filter must derive from MODEL_ROLES"
     )
     assert "roleKeys[MODEL_ROLES[ri].aliasKey] = 1" in admin
+
+
+def test_voice_role_renders_directly_under_coordinator() -> None:
+    """Models → Roles carries a Voice row under Coordinator with both a MODEL
+    and a REASONING EFFORT selector.  Render the real MODEL_ROLES table through
+    the real _renderModelRoles: a registry key is not enough — a role whose
+    settings are absent from the payload disappears, and a missing effortKey
+    silently drops the second dropdown."""
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    roles = re.search(r"^const MODEL_ROLES = \[[\s\S]*?^\];", admin, re.MULTILINE)
+    assert roles is not None, "MODEL_ROLES must be a top-level const"
+    src = (
+        FAKE_DOM
+        + "\n"
+        + roles.group(0)
+        + "\n"
+        + extract_braced(admin, "function _renderModelRoles(container, values, schema) {")
+        + """
+const _modelDefs = [];
+const _modelDefaultAlias = "";
+function _audioModelEligible() { return true; }
+function _saveModelRole() {}
+function _modelRolesError(container, message) {
+  container.textContent = message;
+}
+const values = {
+  "coordinator.model_alias": { key: "coordinator.model_alias", value: "" },
+  "coordinator.reasoning_effort": {
+    key: "coordinator.reasoning_effort", value: "",
+  },
+  "coordinator.voice_model_alias": {
+    key: "coordinator.voice_model_alias", value: "",
+  },
+  "coordinator.voice_reasoning_effort": {
+    key: "coordinator.voice_reasoning_effort", value: "",
+  },
+};
+const schema = {
+  "coordinator.reasoning_effort": { choices: ["", "low", "high"] },
+  "coordinator.voice_reasoning_effort": { choices: ["", "low", "high"] },
+};
+const container = document.createElement("div");
+_renderModelRoles(container, values, schema);
+const rows = container.children.map(function (row) {
+ return {
+    label: row.children[0].children[0].textContent,
+    description: row.children[1].textContent,
+    selects: row.children[2].children.map(function (wrap) {
+      return wrap.children[1].getAttribute("data-role-key");
+    }),
+  };
+});
+console.log(JSON.stringify(rows));
+"""
+    )
+    result = run_node_source(src)
+    assert result.returncode == 0, result.stderr
+    rows = json.loads(result.stdout.strip().splitlines()[-1])
+    assert [row["label"] for row in rows] == ["Coordinator", "Voice"]
+    assert rows[1]["description"] == (
+        "Voice-mode coordinator sessions. Empty = use the Coordinator model."
+    )
+    assert rows[1]["selects"] == [
+        "coordinator.voice_model_alias",
+        "coordinator.voice_reasoning_effort",
+    ]
 
 
 def test_audio_roles_gated_to_openai_sdk_providers() -> None:
@@ -3977,9 +4048,10 @@ def test_copy_button_survives_retry_teardown_in_both_clients() -> None:
     start = _pane_method_offset(interactive, "_attachRetryToLastAssistant")
     end = _pane_method_offset(interactive, "announceToolBlock")
     teardown = interactive[start:end]
-    assert '".msg-retry-btn"' in teardown and ".msg-tts-btn" not in teardown.split(
-        "_addTtsActionsToFinished"
-    )[0], (
+    assert (
+        '".msg-retry-btn"' in teardown
+        and ".msg-tts-btn" not in teardown.split("_addTtsActionsToFinished")[0]
+    ), (
         "interactive teardown must remove only the transient retry button by class; "
         "the read-aloud button belongs to every finished reply"
     )

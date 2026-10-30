@@ -35,6 +35,12 @@ const STATE_LABEL = {
   idle: "idle",
 };
 
+// The coordinator persona that turns a row into a spoken session.  app.js is a
+// classic script and this module is shared with the node UI, so neither can
+// import turnstone.core.voice_config.VOICE_PERSONA; the harness pins this copy
+// against the backend constant.
+const VOICE_PERSONA = "voice";
+
 /** A decorative shape+colour state glyph (the row/pill also carries the state
  *  in text/aria, so the glyph itself is aria-hidden).  Exported so the shell can
  *  paint the SAME glyph onto a conversational tab from the SAME Tier-1 source —
@@ -77,11 +83,18 @@ function nodeState(info) {
   return "idle";
 }
 
-function tagFor(kind) {
+function tagFor(ws) {
   const tag = document.createElement("span");
-  const coord = kind === "coordinator";
+  const coord = ws.kind === "coordinator";
+  // A voice session is a coordinator by kind; its persona is what makes it
+  // spoken.  Normalize like the backend's is_voice_persona so a stamped slug
+  // with stray case/whitespace still reads as voice.
+  const persona =
+    typeof ws.persona === "string" ? ws.persona.trim().toLowerCase() : "";
+  const voice = coord && persona === VOICE_PERSONA;
+  // VOICE keeps the coordinator colour: it is a persona, not a fourth kind.
   tag.className = "tag" + (coord ? " coord" : "");
-  tag.textContent = coord ? "COORD" : "INT";
+  tag.textContent = voice ? "VOICE" : coord ? "COORD" : "INT";
   return tag;
 }
 
@@ -261,7 +274,7 @@ function sessionRow(ws, childCount, isChild, TS, paneManager, active) {
     c.textContent = String(childCount);
     btn.append(c);
   }
-  btn.append(tagFor(kind));
+  btn.append(tagFor(ws));
   // Both kinds open as console panes (step 5): a coordinator is console-local;
   // an interactive session lives on a node, so its pane is node-PROXIED — pass
   // the owning node as a hint (the shell re-derives it from Tier-1 on rehydrate).
