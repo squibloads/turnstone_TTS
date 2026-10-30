@@ -311,6 +311,7 @@ already shipped on the 1.8 line are not repeated here.
 - **Read-aloud keeps playing when the tab is hidden** — it used to stop, because hiding the tab
   closes the live stream and the stream teardown also stopped the audio. It now stops on Stop,
   when the conversation is rebuilt from history, and when the pane is closed.
+- **Every finished reply has its own read-aloud button** — the speaker used to appear only on the latest reply and moved on with Retry. It now stays on each reply once it has finished (a reply still streaming gets it when it settles), so an earlier answer can be read, or keep playing, while a newer one arrives.
 - **`spawn_batch` sends every child's create at once (#1457).** It sent them one after another,
   and each create waits up to 30 seconds for the console, which waits up to 30 seconds for the
   node, so a stalled console or node held the coordinator's call for up to five minutes. A stall
