@@ -59,7 +59,9 @@ _PANE_SRC = "\n".join(
 
 # Just enough DOM for the walker: element/text nodes, classList.contains and
 # an HTML-subset parser so the cases below read as the markup they model.
-_DOM = _PLAYER_MODULE + r"""
+_DOM = (
+    _PLAYER_MODULE
+    + r"""
 // childNodes is NodeList-like as in browsers: iterable, length, item(), and NO
 // array methods (no reduce/map/filter), so code that treats it as an Array
 // fails here as it does in Chrome.  The parser appends through _kids.
@@ -108,6 +110,7 @@ function parse(html, cls) {
   return root;
 }
 """
+)
 
 _PLAYER = r"""
 const log = { announce: 0, toasts: [], created: [], revoked: [], timers: [], audios: [], srcs: [], fetches: [] };
@@ -143,6 +146,11 @@ globalThis.Audio = class {
 // ignoreAbort is set, which models a reply already in flight when the run is
 // superseded (the response still resolves after the abort).
 function authFetch(url, opts) {
+  // The read-aloud config probe (styles + playback rate) is not a clip: answer
+  // it at once, outside the one-clip-in-flight accounting.
+  if (url.endsWith("/v1/api/tts/styles")) {
+    return Promise.resolve({ ok: true, json: async () => ({ styles: [], default: "", instructions_supported: false }) });
+  }
   inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
   return new Promise((resolve, reject) => {
     const f = { url, opts, text: JSON.parse(opts.body).text, done: false };
@@ -366,9 +374,9 @@ def test_every_long_code_cell_in_a_row_keeps_its_marker() -> None:
         ("x, Code omitted., Code omitted.", 0)
     ]
     # Within one cell two adjacent long spans are still one omission.
-    assert _segs(f"<table><tr><td>x</td><td><code>{long_}</code><code>{long_}</code></td></tr></table>") == [
-        ("x, Code omitted.", 0)
-    ]
+    assert _segs(
+        f"<table><tr><td>x</td><td><code>{long_}</code><code>{long_}</code></td></tr></table>"
+    ) == [("x, Code omitted.", 0)]
 
 
 def test_short_table_rows_are_never_merged() -> None:
@@ -442,7 +450,9 @@ def test_a_rendered_mermaid_container_is_one_diagram_marker_not_its_labels() -> 
 
 
 def test_loading_and_error_mermaid_containers_are_also_one_marker() -> None:
-    assert _segs('<div class="mermaid-container mermaid-loading"></div>') == [("Diagram omitted.", 0)]
+    assert _segs('<div class="mermaid-container mermaid-loading"></div>') == [
+        ("Diagram omitted.", 0)
+    ]
     err = (
         '<div class="mermaid-container mermaid-error"><div class="mermaid-error-msg">Parse error on line 2</div>'
         "<pre><code>flowchart LR\n A --> llm-gateway</code></pre></div>"
@@ -488,7 +498,7 @@ def test_a_diagram_inside_a_list_item_keeps_the_list_one_clip() -> None:
 def test_inline_svg_and_media_elements_are_skipped_silently() -> None:
     assert _segs(
         "<p>Click the <svg><title>gear icon</title><text>cog</text></svg> button to open settings.</p>"
-        "<p>See <img alt=\"chart of results\"></img> the picture and <canvas>fallback text</canvas> "
+        '<p>See <img alt="chart of results"></img> the picture and <canvas>fallback text</canvas> '
         "<video>no video support</video><audio>no audio support</audio> for details.</p>"
     ) == [
         ("Click the button to open settings.", 500),
