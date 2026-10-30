@@ -103,6 +103,7 @@ _PRELUDE = "\n".join(
         STUBS,
         _STATE,
         _decl(r"let voiceRoles = [^;]*;", "let voiceRoles = undefined;"),
+        _decl(r"let ttsStream = [^;]*;", "let ttsStream = null;"),
         _decl(
             r"const ttsPlayer = createTtsPlayer\(\{[^}]*\}\);",
             "const ttsPlayer = { stop() { throw new Error('missing ttsPlayer'); } };",

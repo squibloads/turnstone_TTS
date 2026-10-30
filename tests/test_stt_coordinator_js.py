@@ -68,6 +68,7 @@ function reconcileSendBlock() {}
 function _addTtsActions() {}
 let voiceRoles = { stt: false, tts: false };
 const ttsPlayer = { stop() {} };
+let ttsStream = null;
 """
 
 _COORD_FNS = "\n".join(
