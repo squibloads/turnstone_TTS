@@ -121,11 +121,11 @@ COORDINATOR_TOOLS = [
 VOICE_EXCLUDED_COORDINATOR_TOOLS = frozenset({"wait_for_workstream"})
 # Voice coordinators are coordinator-kind sessions built under the ``voice``
 # persona.  They see the coordinator shelf minus the blocking wait, then apply
-# the ``voice`` kind variant on top: the memory variant narrows the scope enum
-# to the private voice namespace (plus project) and replaces the coordinator
-# description, so it must WIN over the coordinator variant rather than merge
-# with it.  Every tool with no ``voice`` variant passes through unchanged
-# (same object, no copy).
+# the ``voice`` kind variant on top: the memory variant replaces the
+# coordinator scope enum with the interactive envelope (voice never reaches the
+# coordinator namespace) and replaces the coordinator description, so it must
+# WIN over the coordinator variant rather than merge with it.  Every tool with
+# no ``voice`` variant passes through unchanged (same object, no copy).
 VOICE_COORDINATOR_TOOLS = [
     _apply_kind_variant(t, "voice", _META[t["function"]["name"]])
     for t in _COORDINATOR_KIND_TOOLS

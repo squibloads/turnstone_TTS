@@ -682,6 +682,27 @@ def _stt_bool(raw: Any) -> bool:
     return bool(raw)
 
 
+def _bounded_int(raw: Any, key: str) -> int:
+    """A stored int clamped to the registry's bounds; unusable reads as default.
+
+    The browser receives these values directly (the segment clock, the capture
+    cap), so a row written by an older build must not hand it a value the
+    setting itself would reject.
+    """
+    from turnstone.core.settings_registry import SETTINGS
+
+    defn = SETTINGS[key]
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = int(defn.default)
+    if defn.min_value is not None and value < defn.min_value:
+        value = int(defn.min_value)
+    if defn.max_value is not None and value > defn.max_value:
+        value = int(defn.max_value)
+    return value
+
+
 def stt_config_payload(*, config_store: Any) -> dict[str, Any]:
     """The body of ``GET /v1/api/stt/config``: the browser-side dictation knobs.
 
@@ -728,6 +749,14 @@ def stt_config_payload(*, config_store: Any) -> dict[str, Any]:
         # Hands-free mode defaults on (registry default), so a missing or
         # unreadable value must not hide it; only an explicit false does.
         "voice_mode_enabled": _voice_mode_enabled(raw("audio.voice_mode_enabled")),
+        # Speaker-gate groundwork.  Off unless explicitly on: a degraded or
+        # older server must never start posting microphone frames.
+        "frame_capture": _stt_bool(raw("audio.stt_frame_capture")),
+        "segment_gap_ms": _bounded_int(raw("audio.stt_segment_gap_ms"), "audio.stt_segment_gap_ms"),
+        "frame_capture_max_seconds": _bounded_int(
+            raw("audio.stt_frame_capture_max_seconds"),
+            "audio.stt_frame_capture_max_seconds",
+        ),
     }
 
 
@@ -742,6 +771,116 @@ def _voice_mode_enabled(raw: Any) -> bool:
     if isinstance(raw, str) and raw.strip().lower() in ("false", "0", "no"):
         return False
     return raw if isinstance(raw, bool) else True
+
+
+def _int_query(params: Any, name: str) -> int:
+    """A required non-negative integer query parameter, or a 400."""
+    from turnstone.core.speech_frames import FrameCaptureError
+
+    raw = (params.get(name) or "").strip()
+    if not raw or not raw.isascii() or not raw.isdigit():
+        raise FrameCaptureError(f"{name} must be a non-negative integer")
+    return int(raw)
+
+
+async def _read_bounded_body(request: Request, limit: int) -> bytes:
+    """Read a body with a hard ceiling, rejecting before it is buffered whole.
+
+    ``await request.body()`` would hold an arbitrarily large chunked upload in
+    memory; this route is reachable by any user who can dictate, so the ceiling
+    has to bite while the bytes are still arriving.
+    """
+    from turnstone.core.speech_frames import FrameCaptureError
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise FrameCaptureError(f"frame batch exceeds the {limit}-byte limit", status_code=413)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def frame_capture_response(
+    request: Request,
+    *,
+    authorize: Callable[[Request, str], Awaitable[Response | None]],
+) -> Response:
+    """Serve ``POST .../speech-to-text/frames``: one PCM batch into a buffer.
+
+    The route authorizes exactly like the clip upload it rides beside, and is
+    closed unless ``audio.stt_frame_capture`` is on, so enabling the browser
+    side is the only way to reach it.  The body is whole 32 ms frames; the
+    receiver owns the hard caps, and a refused batch is final — the sender stops
+    rather than retrying a capture the server already closed.
+    """
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    from turnstone.core.speech_frames import (
+        MAX_BATCH_BYTES,
+        FrameCaptureError,
+        frame_capture_store,
+    )
+
+    ws_id = str(request.path_params.get("ws_id") or "")
+    err = await authorize(request, ws_id)
+    if err is not None:
+        return err
+
+    config_store = getattr(request.app.state, "config_store", None)
+    enabled = _stt_bool(
+        config_store.get("audio.stt_frame_capture") if config_store is not None else None
+    )
+    if not enabled:
+        return _JSONResponse({"error": "Frame capture is disabled"}, status_code=403)
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    if not content_type.startswith("application/octet-stream"):
+        return _JSONResponse(
+            {"error": "Content-Type must be application/octet-stream"},
+            status_code=400,
+        )
+
+    try:
+        params = request.query_params
+        capture_id = (params.get("capture_id") or "").strip()
+        first_seq = _int_query(params, "seq")
+        first_t0_ms = _int_query(params, "t0_ms")
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                too_large = int(declared) > MAX_BATCH_BYTES
+            except ValueError:
+                too_large = False
+            if too_large:
+                raise FrameCaptureError(
+                    f"frame batch exceeds the {MAX_BATCH_BYTES}-byte limit",
+                    status_code=413,
+                )
+        body = await _read_bounded_body(request, MAX_BATCH_BYTES)
+        if len(body) > MAX_BATCH_BYTES:
+            raise FrameCaptureError(
+                f"frame batch exceeds the {MAX_BATCH_BYTES}-byte limit",
+                status_code=413,
+            )
+        max_seconds = _bounded_int(
+            config_store.get("audio.stt_frame_capture_max_seconds")
+            if config_store is not None
+            else None,
+            "audio.stt_frame_capture_max_seconds",
+        )
+        buffered = frame_capture_store(request.app).append(
+            ws_id=ws_id,
+            capture_id=capture_id,
+            first_seq=first_seq,
+            first_t0_ms=first_t0_ms,
+            payload=body,
+            max_seconds=max_seconds,
+        )
+    except FrameCaptureError as exc:
+        return _JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+    return _JSONResponse(buffered)
 
 
 async def text_to_speech_response(

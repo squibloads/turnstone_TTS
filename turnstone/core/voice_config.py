@@ -865,12 +865,13 @@ class SpeechPreview:
 
 # ---------------------------------------------------------------------------
 # Voice persona.  A voice session is a coordinator created with this persona;
-# its memory scope, spawn cap and child-model default all key off the name, so
-# a voice conversation never inherits the text coordinator's work habits.
+# its spawn cap and child-model default key off the name, so a voice
+# conversation never inherits the text coordinator's work habits.  Memory is
+# not persona-scoped: voice uses the interactive envelope and must never reach
+# the coordinator scope (see ChatSession._visible_scopes).
 # ---------------------------------------------------------------------------
 
 VOICE_PERSONA = "voice"
-VOICE_MEMORY_SCOPE = "voice"
 
 
 def is_voice_persona(name: str | None) -> bool:

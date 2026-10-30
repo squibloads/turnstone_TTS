@@ -1179,7 +1179,8 @@ def acquire_memory_index_snapshot(
     transaction as its metadata read and first-writer insert.
 
     ``voice`` tells the backend that a COORDINATOR-kind row belongs to a voice
-    session, whose private namespace is ``voice`` rather than ``coordinator``.
+    session, which captures the interactive envelope (global, workstream, user,
+    and the attached project) instead of the ``coordinator`` namespace.
 
     When supplied, ``commit_context`` runs only for a concrete candidate. Its
     pre-yield phase may reject, rolling back any newly inserted candidate; the

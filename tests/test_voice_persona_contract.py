@@ -1,9 +1,11 @@
 """Tests for the voice-persona contract in turnstone.core.voice_config.
 
 A voice session is a coordinator created with the ``voice`` persona.  The
-memory scope, the spawn caps and the child-model default all key off that one
-name, so the name, the scope and the settings are pinned here before the
-slices that consume them are built.
+spawn caps and the child-model default key off that one name, so the name and
+the settings are pinned here before the slices that consume them are built.
+Memory is deliberately not persona-scoped: a voice coordinator uses the same
+scopes as an interactive session, so the retired ``VOICE_MEMORY_SCOPE``
+constant must not come back.
 """
 
 from __future__ import annotations
@@ -13,7 +15,6 @@ import pytest
 from turnstone.core.settings_registry import validate_key, validate_value
 from turnstone.core.voice_config import (
     VOICE_DOCS_URL,
-    VOICE_MEMORY_SCOPE,
     VOICE_PERSONA,
     is_voice_persona,
 )
@@ -21,7 +22,12 @@ from turnstone.core.voice_config import (
 
 def test_names_are_fixed() -> None:
     assert VOICE_PERSONA == "voice"
-    assert VOICE_MEMORY_SCOPE == "voice"
+
+
+def test_retired_memory_scope_constant_is_gone() -> None:
+    import turnstone.core.voice_config as voice_config
+
+    assert not hasattr(voice_config, "VOICE_MEMORY_SCOPE")
 
 
 @pytest.mark.parametrize(
@@ -62,3 +68,32 @@ def test_child_model_setting() -> None:
     d = validate_key("coordinator.voice_child_model")
     assert (d.type, d.section, d.default) == ("str", "coordinator", "deepseek-flash-high")
     assert d.help and d.reference_url.startswith(VOICE_DOCS_URL + "#")
+
+
+def test_voice_model_role_settings() -> None:
+    """The two Voice roles sit beside their Coordinator counterparts and use
+    the same value shapes, so the Models → Roles row can be a straight copy."""
+    model = validate_key("coordinator.voice_model_alias")
+    assert (model.type, model.section, model.default) == ("str", "coordinator", "")
+    assert model.help
+    assert model.reference_url == VOICE_DOCS_URL + "#voice-model-role"
+
+    effort = validate_key("coordinator.voice_reasoning_effort")
+    assert (effort.type, effort.section, effort.default) == ("str", "coordinator", "")
+    assert effort.help
+    assert effort.reference_url == VOICE_DOCS_URL + "#voice-reasoning-effort"
+    # Same choices as the Coordinator effort role: empty is "use Coordinator",
+    # and the literal values match the shared effort vocabulary.
+    assert effort.choices == [
+        "",
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    validate_value("coordinator.voice_reasoning_effort", "high")
+    with pytest.raises(ValueError):
+        validate_value("coordinator.voice_reasoning_effort", "extreme")

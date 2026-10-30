@@ -709,6 +709,49 @@ def _build_registry() -> dict[str, SettingDef]:
             reference_url=VOICE_DOCS_URL + "#auto-stop",
         ),
         SettingDef(
+            "audio.stt_frame_capture",
+            "bool",
+            False,
+            "Stream microphone frames to the server (speaker gate groundwork)",
+            "audio",
+            help="When on, a dictation recording also sends raw 32 ms audio frames to "
+            "this server, where they are buffered per recording for the future speaker "
+            "gate. Transcription is unchanged: the compressed clip still goes to the "
+            "speech-to-text model exactly as before. Off by default; the capture "
+            "stops accepting frames at the capture cap and expires shortly after, "
+            "in memory only.",
+            reference_url=VOICE_DOCS_URL + "#frame-capture-speaker-gate-groundwork",
+        ),
+        SettingDef(
+            "audio.stt_segment_gap_ms",
+            "int",
+            250,
+            "Quiet gap (ms) that closes a speaker segment",
+            "audio",
+            min_value=100,
+            max_value=2000,
+            help="How long a pause ends one speaker-checked segment. This is separate "
+            "from the auto-stop silence: it cuts the frame stream into short pieces for "
+            "the future speaker gate, it does not stop the recorder. Raise it if a "
+            "speaker's natural pauses split their sentences; lower it when two voices "
+            "follow each other quickly.",
+            reference_url=VOICE_DOCS_URL + "#segment-gap",
+        ),
+        SettingDef(
+            "audio.stt_frame_capture_max_seconds",
+            "int",
+            300,
+            "Longest frame capture (seconds) buffered per recording",
+            "audio",
+            min_value=10,
+            max_value=3600,
+            help="The hard cap on how much audio frame capture buffers for one "
+            "recording, in seconds (about 32 KB per second on the server). At the cap "
+            "the capture closes and later frames are refused; dictation itself keeps "
+            "recording and transcribing until you stop it.",
+            reference_url=VOICE_DOCS_URL + "#capture-caps",
+        ),
+        SettingDef(
             "audio.tts_stream",
             "bool",
             False,
@@ -1284,6 +1327,34 @@ def _build_registry() -> dict[str, SettingDef]:
             "Use ‘none’ to disable reasoning where the model supports that.",
         ),
         SettingDef(
+            "coordinator.voice_model_alias",
+            "str",
+            "",
+            "Model alias used for voice-persona coordinator sessions",
+            "coordinator",
+            help="Which model alias coordinators created with the voice persona run on. "
+            "When empty, a voice session falls back to the ordinary coordinator chain: "
+            "coordinator.model_alias, then model.default_alias, then the console's "
+            "[model].default. A model chosen for one session in the launcher still wins "
+            "over this role. When this alias names a model that isn't loaded, creating "
+            "the voice session fails instead of using another model.",
+            reference_url=VOICE_DOCS_URL + "#voice-model-role",
+        ),
+        SettingDef(
+            "coordinator.voice_reasoning_effort",
+            "str",
+            "",
+            "Reasoning effort for voice coordinator sessions (empty = use the Coordinator setting)",
+            "coordinator",
+            choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            help="Reasoning effort for coordinators created with the voice persona. When "
+            "empty (the default), a voice session uses coordinator.reasoning_effort and "
+            "then the normal global/model ladder. A value set here applies only to voice "
+            "sessions; text coordinators keep their own setting. Use ‘none’ to disable "
+            "reasoning where the model supports that.",
+            reference_url=VOICE_DOCS_URL + "#voice-reasoning-effort",
+        ),
+        SettingDef(
             "coordinator.max_active",
             "int",
             5,
@@ -1321,8 +1392,9 @@ def _build_registry() -> dict[str, SettingDef]:
             max_value=10,
             help="Applies only to coordinators created with the voice persona. When the "
             "user's latest message explicitly names a number of agents and the spawn call "
-            "sets user_requested_count, the turn's budget becomes the larger of this and "
-            "coordinator.voice_max_agents_per_turn. The number in the user's message must "
+            "sets user_requested_count, the turn's budget becomes that named count, capped "
+            "by this setting and never below coordinator.voice_max_agents_per_turn. The "
+            "number must sit directly before 'agent' or 'agents' in the user's message and "
             "be at least the batch size, so the model cannot widen the cap on its own; a "
             "claim the message does not support falls back to the normal cap. A "
             "coordinator.voice_max_agents_per_turn of 0 stays a hard stop. Set this to 0 "

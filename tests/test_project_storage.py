@@ -235,7 +235,6 @@ class TestMemoryScopeLabels:
             {"scope": "project", "scope_id": "p1"},
             {"scope": "user", "scope_id": "u1"},
             {"scope": "coordinator", "scope_id": "u1"},  # coord scope_id is the user_id
-            {"scope": "voice", "scope_id": "u1"},  # voice is user-keyed too
             {"scope": "workstream", "scope_id": "ws1"},
             {"scope": "global", "scope_id": ""},  # no id → no label
             {"scope": "project", "scope_id": "gone"},  # missing → falls back to the id
@@ -244,7 +243,6 @@ class TestMemoryScopeLabels:
         labels = [r["scope_label"] for r in _enrich_memory_scope_labels(rows, backend)]
         assert labels == [
             "Research",
-            "alice",
             "alice",
             "alice",
             "planning chat",
