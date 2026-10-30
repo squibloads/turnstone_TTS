@@ -129,6 +129,9 @@ let authGen = 0, fetchMode = "ok";
 let stylesMode = "off";
 // Playback rate the styles probe reports; undefined omits the field (pre-rate server).
 let stubRate;
+// Read-aloud profile the styles probe reports; undefined omits the field
+// (pre-profile server), which must read as the module's built-in defaults.
+let stubProfile;
 const _store = new Map();
 let storageGetThrows = false, storageSetThrows = false;
 globalThis.localStorage = {
@@ -159,7 +162,10 @@ function authFetch(url, opts) {
     if (stylesMode === "down") return Promise.reject(new Error("down"));
     return _stylesResponse().then((r) => ({ ok: r.ok, json: async () => {
       const d = await r.json();
-      return stubRate === undefined ? d : { ...d, playback_rate: stubRate };
+      const extra = {};
+      if (stubRate !== undefined) extra.playback_rate = stubRate;
+      if (stubProfile !== undefined) extra.profile = stubProfile;
+      return { ...d, ...extra };
     } }));
   }
   if (url.endsWith("/v1/api/models")) {

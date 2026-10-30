@@ -67,6 +67,13 @@ for (const name of [
   "splitAlsoHears",
   "validateEntry",
   "putSetting",
+  "parseBuiltinTerms",
+  "parseTermsOff",
+  "nextTermsOff",
+  "overrideFor",
+  "termsOffJson",
+  "builtinRowsHtml",
+  "builtinSectionHtml",
 ]) {
   assert.equal(typeof VD[name], "function", name + " must be exposed for the harness");
 }
@@ -82,6 +89,12 @@ def test_contract_strings_and_shelf_copy_are_present() -> None:
     for needle in [
         "audio.voice_dictionary",
         "audio.tts_pronunciations",
+        "audio.tts_builtin_terms_off",
+        "/v1/api/admin/voice/meta",
+        "#built-in-terms",
+        "Built in",
+        "technical terms Turnstone ships; add an entry with the same term to override, "
+        "or switch one off",
         '"admin.settings"',
         "used by every model",
         "only for models that accept IPA; others use the respelling",
@@ -470,7 +483,184 @@ assert.ok(readonly.includes("legacy pronunciation"), "the notice itself still in
     )
 
 
+# -- built-in terms ---------------------------------------------------------
+
+
+def test_parse_builtin_terms_reads_the_meta_payload_tolerantly() -> None:
+    _run(
+        """
+for (const meta of [null, undefined, {}, {builtin_terms: "nope"}, {builtin_terms: 3}]) {
+  assert.deepEqual(VD.parseBuiltinTerms(meta), [], JSON.stringify(meta));
+}
+assert.deepEqual(
+  VD.parseBuiltinTerms({
+    builtin_terms: [
+      {term: " YAML ", respelling: " yammel "},
+      "nope",
+      {term: ""},
+      {term: "x".repeat(101), respelling: "y"},
+      {term: "JSON", respelling: 3},
+      {term: "kubectl"},
+      {term: "YAML", respelling: "why-am-ell"},
+    ],
+  }),
+  [
+    {term: "YAML", respelling: "yammel"},
+    {term: "JSON", respelling: ""},
+    {term: "kubectl", respelling: ""},
+  ],
+  "bad rows are skipped, a missing respelling is blank and a duplicate term keeps the first",
+);
+"""
+    )
+
+
+def test_parse_terms_off_mirrors_parse_builtin_terms_off() -> None:
+    _run(
+        """
+const allowed = ["YAML", "JSON"];
+for (const raw of ["", "   ", "not json", "{}", "42", "null"]) {
+  assert.deepEqual(VD.parseTermsOff(raw, allowed), [], JSON.stringify(raw));
+}
+assert.deepEqual(
+  VD.parseTermsOff('["JSON", "nope", "YAML", "JSON", 3]', allowed),
+  ["JSON", "YAML"],
+  "unknown names and non-strings are dropped; the list keeps its order and de-dupes",
+);
+assert.deepEqual(
+  VD.parseTermsOff('["json"]', allowed),
+  [],
+  "the setting keys terms exactly, as the server validator does",
+);
+assert.deepEqual(VD.parseTermsOff('["YAML"]', undefined), []);
+"""
+    )
+
+
+def test_next_terms_off_switches_one_term_without_mutating_the_input() -> None:
+    _run(
+        """
+const before = ["JSON"];
+const off = VD.nextTermsOff(before, "YAML", false);
+assert.deepEqual(off, ["JSON", "YAML"], "switching off appends, keeping the stored order");
+assert.deepEqual(before, ["JSON"], "the input list is not mutated");
+
+assert.deepEqual(
+  VD.nextTermsOff(off, "JSON", true),
+  ["YAML"],
+  "switching one on removes just that term",
+);
+assert.deepEqual(
+  VD.nextTermsOff(["YAML"], "YAML", false),
+  ["YAML"],
+  "switching an already-off term off again does not duplicate it",
+);
+assert.deepEqual(VD.nextTermsOff(undefined, "YAML", false), ["YAML"]);
+"""
+    )
+
+
+def test_override_for_matches_the_read_aloud_precedence() -> None:
+    _run(
+        """
+const entry = (kw) => Object.assign({
+  term: "YAML", kind: "respelling", respelling: "yammel", ipa: "",
+  match_case: false, also_hears: [],
+}, kw);
+
+assert.equal(VD.overrideFor("YAML", []), null);
+assert.equal(VD.overrideFor("YAML", [entry({term: "yaml"})]).term, "yaml",
+  "without match_case the comparison is case-insensitive");
+assert.equal(VD.overrideFor("YAML", [entry({term: "yaml", match_case: true})]), null,
+  "match_case only overrides the exact spelling");
+assert.equal(VD.overrideFor("YAML", [entry({term: "YAML", match_case: true})]).term, "YAML");
+assert.equal(VD.overrideFor("YAML", [entry({term: "YAML", respelling: ""})]), null,
+  "a dictation-only entry says nothing aloud, so it cannot override the respelling");
+assert.equal(VD.overrideFor("", [entry({})]), null);
+
+const first = entry({term: "yaml", respelling: "one"});
+const later = entry({term: "Yaml", respelling: "two"});
+assert.equal(VD.overrideFor("YAML", [first, later]).respelling, "two",
+  "a later matching entry wins, as it does in the read-aloud merge");
+"""
+    )
+
+
+def test_builtin_rows_reuse_the_entry_columns_and_mark_overrides() -> None:
+    _run(
+        """
+const builtins = [
+  {term: "YAML", respelling: "yammel"},
+  {term: "JSON", respelling: "jay-son"},
+];
+const rows = VD.builtinRowsHtml(builtins, ["JSON"], [], true);
+assert.ok(rows.includes("<code>YAML</code>"), "the term is monospace like an entry");
+assert.ok(rows.includes("built-in"), "the type column carries the built-in pill");
+assert.ok(rows.includes("yammel"));
+assert.ok(rows.includes("data-vd-term=\\"YAML\\""));
+assert.equal((rows.match(/checked/g) || []).length, 1, "JSON is off, YAML is on");
+assert.ok(rows.includes("\\u2014"), "dictation and case columns read as a dash");
+
+const entry = {
+  term: "yaml", kind: "respelling", respelling: "why", ipa: "",
+  match_case: false, also_hears: [],
+};
+const overridden = VD.builtinRowsHtml(builtins, [], [entry], true);
+assert.ok(overridden.includes("overridden by your entry"));
+
+const readonly = VD.builtinRowsHtml(builtins, [], [], false);
+assert.ok(readonly.includes("disabled"), "a read-only user sees the state but cannot flip it");
+assert.ok(readonly.includes("checked"));
+
+const escaped = VD.builtinRowsHtml(
+  [{term: "<b>&\\"x\\"</b>", respelling: "<i>y</i>"}], [], [], true);
+assert.ok(!escaped.includes("<b>"), "built-in term markup is escaped");
+assert.ok(!escaped.includes("<i>"), "respelling markup is escaped");
+"""
+    )
+
+
+def test_render_places_the_built_in_section_below_the_entries() -> None:
+    _run(
+        """
+const builtins = [{term: "YAML", respelling: "yammel"}];
+const loaded = VD.renderHtml([], 0, true, {
+  terms: builtins, termsOff: [], error: "",
+});
+assert.ok(loaded.includes("Built in"));
+assert.ok(loaded.includes("technical terms Turnstone ships; add an entry with the same term to override, or switch one off"));
+assert.ok(loaded.includes("#built-in-terms"), "the section help links to the docs anchor");
+assert.ok(loaded.includes("data-vd-term=\\"YAML\\""));
+assert.ok(
+  loaded.indexOf("No dictionary entries yet.") < loaded.indexOf("Built in"),
+  "the built-in section sits below the operator's list",
+);
+
+const failed = VD.renderHtml([], 0, true, {
+  terms: [], termsOff: [], error: "Built-in terms could not be loaded.",
+});
+assert.ok(failed.includes("Built in"), "the section still names itself when meta fails");
+assert.ok(failed.includes("Built-in terms could not be loaded."));
+assert.ok(!failed.includes("data-vd-term"));
+
+// A legacy call without the optional state renders exactly the old list.
+const legacy = VD.renderHtml([], 0, true);
+assert.ok(!legacy.includes("Built in"));
+"""
+    )
+
+
 # -- settings writes --------------------------------------------------------
+
+
+def test_terms_off_json_is_the_full_list_body() -> None:
+    _run(
+        """
+assert.equal(VD.termsOffJson(["JSON", "YAML"]), '["JSON","YAML"]');
+assert.equal(VD.termsOffJson([]), "[]");
+assert.equal(VD.termsOffJson(undefined), "[]");
+"""
+    )
 
 
 def test_put_setting_sends_the_settings_envelope() -> None:
