@@ -232,6 +232,36 @@ class TextToSpeechStylesResponse(BaseModel):
             "audio.tts_profiles with the defaults filled in"
         ),
     )
+    stream: bool = Field(
+        default=False,
+        description=(
+            "Whether read-aloud speaks a reply while it is still being written (audio.tts_stream)"
+        ),
+    )
+
+
+class SttConfigResponse(BaseModel):
+    """The dictation knobs the browser applies while recording.
+
+    Fetched per transport base by the mic module, so a coordinator pane and a
+    node-hosted interactive pane each read their own process's settings.
+    """
+
+    auto_stop: bool = Field(
+        default=False,
+        description="audio.stt_auto_stop: end dictation when the speaker goes quiet",
+    )
+    silence_ms: int = Field(
+        default=900,
+        description="audio.stt_silence_ms: quiet milliseconds before auto-stop fires (300-5000)",
+    )
+    vad_threshold: float = Field(
+        default=0.5,
+        description=(
+            "audio.stt_vad_threshold: speech probability that counts as talking (0.1-0.9); "
+            "silence is this value minus 0.15"
+        ),
+    )
 
 
 class ApproveRequest(BaseModel):

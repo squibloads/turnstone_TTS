@@ -119,6 +119,13 @@ _NUDGE_MAP: dict[str, str] = {
     "participant_joined": "",
     # Live metadata-only pointer generated directly by the session planner.
     "memory_pointer": "",
+    # Voice-session report offer, composed by
+    # ``ChatSession._append_voice_report_note`` and emitted via
+    # ``_append_system_turn``.  The entry only keeps this map mirroring
+    # ``tool_advisory.SYSTEM_TURN_SOURCES`` (pinned by the vocabulary test);
+    # nothing calls ``should_nudge("voice_reports", …)``, so it never fires as
+    # a nudge and needs no cooldown or cap.
+    "voice_reports": "",
 }
 
 # Nudge types whose copy directs the model to save memories. A memory-off persona suppresses

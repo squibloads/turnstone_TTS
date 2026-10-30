@@ -265,7 +265,7 @@ from turnstone.core.storage import (
     WorkstreamLeaseHeldError,
     WorkstreamLeaseLostError,
 )
-from turnstone.core.storage._registry import get_storage
+from turnstone.core.storage._registry import get_storage, is_storage_initialized
 from turnstone.core.storage._utils import (
     COMPACTION_SOURCE,
     COMPACTION_SUMMARY_LABEL,
@@ -2425,6 +2425,16 @@ _SKILLS_MIXED_BATCH_ERROR = (
 )
 _TASKS_READ_ACTIONS: frozenset[str] = frozenset({"list"})
 _TASKS_WRITE_ACTIONS: frozenset[str] = frozenset({"add", "update", "remove", "reorder"})
+
+# ``voice_report`` actions.  Both mutate the report's state, so the tool is
+# auto-approved; the body is returned only on ``read``, because ``dismiss``
+# means the user declined to hear it.
+_VOICE_REPORT_ACTIONS: frozenset[str] = frozenset({"read", "dismiss"})
+
+# Cap on the reports one offer note lists.  A voice user hears a one-sentence
+# offer, so a long list is noise; the rest ride the next turn's note as the
+# queue drains.  Matches the idle-children roster's display cap.
+_VOICE_REPORT_NOTE_MAX = 6
 
 # Per-field character budget for the tasks approval preview/header.  The
 # operator rules on the preview, so over-budget fields are cut with
@@ -19698,6 +19708,10 @@ class ChatSession:
             "list_nodes": self._prepare_list_nodes,
             "tasks": self._prepare_tasks,
             "wait_for_workstream": self._prepare_wait_for_workstream,
+            # Voice-only: reached when a voice coordinator's model calls it;
+            # a plain coordinator never sees the schema, and the preparer
+            # refuses a stray call anyway.
+            "voice_report": self._prepare_voice_report,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -21271,6 +21285,87 @@ class ChatSession:
                 plan.memory_pointer,
                 deferred_persistence=deferred_persistence,
             )
+        self._append_voice_report_note(deferred_persistence)
+
+    def _append_voice_report_note(self, deferred_persistence: list[Callable[[], None]]) -> None:
+        """Offer finished agents' reports on a voice session's user turn.
+
+        A voice coordinator has no ``wait_for_workstream`` (its call would
+        park a spoken turn with nothing watching), so a finished child's
+        report waits in storage instead.  This is where it is offered: one
+        short system note after the user turn, listing each waiting report's
+        title and id, telling the model to answer the user FIRST and only
+        then offer them in one sentence, and to call ``voice_report`` only
+        if the user agrees.  The note is a system turn rather than part of
+        the user text so it never reads as something the user said.
+
+        Report ids are listed because they are the only handles the model
+        has: ``voice_report`` validates against this coordinator's rows, and
+        an invented id is refused.  Titles were sanitised at capture, but
+        they are model-authored text entering a trusted system turn, so they
+        are sanitised again here (the belt-and-braces rule every system-turn
+        producer follows).
+
+        Pending reports are marked ``offered`` only AFTER the note is
+        admitted, so a crash in between re-offers them next turn rather than
+        dropping them unmentioned.  Rows already ``offered`` keep being
+        listed (the user may not have answered yet) but are never re-marked.
+        """
+        if not self._voice_spawn_guard_active():
+            return
+        # ``get_storage`` auto-initializes SQLite; a note on a session with
+        # no host storage (CLI/tests) must not create a stray database file.
+        if not is_storage_initialized():
+            return
+        try:
+            storage = get_storage()
+            reports = storage.list_voice_reports(self._ws_id, ("pending", "offered"))
+        except Exception:
+            log.warning("voice.report_offer_read_failed ws=%s", self._ws_id[:8], exc_info=True)
+            return
+        if not reports:
+            return
+        # Pending first: a report the model just learned about must not be
+        # crowded out by a backlog of offers the user keeps ignoring.
+        pending = [r for r in reports if r.get("state") == "pending"]
+        offered = [r for r in reports if r.get("state") != "pending"]
+        shown = (pending + offered)[:_VOICE_REPORT_NOTE_MAX]
+        lines = ["Finished agent reports are waiting to be offered:"]
+        for row in shown:
+            title = sanitize_name(str(row.get("title") or ""))
+            if not title:
+                title = f"agent {str(row.get('child_ws_id') or '')[:8]}"
+            lines.append(f"  - {title} (report_id {row.get('report_id', '')})")
+        overflow = len(pending) + len(offered) - len(shown)
+        if overflow > 0:
+            lines.append(f"  ...and {overflow} more, offered after these.")
+        lines.append("")
+        lines.append(
+            "Answer the user first. Then offer these reports in one sentence. "
+            'Call voice_report(action="read", report_id=...) only if the user says '
+            'yes; if they are not interested, call voice_report(action="dismiss", '
+            "report_id=...) instead of reading them."
+        )
+        self._append_system_turn(
+            "voice_reports",
+            "\n".join(lines),
+            deferred_persistence=deferred_persistence,
+        )
+        for row in shown:
+            if row.get("state") != "pending":
+                continue
+            report_id = str(row.get("report_id") or "")
+            try:
+                storage.update_voice_report_state(report_id, "offered")
+            except Exception:
+                # Best-effort: a failed mark re-offers the same report next
+                # turn (harmless duplicate) instead of failing the user turn.
+                log.warning(
+                    "voice.report_offer_mark_failed ws=%s report=%s",
+                    self._ws_id[:8],
+                    report_id[:8],
+                    exc_info=True,
+                )
 
     def _memory_index_backpressure(self, access: _MemoryAccess) -> str:
         """Return a post-save soft-cap notice for the writer's live envelope."""
@@ -24697,6 +24792,20 @@ class ChatSession:
         Bad input surfaces at exec time as a normal tool error via the
         ``result.get("error")`` branch below.
         """
+        if self._voice_spawn_guard_active():
+            # Voice never blocks its turn on a child: nothing is listening
+            # to a spoken turn that parks, and the child's result arrives as
+            # a report on the user's next turn instead.  The tool is already
+            # absent from the voice tool list; this refusal covers a replayed
+            # transcript (built by a build that still offered it) and a model
+            # that calls it from memory, so a stray call cannot pin the
+            # worker for up to ten minutes.
+            return self._coord_tool_error(
+                call_id,
+                "wait_for_workstream",
+                "not available in a voice session — a finished agent's report "
+                "is offered on the user's next turn; answer the user now",
+            )
         if self._coord_client is None:
             return self._coord_tool_error(
                 call_id, "wait_for_workstream", "coordinator client unavailable"
@@ -24904,6 +25013,111 @@ class ChatSession:
             enqueue({"type": event_type, **payload})
         except Exception:
             log.debug("wait_event.enqueue_failed type=%s", event_type, exc_info=True)
+
+    def _prepare_voice_report(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a ``voice_report`` read or dismiss.
+
+        Reading the body must happen in the turn the user agreed to hear it,
+        so the body comes back as a tool result and the model speaks a
+        short version.  The tool is only ever offered to a voice
+        coordinator; the kind/persona check here is belt-and-braces for a
+        resumed transcript whose tool list was built by an older build, and
+        it keeps a stray call from a text coordinator from reading a voice
+        user's reports.
+
+        No coordinator-client lookup: reports are storage rows in this
+        process, like ``tasks(list)``.
+        """
+        if self._kind != WorkstreamKind.COORDINATOR or not is_voice_persona(self._persona_name):
+            return self._coord_tool_error(
+                call_id, "voice_report", "only available in a voice session"
+            )
+        action = self._coord_str_arg(args, "action").strip().lower()
+        if action not in _VOICE_REPORT_ACTIONS:
+            return self._coord_tool_error(
+                call_id, "voice_report", "action must be one of: read, dismiss"
+            )
+        # Ids are server-minted 32-hex strings; the storage read scopes the
+        # lookup to this coordinator, so a foreign id reads as "no such
+        # report" rather than confirming another session's report exists.
+        report_id = self._coord_str_arg(args, "report_id").strip()
+        if not report_id:
+            return self._coord_tool_error(call_id, "voice_report", "report_id is required")
+        # The header is operator chrome and ``report_id`` is model-authored
+        # (the lookup above only strips); sanitize so a newline or bidi run
+        # cannot forge a header line or reorder the decision the operator
+        # reads.  The lookup keeps the raw string - a hostile id simply
+        # matches nothing.
+        header_id = sanitize_display(report_id)[:32]
+        return {
+            "call_id": call_id,
+            "func_name": "voice_report",
+            "header": f"\u2699 voice_report {action}: {header_id}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_voice_report,
+            "action": action,
+            "report_id": report_id,
+        }
+
+    def _exec_voice_report(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        action = item["action"]
+        report_id = item["report_id"]
+        try:
+            storage = get_storage()
+            # One coordinator's list is small (finished children since the
+            # last read/dismiss), so the in-Python id match keeps the storage
+            # surface to one list method and gives the scope check for free.
+            report = next(
+                (
+                    row
+                    for row in storage.list_voice_reports(self._ws_id, None)
+                    if row.get("report_id") == report_id
+                ),
+                None,
+            )
+        except Exception as e:
+            msg = f"Error: voice_report failed: {e}"
+            self._report_tool_result(call_id, "voice_report", msg, is_error=True)
+            return call_id, msg
+        if report is None:
+            msg = (
+                f"Error: no report {report_id!r} in this session. "
+                "Use an id from the waiting-reports note; do not invent one."
+            )
+            self._report_tool_result(call_id, "voice_report", msg, is_error=True)
+            return call_id, msg
+        if action == "read" and report.get("state") == "dismissed":
+            msg = f"Error: report {report_id!r} was dismissed and cannot be read again."
+            self._report_tool_result(call_id, "voice_report", msg, is_error=True)
+            return call_id, msg
+        new_state = "read" if action == "read" else "dismissed"
+        try:
+            updated = storage.update_voice_report_state(report_id, new_state)
+        except Exception as e:
+            msg = f"Error: voice_report failed: {e}"
+            self._report_tool_result(call_id, "voice_report", msg, is_error=True)
+            return call_id, msg
+        if not updated:
+            # Deleted between the list and the update (a hard-deleted child
+            # or an operator sweep); the model can re-read the note.
+            msg = f"Error: report {report_id!r} no longer exists."
+            self._report_tool_result(call_id, "voice_report", msg, is_error=True)
+            return call_id, msg
+        if action == "read":
+            result: dict[str, Any] = {
+                "report_id": report_id,
+                "title": report.get("title", ""),
+                "body": report.get("body", ""),
+                "state": new_state,
+            }
+            summary = f"read report {report_id[:8]} ({len(result['body'])} chars)"
+        else:
+            result = {"report_id": report_id, "state": new_state}
+            summary = f"dismissed report {report_id[:8]}"
+        self._report_tool_result(call_id, "voice_report", summary)
+        return call_id, json.dumps(result, separators=(",", ":"), default=str)
 
     def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a memory tool action (save/get/search/delete/list)."""

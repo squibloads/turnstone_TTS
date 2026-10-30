@@ -241,7 +241,19 @@ def test_styles_lists_names_and_menu_flags_without_instructions() -> None:
         "instructions_supported": False,
         "playback_rate": 1.0,
         "profile": profile_json(DEFAULT_PROFILE),
+        "stream": False,
     }
+
+
+def test_styles_reports_the_streaming_read_aloud_setting() -> None:
+    # Off by default: the browser keeps waiting for a finished reply.
+    assert _client(settings=_style_settings()).get("/v1/api/tts/styles").json()["stream"] is False
+    assert (
+        _client(settings=_style_settings(**{"audio.tts_stream": True}))
+        .get("/v1/api/tts/styles")
+        .json()["stream"]
+        is True
+    )
 
 
 def test_styles_default_is_the_configured_setting() -> None:

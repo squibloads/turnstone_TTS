@@ -7,14 +7,14 @@ this empty revision merges the two.  When upstream adds a migration on top of
 its own head, the next port adds another merge revision the same way.
 
 Revision ID: dt_merge_084
-Revises: 084, dt_voice_persona
+Revises: 084, dt_voice_reports
 Create Date: 2026-10-28
 """
 
 from __future__ import annotations
 
 revision = "dt_merge_084"
-down_revision = ("084", "dt_voice_persona")
+down_revision = ("084", "dt_voice_reports")
 branch_labels = None
 depends_on = None
 

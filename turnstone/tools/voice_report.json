@@ -1,0 +1,23 @@
+{
+  "name": "voice_report",
+  "description": "Read or dismiss a report from a finished child agent. A voice session never blocks its turn waiting for a child: when a child finishes, its last message (or last error) is saved as a report, and the next spoken turn carries one short system note listing the waiting reports. Answer the user first and offer the reports in one sentence; call this tool with action='read' only after the user says yes. `read` returns the report body and marks it read; `dismiss` drops it without returning the body. Reports are scoped to this coordinator: an id from another session is refused. Verify the id against the waiting-reports note rather than guessing one.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["read", "dismiss"],
+        "description": "'read' returns the report body and marks the report read; 'dismiss' marks it dismissed without returning the body. Use 'read' only after the user agrees to hear it."
+      },
+      "report_id": {
+        "type": "string",
+        "description": "Report id exactly as shown in the waiting-reports note (32 hex characters). Ids are validated against this coordinator's reports; nothing is guessed."
+      }
+    },
+    "required": ["action", "report_id"]
+  },
+  "coordinator": true,
+  "voice": true,
+  "auto_approve": true,
+  "primary_key": "report_id"
+}
