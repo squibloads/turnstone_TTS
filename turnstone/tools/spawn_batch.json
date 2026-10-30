@@ -42,7 +42,7 @@
       },
       "user_requested_count": {
         "type": "boolean",
-        "description": "Set only when the user's latest message explicitly asked for this many agents (for example \"four different agents\"). In a voice session it lets this call use coordinator.voice_max_requested_agents when that is larger than the normal per-turn cap; the claim is checked against the user's words, and a count smaller than the batch falls back to the normal cap. Text coordinators ignore it."
+        "description": "Set only when the user's latest message explicitly asked for this many agents (for example \"four different agents\"). In a voice session it widens this turn's budget to the agent count the user named, capped by coordinator.voice_max_requested_agents and never below the normal per-turn cap; the claim is checked against the user's words, and a count smaller than the batch falls back to the normal cap. Text coordinators ignore it."
       }
     },
     "required": ["children"]

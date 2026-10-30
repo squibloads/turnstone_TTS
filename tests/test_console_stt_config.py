@@ -25,6 +25,9 @@ _DEFAULTS = {
     "silence_ms": 900,
     "vad_threshold": 0.5,
     "voice_mode_enabled": True,
+    "frame_capture": False,
+    "segment_gap_ms": 250,
+    "frame_capture_max_seconds": 300,
 }
 
 
@@ -66,6 +69,9 @@ def test_stored_values_pass_through() -> None:
         "silence_ms": 1500,
         "vad_threshold": 0.7,
         "voice_mode_enabled": True,
+        "frame_capture": False,
+        "segment_gap_ms": 250,
+        "frame_capture_max_seconds": 300,
     }
 
 
@@ -111,6 +117,9 @@ def test_the_console_route_serves_the_payload() -> None:
         "silence_ms": 900,
         "vad_threshold": 0.5,
         "voice_mode_enabled": True,
+        "frame_capture": False,
+        "segment_gap_ms": 250,
+        "frame_capture_max_seconds": 300,
     }
 
 
@@ -124,6 +133,9 @@ def test_the_node_route_serves_the_payload() -> None:
         "silence_ms": 1200,
         "vad_threshold": 0.5,
         "voice_mode_enabled": True,
+        "frame_capture": False,
+        "segment_gap_ms": 250,
+        "frame_capture_max_seconds": 300,
     }
 
 
@@ -142,3 +154,51 @@ def test_voice_mode_is_on_unless_explicitly_switched_off() -> None:
     assert body("false")["voice_mode_enabled"] is False
     assert body(True)["voice_mode_enabled"] is True
     assert body(None)["voice_mode_enabled"] is True
+
+
+def test_frame_capture_knobs_are_typed_bounded_and_off_by_default() -> None:
+    """Frame capture is groundwork: a degraded or older server must never
+    switch it on, and a bad stored row must not hand the browser a gap or cap
+    the settings registry would not accept."""
+    off = stt_config_payload(config_store=_store({}))
+    assert off["frame_capture"] is False
+    assert off["segment_gap_ms"] == 250
+    assert off["frame_capture_max_seconds"] == 300
+
+    on = stt_config_payload(
+        config_store=_store(
+            {
+                "audio.stt_frame_capture": True,
+                "audio.stt_segment_gap_ms": 400,
+                "audio.stt_frame_capture_max_seconds": 600,
+            }
+        )
+    )
+    assert on["frame_capture"] is True
+    assert on["segment_gap_ms"] == 400
+    assert on["frame_capture_max_seconds"] == 600
+
+    low = stt_config_payload(
+        config_store=_store(
+            {
+                "audio.stt_segment_gap_ms": 1,
+                "audio.stt_frame_capture_max_seconds": 1,
+            }
+        )
+    )
+    high = stt_config_payload(
+        config_store=_store(
+            {
+                "audio.stt_segment_gap_ms": 99999,
+                "audio.stt_frame_capture_max_seconds": 99999,
+            }
+        )
+    )
+    assert (low["segment_gap_ms"], low["frame_capture_max_seconds"]) == (100, 10)
+    assert (high["segment_gap_ms"], high["frame_capture_max_seconds"]) == (2000, 3600)
+    assert (
+        stt_config_payload(config_store=_store({"audio.stt_frame_capture": "false"}))[
+            "frame_capture"
+        ]
+        is False
+    )

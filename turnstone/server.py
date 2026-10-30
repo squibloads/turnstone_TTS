@@ -1787,6 +1787,16 @@ async def speech_to_text_stream(request: Request) -> Response:
     )
 
 
+async def speech_to_text_frames(request: Request) -> Response:
+    """POST /v1/api/workstreams/{ws_id}/speech-to-text/frames — raw PCM batches.
+
+    Thin wrapper over the shared receiver; see :func:`speech_to_text`.
+    """
+    from turnstone.core.web_helpers import frame_capture_response
+
+    return await frame_capture_response(request, authorize=_authorize_ws_access)
+
+
 async def text_to_speech(request: Request) -> Response:
     """POST /v1/api/tts — synthesize assistant text into playable audio."""
     from turnstone.core.web_helpers import text_to_speech_response
@@ -5508,6 +5518,13 @@ def create_app(
         Route(
             "/api/workstreams/{ws_id}/speech-to-text/stream",
             speech_to_text_stream,
+            methods=["POST"],
+        )
+    )
+    v1_routes.append(
+        Route(
+            "/api/workstreams/{ws_id}/speech-to-text/frames",
+            speech_to_text_frames,
             methods=["POST"],
         )
     )
