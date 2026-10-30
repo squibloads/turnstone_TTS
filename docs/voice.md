@@ -9,9 +9,10 @@ the speaker button.
 
 The page requires the `admin.settings` permission, the same as the Settings
 tab. Every control writes an `audio.*` setting, so a saved change applies to
-the next request without a restart. Pacing and playback speed are the
-exception: the browser player reads them with the rest of its read-aloud
-configuration, so they reach replies played after a page reload.
+the next request without a restart. Pacing, playback speed and the dictation
+auto-stop settings are the exception: the browser reads them with the rest of
+its voice configuration, so they reach recordings and replies started after a
+page reload.
 
 ## Overview
 
@@ -245,6 +246,7 @@ own section:
 | `audio.tts_builtin_terms_off` | `[]` | Built-in respellings switched off. | A shipped respelling is wrong for your team. | [Built-in terms](#built-in-terms) |
 | `audio.voice_dictionary` | `[]` | Read-aloud respellings and dictation corrections. | A term is mispronounced or mistranscribed. | [Dictionary](#dictionary), max 200 |
 | `audio.tts_styles` | Professional, Social, Plain | Named delivery instructions. | The model accepts instructions and you want a different delivery. | [Styles](#styles), max 20 |
+| `audio.tts_stream` | `false` | Reads a reply aloud while it is still being written. | A voice session should speak each sentence as it completes. | [Streaming read-aloud](#streaming-read-aloud) |
 
 ## Pacing profiles
 
@@ -802,3 +804,144 @@ Edit both in Admin › Settings, section **Coordinator**. They are read when a
 spawn is prepared, so a saved change applies to the next spawn without
 reopening the session.
 
+
+## Agent reports
+
+A text coordinator waits for its children: it calls `wait_for_workstream` and
+its turn ends when they finish. A voice session cannot do that. The user has
+usually finished speaking long before an agent does, and a turn that blocks
+leaves the microphone silent with nothing to say. So a finished agent does not
+interrupt anything. Its report is saved, and the next thing you say is where
+it comes up.
+
+When an agent you started stops — normally, or with an error — the session
+stores its last message as a report. On your next spoken turn the model is
+told, in one short internal note, which reports are waiting; it does not
+receive their text. It answers you first, then offers them in one sentence,
+for example "Your research came back — want the short version?". Only if you
+say yes does it read the report aloud, and it can also drop a report you are
+not interested in. Nothing is read aloud unasked, and nothing is lost if you
+say nothing: a report waits until you ask for it or dismiss it.
+
+Reports live in the database, not in the conversation, so they survive the
+console restarting or the session being reopened. An agent that finished while
+the console was down is offered the next time you speak.
+
+Each agent gets one report per finished turn. An agent that runs again and
+finishes again leaves a second report; state changes that do not finish a turn
+produce nothing. A report whose agent never produced any text carries a short
+placeholder rather than an empty body, and an agent that failed carries its
+recorded error where there is one, so a failure is offered as readily as a
+success.
+
+`coordinator.voice_report_chime` (default off) controls the audible nudge for a
+report that arrives while you are not speaking: a short chime and a badge
+instead of the session starting to talk. The report is offered on your next
+turn whether the setting is on or off, and the setting never makes the session
+speak on its own. It applies only to voice sessions.
+
+Voice sessions no longer have `wait_for_workstream`. If the model asks for it
+the call is refused, and the next turn's report offer is how the result
+arrives. Text coordinators are unchanged: they keep the tool and the blocking
+wait.
+
+## Auto-stop
+
+Auto-stop ends a recording when you stop talking, so a spoken turn is one
+click instead of two. While the microphone is recording, the page watches the
+audio it is already capturing and stops the clip once you have been quiet
+long enough. The clip is then transcribed exactly as if you had clicked the
+button yourself — the dictionary hint, correction and every other dictation
+behavior apply unchanged.
+
+The detector runs inside the browser against the microphone stream dictation
+already captured. Its model is served by the application itself — not a CDN —
+and is loaded once per page, on the first recording made with auto-stop on.
+Nothing is sent anywhere until the clip is uploaded for transcription, and no
+extra permission prompt appears: it uses the same microphone grant as the
+recording itself.
+
+### Turning it on
+
+`audio.stt_auto_stop` · default off · boolean
+
+Off keeps today's behavior: the recording runs until you click the microphone
+button again. On, the recording also ends itself once you have been quiet for
+[`audio.stt_silence_ms`](#how-long-you-must-be-quiet). The button stays the
+manual override in both directions — clicking it still stops a recording
+immediately, and it is the only way to stop when the detector is unavailable.
+
+Turn it on for hands-free spoken turns. Leave it off if you dictate long
+answers with deliberate pauses (or think out loud between sentences) and would
+rather decide when the clip ends.
+
+### How long you must be quiet
+
+`audio.stt_silence_ms` · default `900` · range 300–5000
+
+How long the input must stay quiet before the recording ends. Raise it if
+dictation cuts you off mid-thought or while you are looking something up;
+lower it for snappier turns. A value below a few hundred milliseconds starts
+cutting normal pauses between words.
+
+### What counts as talking
+
+`audio.stt_vad_threshold` · default `0.5` · range 0.1–0.9
+
+For each audio frame the detector reports a speech probability between 0 and
+1. A frame at or above this value is you talking; a frame below this value
+minus 0.15 is silence. The gap between the two lines keeps a frame that
+wobbles around the threshold during speech from starting the silence clock.
+
+The recording can only stop after it has started. If you click the mic and say
+nothing, it keeps recording until you click again, so a pause before your
+first word never ends a turn early.
+
+Audio between the two lines is neither speech nor silence. It cannot start a
+recording, and because a stop needs an *unbroken* run of quiet it also
+restarts the silence clock. That protects a pause from being cut short by one
+noisy frame, at the cost of a room whose background noise sits in that band
+never auto-stopping. Raise the threshold until the room's noise reads as
+silence; lower it when quiet speech is missed.
+
+### When the detector is unavailable
+
+The detector ships with the application, so a normal deployment has it. If the
+browser cannot load it — an older build without the files, or a browser that
+refuses the module — dictation falls back to click-to-stop and
+`audio.stt_auto_stop` has no effect. Nothing else about dictation changes.
+
+The mic reads these three settings when it first needs them on a page, so a
+saved change reaches recordings started after a page reload.
+
+## Streaming read-aloud
+
+By default a reply is read aloud only after it is finished: the speaker button
+appears when the turn ends, and pressing it speaks the whole answer. With
+streaming read-aloud on, the player starts as soon as the first **sentence** is
+complete and keeps speaking while the rest of the reply is still being written.
+
+The player receives the reply as it streams, so it can only act on text that
+has arrived. It holds the trailing partial sentence back — a delta that stops
+in the middle of a word, or on a full stop that might still become "3.14" or
+"Dr." — and hands each completed sentence to the speech backend immediately.
+At the end of the turn the remainder is flushed, so a reply that trails off is
+still spoken in full. A cancel, a stop, or a new reply drops every clip that
+was queued but not yet played.
+
+Streaming and finished-reply playback share the same voice, style, playback
+rate and pacing profile, and the same one-request-at-a-time rule: the next
+sentence is synthesized while the current one plays. Only one reading plays at
+a time on a page, so starting a new reply stops anything still speaking. The
+speaker button on finished replies is unchanged; it reads the whole reply again
+from the beginning.
+
+`audio.tts_stream` · default off · on/off · Admin › Settings, section **Audio**
+
+Off keeps the old behaviour: nothing is synthesized until you press the speaker
+on a finished reply. Turn it on for a voice session whose replies should be
+heard as they are written. The setting is deployment-wide and reaches the
+browser with the rest of the read-aloud configuration, so a saved change
+applies after a page reload. The browser may refuse to start audio that no
+click preceded — a page that has had no interaction yet — in which case the
+speaker on the finished reply still works.

@@ -111,6 +111,7 @@ const OPERATOR_SOURCE_LABELS = {
   background_shell_exit: "background shell",
   participant_joined: "participant",
   memory_pointer: "memory pointer",
+  voice_reports: "agent reports",
 };
 export function operatorSourceLabel(source) {
   return OPERATOR_SOURCE_LABELS[source] || source || "operator";

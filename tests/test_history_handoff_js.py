@@ -246,6 +246,9 @@ const pane = {
   _beginReplayQuiesce: _beginReplayQuiesce,
   _endReplayQuiesce: _endReplayQuiesce,
   _deferStaleHistoryBackstop: _deferStaleHistoryBackstop,
+  _streamTTS() {},
+  _endTTSStream() {},
+  _cancelTTSStream() {},
   handleEvent: handleEvent,
 };
 

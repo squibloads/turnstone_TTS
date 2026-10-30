@@ -132,6 +132,9 @@ let stubRate;
 // Read-aloud profile the styles probe reports; undefined omits the field
 // (pre-profile server), which must read as the module's built-in defaults.
 let stubProfile;
+// audio.tts_stream as the styles probe reports it; undefined omits the field
+// (pre-streaming server), which the module must read as off.
+let stubStream;
 const _store = new Map();
 let storageGetThrows = false, storageSetThrows = false;
 globalThis.localStorage = {
@@ -165,6 +168,7 @@ function authFetch(url, opts) {
       const extra = {};
       if (stubRate !== undefined) extra.playback_rate = stubRate;
       if (stubProfile !== undefined) extra.profile = stubProfile;
+      if (stubStream !== undefined) extra.stream = stubStream;
       return { ...d, ...extra };
     } }));
   }

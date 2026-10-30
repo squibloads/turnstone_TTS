@@ -2915,6 +2915,17 @@ function loadAdminMemories() {
     });
 }
 
+// The scope target cell: the server-resolved human name when it found one,
+// otherwise the raw scope id shortened to 8 characters — an unknown or deleted
+// user leaves scope_label equal to the id, and a full UUID would swamp the
+// column.  The full id rides in title so hovering still identifies the target.
+function _memoryScopeTarget(m) {
+  const id = m.scope_id || "";
+  const label = m.scope_label || "";
+  if (!id) return { text: label, title: label };
+  return { text: label && label !== id ? label : id.slice(0, 8), title: id };
+}
+
 function _renderAdminMemories(items, total) {
   const el = document.getElementById("admin-memories-table");
   if (!items.length) {
@@ -2931,19 +2942,20 @@ function _renderAdminMemories(items, total) {
     const typeBadge =
       '<span class="' + typeCls + '">' + escapeHtml(m.type) + "</span>";
 
-    // Scope: a short colored pill (the scope) + the resolved human target —
-    // project / workstream / user NAME (server-supplied scope_label), not the
-    // raw hex id — which truncates so it can't collide with the preview column.
+    // Scope: a short colored pill (the scope) + the target — the resolved
+    // project / workstream / user name, or a shortened raw id — which truncates
+    // so it can't collide with the preview column.  The title carries the full
+    // scope id for hover.
     const scopeCls = "scope-badge mem-scope-" + escapeHtml(m.scope);
     let scopeBadge =
       '<span class="' + scopeCls + '">' + escapeHtml(m.scope) + "</span>";
-    const scopeTarget = m.scope_label || m.scope_id || "";
-    if (scopeTarget) {
+    const scopeTarget = _memoryScopeTarget(m);
+    if (scopeTarget.text) {
       scopeBadge +=
         '<span class="mem-scope-target" title="' +
-        escapeHtml(scopeTarget) +
+        escapeHtml(scopeTarget.title) +
         '">' +
-        escapeHtml(scopeTarget) +
+        escapeHtml(scopeTarget.text) +
         "</span>";
     }
 
