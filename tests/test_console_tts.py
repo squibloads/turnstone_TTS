@@ -24,6 +24,7 @@ from tests._coord_test_helpers import _AuthMiddleware, _FakeConfigStore
 from turnstone.console.server import list_available_models, list_tts_styles, text_to_speech
 from turnstone.core.audio import AudioBackendError, AudioUnavailableError, SpeechResult
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+from turnstone.core.voice_config import DEFAULT_PROFILE, profile_json
 from turnstone.core.web_helpers import SpeechCapacity
 
 
@@ -239,6 +240,7 @@ def test_styles_lists_names_and_menu_flags_without_instructions() -> None:
         "default": "",
         "instructions_supported": False,
         "playback_rate": 1.0,
+        "profile": profile_json(DEFAULT_PROFILE),
     }
 
 
@@ -417,3 +419,38 @@ def test_styles_reports_the_admin_playback_rate() -> None:
     assert (
         _client(settings=_style_settings()).get("/v1/api/tts/styles").json()["playback_rate"] == 1.0
     )
+
+
+def test_styles_reports_the_active_model_profile_with_every_field() -> None:
+    profiles = json.dumps(
+        {"voice-tts": {"pause_paragraph_ms": 250}, "other-tts": {"pause_heading_ms": 1}}
+    )
+    body = (
+        _client(settings=_style_settings(**{"audio.tts_profiles": profiles}))
+        .get("/v1/api/tts/styles")
+        .json()
+    )
+    assert body["profile"]["pause_paragraph_ms"] == 250
+    # Unset fields read as the default, and every field is present.
+    assert body["profile"]["pause_heading_ms"] == DEFAULT_PROFILE.pause_heading_ms
+    assert list(body["profile"]) == list(profile_json(DEFAULT_PROFILE))
+    # Another alias's profile never leaks into the active one.
+    assert body["profile"]["pause_heading_ms"] != 1
+
+
+def test_styles_profile_is_the_default_without_a_profile_or_a_role() -> None:
+    body = _client(settings=_style_settings()).get("/v1/api/tts/styles").json()
+    assert body["profile"] == profile_json(DEFAULT_PROFILE)
+
+    no_role = _FakeConfigStore(
+        {k: v for k, v in _style_settings().items() if k != "audio.tts_model_alias"}
+    )
+    client = _client(settings=_style_settings())
+    client.app.state.config_store = no_role  # type: ignore[attr-defined]
+    assert client.get("/v1/api/tts/styles").json()["profile"] == profile_json(DEFAULT_PROFILE)
+
+
+def test_styles_profile_ignores_unusable_stored_profiles() -> None:
+    settings = _style_settings(**{"audio.tts_profiles": json.dumps({"voice-tts": ["bad"]})})
+    body = _client(settings=settings).get("/v1/api/tts/styles").json()
+    assert body["profile"] == profile_json(DEFAULT_PROFILE)

@@ -24,6 +24,7 @@ from starlette.testclient import TestClient
 from tests._helpers import opaque_png, slot_held, wait_until
 from turnstone.core.audio import _TTS_BACKEND_TIMEOUT_S
 from turnstone.core.settings_registry import SETTINGS
+from turnstone.core.voice_config import DEFAULT_PROFILE, profile_json
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -1410,6 +1411,8 @@ class TestTextToSpeech:
             ],
             "default": "",
             "instructions_supported": False,
+            "playback_rate": 1.0,
+            "profile": profile_json(DEFAULT_PROFILE),
         }
 
     def test_style_instruction_reaches_the_backend_when_capable(self, voice_app_client):
@@ -1604,6 +1607,23 @@ class TestTextToSpeech:
         assert resp.status_code == 200, resp.text
         create = mock_client.audio.speech.with_streaming_response.create
         assert create.call_args.kwargs["input"] == "Needs ~32GB"
+
+    def test_normalisation_honours_the_cleanup_settings(self, voice_app_client):
+        client, mock_client = voice_app_client
+        store = client.app.state.config_store
+        store._values["audio.tts_cleanup_disabled"] = json.dumps(["units"])
+        store._values["audio.tts_rewrite_rules"] = json.dumps(
+            [{"find": "Postgres", "replace": "postgres", "enabled": True}]
+        )
+        store._values["audio.tts_builtin_terms_off"] = json.dumps(["YAML"])
+        resp = client.post(
+            "/v1/api/tts",
+            json={"text": "user_id Postgres needs ~32GB and YAML"},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200, resp.text
+        create = mock_client.audio.speech.with_streaming_response.create
+        assert create.call_args.kwargs["input"] == "user ID postgres needs about 32GB and YAML"
 
     def test_backend_failure_returns_masked_502(self, voice_app_client):
         client, mock_client = voice_app_client

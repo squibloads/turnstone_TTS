@@ -56,6 +56,7 @@ from turnstone.console.schedule_timing import (
     no_next_run_reason,
     resolve_zone,
 )
+from turnstone.console.voice_admin import admin_voice_meta, admin_voice_preview
 from turnstone.core.audit import record_audit
 from turnstone.core.auth import (
     AUTH_COOKIE_CONSOLE,
@@ -18554,6 +18555,13 @@ def create_app(
                         "/api/admin/settings/{key:path}",
                         admin_delete_setting,
                         methods=["DELETE"],
+                    ),
+                    # Voice: read-aloud tuning metadata and the cleanup preview
+                    Route("/api/admin/voice/meta", admin_voice_meta),
+                    Route(
+                        "/api/admin/voice/preview",
+                        admin_voice_preview,
+                        methods=["POST"],
                     ),
                     # System: MCP Registry
                     Route("/api/admin/mcp-registry/search", admin_registry_search),
