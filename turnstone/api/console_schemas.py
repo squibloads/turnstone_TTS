@@ -783,6 +783,117 @@ class UpdateSettingRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Admin: Voice tuning
+# ---------------------------------------------------------------------------
+
+
+class VoiceCleanupGroupInfo(BaseModel):
+    """One built-in cleanup group, with its example run through the group alone."""
+
+    id: str
+    label: str
+    description: str = ""
+    example: str = ""
+    result: str = Field(description="The example after this group alone has run")
+
+
+class VoiceBuiltinTermInfo(BaseModel):
+    term: str
+    respelling: str
+
+
+class VoiceProfileFieldInfo(BaseModel):
+    """One ``audio.tts_profiles`` field, as the Settings tab's Pacing/Structure/Clips render it."""
+
+    key: str
+    group: str = Field(description="pacing | structure | clips")
+    kind: str = Field(description="int | str | choice")
+    default: int | str
+    label: str = ""
+    help: str = ""
+    reference_url: str = Field(description="docs/voice.md section for this field")
+    min: int | None = Field(default=None, description="Lower bound for an int field")
+    max: int | None = Field(default=None, description="Upper bound for an int field")
+    choices: list[str] = Field(
+        default_factory=list, description="Allowed values for a choice field"
+    )
+    unit: str = Field(default="", description="Display unit: ms, chars or clips")
+
+
+class VoiceTtsModelInfo(BaseModel):
+    """A model alias eligible for the TTS role."""
+
+    alias: str
+    active: bool = Field(description="Whether the TTS role currently resolves to this alias")
+
+
+class VoiceLimitsInfo(BaseModel):
+    """The caps a Voice editor enforces, from the voice_config constants."""
+
+    max_rules: int
+    max_find_chars: int
+    max_replace_chars: int
+    max_test_chars: int
+    max_profiles: int
+    max_marker_chars: int
+
+
+class VoiceAdminMetaResponse(BaseModel):
+    """Everything Admin › Voice needs besides the stored settings themselves."""
+
+    groups: list[VoiceCleanupGroupInfo]
+    builtin_terms: list[VoiceBuiltinTermInfo]
+    profile_fields: list[VoiceProfileFieldInfo]
+    tts_models: list[VoiceTtsModelInfo]
+    limits: VoiceLimitsInfo
+
+
+class VoiceRewriteRuleDraft(BaseModel):
+    """One rewrite rule in the stored ``audio.tts_rewrite_rules`` shape."""
+
+    find: str
+    regex: bool = False
+    replace: str = ""
+    test: str = ""
+    enabled: bool = True
+
+
+class VoicePreviewRequest(BaseModel):
+    text: str = Field(description="Text to preview, at most 5000 characters")
+    rules: list[VoiceRewriteRuleDraft] | None = Field(
+        default=None,
+        description=(
+            "Draft rules replacing the stored audio.tts_rewrite_rules for this preview only"
+        ),
+    )
+    only_rules: bool = Field(
+        default=False,
+        description=(
+            "Run only the draft (or stored) rules; skip the cleanup groups, built-in terms, "
+            "legacy pronunciations and dictionary"
+        ),
+    )
+
+
+class VoicePreviewSpanInfo(BaseModel):
+    """One changed stretch of the previewed text, in output coordinates."""
+
+    start: int
+    end: int
+    source: str = Field(description="group | custom | dictionary")
+    label: str = Field(description="Group id, 'custom <n>' or 'dictionary'")
+
+
+class VoicePreviewResponse(BaseModel):
+    text: str = Field(description="Exactly what the TTS model would receive")
+    spans: list[VoicePreviewSpanInfo]
+    changes: int = Field(description="Number of changed spans")
+    normalize_enabled: bool = Field(
+        description="The audio.tts_normalize master switch; the preview runs regardless"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Admin: MCP Servers
 # ---------------------------------------------------------------------------
 

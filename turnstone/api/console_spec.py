@@ -122,6 +122,9 @@ from turnstone.api.console_schemas import (
     UsageResponse,
     UserRoleInfo,
     VerdictInfo,
+    VoiceAdminMetaResponse,
+    VoicePreviewRequest,
+    VoicePreviewResponse,
 )
 from turnstone.api.openapi import EndpointSpec, QueryParam, build_openapi
 from turnstone.api.schemas import (
@@ -951,6 +954,30 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             QueryParam("node_id", "Node ID for node-scoped settings"),
         ],
         error_codes=[400, 404],
+        tags=["Admin"],
+    ),
+    # --- Admin: Voice tuning ---
+    EndpointSpec(
+        "/v1/api/admin/voice/meta",
+        "GET",
+        "Read-aloud tuning metadata for Admin › Voice: cleanup groups (each with "
+        "its example run through that group alone), built-in terms, the "
+        "audio.tts_profiles field table, the TTS-eligible model aliases and the "
+        "editor limits.",
+        response_model=VoiceAdminMetaResponse,
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/voice/preview",
+        "POST",
+        "Preview read-aloud text cleanup.  Returns exactly what the TTS model "
+        "would receive plus the changed spans, running with draft rules when "
+        "given.  only_rules skips every other cleanup source for the rule "
+        "editor's test line.  A draft rule that does not validate returns 400 "
+        "with the editor-ready message.",
+        request_model=VoicePreviewRequest,
+        response_model=VoicePreviewResponse,
+        error_codes=[400],
         tags=["Admin"],
     ),
     # --- Admin: MCP Registry ---
