@@ -26,3 +26,63 @@
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
+
+/* Per-model pacing profile — the bar below the two setting groups.  The
+   fields themselves reuse .settings-row; only the bar, the unit beside an
+   input and the inline save error need rules. */
+.voice-profile-block {
+  margin-top: 18px;
+  border-top: 1px solid var(--border);
+  padding-top: 2px;
+}
+
+.voice-profile-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 12px 2px;
+}
+
+.voice-profile-model-label {
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+
+.settings-input.voice-profile-model-input,
+.settings-input.voice-profile-copy-input {
+  flex: 0 1 260px;
+}
+
+.voice-profile-note {
+  padding: 0 12px 8px;
+}
+
+/* The editor is always present so a failed save has somewhere to report;
+   :empty keeps it out of the layout until it does. */
+.voice-profile-error:empty {
+  display: none;
+}
+
+.voice-profile-error {
+  margin: 0 12px 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--red);
+  border-radius: 3px;
+  color: var(--red);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.voice-profile-unit {
+  margin-left: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
+.settings-reset-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}

@@ -1,7 +1,7 @@
-/* Admin › Voice › Dictionary — the entry list's column tracks and its
-   legacy-pronunciation notice.  Row/header chrome comes from
-   .admin-colheaders / .admin-row in style.css; this sheet supplies only
-   what the shared admin language does not have. */
+/* Admin › Voice › Dictionary — the entry list's column tracks, its
+   legacy-pronunciation notice and the Built in reference table.  Row/header
+   chrome comes from .admin-colheaders / .admin-row in style.css; this sheet
+   supplies only what the shared admin language does not have. */
 
 /* TERM | TYPE | SAY AS | DICTATION ALSO HEARS | CASE | ACTIONS.  The typed
    columns get needed minimums so a long respelling cannot squeeze them out. */
@@ -54,4 +54,71 @@
   .voice-dict-case {
     display: none;
   }
+}
+
+/* -- Built in --------------------------------------------------------------
+   Reference rows below the operator's list: the same columns, one step
+   quieter, behind a divider so the two tables never read as one editable
+   list.  The switch column is an action-sized track borrowed from the
+   entries grid. */
+
+.voice-dict-builtin {
+  margin-top: 32px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.voice-dict-builtin-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 0 12px;
+}
+/* .section-header carries the page's section rhythm; in the flex head the
+   note and "?" sit beside it, so drop its bottom margin. */
+.voice-dict-builtin-head .section-header {
+  margin: 0;
+}
+.voice-dict-builtin-note {
+  flex: 1 1 320px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+}
+.voice-dict-builtin-head .settings-help-btn {
+  align-self: center;
+}
+.voice-dict-builtin-head + .settings-help-popover {
+  margin: 4px 12px 8px;
+}
+.voice-dict-builtin .admin-colheaders {
+  margin-top: 10px;
+}
+
+/* The design greys a built-in row: same cells as an entry, dimmer text.  The
+   switch keeps its normal contrast so it still reads as usable. */
+.voice-dict-builtin-row .admin-col,
+.voice-dict-builtin-row .admin-col code {
+  color: var(--fg-dim);
+}
+.voice-dict-builtin-row .voice-dict-override {
+  display: block;
+  margin-top: 2px;
+  color: var(--yellow);
+  white-space: normal;
+}
+
+.voice-dict-builtin-error {
+  padding: 4px 12px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--err);
+}
+
+/* ON column: center the switch against the row's first line. */
+.voice-dict-on {
+  display: flex;
+  align-items: center;
+  min-height: 22px;
 }

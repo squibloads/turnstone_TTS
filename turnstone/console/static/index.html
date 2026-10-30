@@ -17,6 +17,7 @@
     <link rel="stylesheet" href="/static/style.css" />
     <link rel="stylesheet" href="/static/voice.css" />
     <link rel="stylesheet" href="/static/voice_dictionary.css" />
+    <link rel="stylesheet" href="/static/voice_cleanup.css" />
     <link rel="stylesheet" href="/static/voice_styles.css" />
     <link rel="stylesheet" href="/shared/shell.css" />
     <link rel="stylesheet" href="/shared/katex-0.19.1/katex.min.css" />
@@ -1390,6 +1391,18 @@
                   Settings
                 </button>
                 <button
+                  id="voice-tab-cleanup"
+                  class="admin-subtab-btn"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="voice-cleanup-section"
+                  tabindex="-1"
+                  data-section="voice-cleanup"
+                  onclick="switchVoiceSection('voice-cleanup')"
+                >
+                  Text cleanup
+                </button>
+                <button
                   id="voice-tab-dictionary"
                   class="admin-subtab-btn"
                   role="tab"
@@ -1424,6 +1437,19 @@
               >
                 <div id="voice-settings-container" style="max-width: 900px">
                   <div class="dashboard-empty">Loading settings...</div>
+                </div>
+              </div>
+
+              <!-- Text cleanup section — mounted by the cleanup editor -->
+              <div
+                id="voice-cleanup-section"
+                class="voice-section"
+                role="tabpanel"
+                aria-labelledby="voice-tab-cleanup"
+                style="display: none"
+              >
+                <div id="voice-cleanup-container" style="max-width: 1100px">
+                  <div class="dashboard-empty">Loading text cleanup...</div>
                 </div>
               </div>
 
@@ -4462,6 +4488,7 @@
     <script src="/static/governance.js"></script>
     <script src="/static/voice.js"></script>
     <script src="/static/voice_dictionary.js"></script>
+    <script src="/static/voice_cleanup.js"></script>
     <script src="/static/voice_styles.js"></script>
     <script src="/static/app.js"></script>
     <!-- L-shell (ES module) — deferred, so it runs after the classic scripts

@@ -31,9 +31,7 @@ const VOICE_SETTING_GROUPS = [
     label: "Read aloud",
     keys: [
       "audio.tts_voice",
-      "audio.tts_max_chars",
-      "audio.tts_timeout_seconds",
-      "audio.tts_normalize",
+      "audio.tts_playback_rate",
       "audio.tts_style",
       "audio.tts_pronunciations",
     ],
@@ -202,12 +200,15 @@ const values = [
   value("audio.tts_model_alias", ""),
   value("audio.voice_dictionary", "[]"),
   value("audio.tts_styles", JSON.stringify(styles)),
+  value("audio.tts_profiles", '{"tts-qwen":{"max_clips":50}}'),
+  value("audio.tts_rewrite_rules", "[]"),
+  value("audio.tts_cleanup_disabled", '["versions"]'),
+  value("audio.tts_builtin_terms_off", '["YAML"]'),
   value("audio.stt_prompt", "domain words", "storage"),
   value("audio.stt_dictionary_hint", true),
   value("audio.stt_dictionary_correct", false),
   value("audio.tts_voice", "alloy"),
-  value("audio.tts_max_chars", 8000, "storage"),
-  value("audio.tts_timeout_seconds", 30),
+  value("audio.tts_playback_rate", 1.25, "storage"),
   value("audio.tts_normalize", true),
   value("audio.tts_style", "social"),
   value("audio.tts_pronunciations", "SQL = sequel"),
@@ -219,8 +220,7 @@ const items = _voiceSettingsFrom(values, [
   schema("audio.stt_dictionary_hint", {type: "bool", default: true}),
   schema("audio.stt_dictionary_correct", {type: "bool", default: true}),
   schema("audio.tts_voice"),
-  schema("audio.tts_max_chars", {type: "int", default: 8000, min_value: 1, max_value: 50000}),
-  schema("audio.tts_timeout_seconds", {type: "int", default: 30, min_value: 1, max_value: 600}),
+  schema("audio.tts_playback_rate", {type: "float", default: 1.0}),
   schema("audio.tts_normalize", {type: "bool", default: true}),
   schema("audio.tts_style"),
   schema("audio.tts_pronunciations"),
@@ -231,9 +231,7 @@ assert.deepEqual(items.map((item) => item.key), [
   "audio.stt_dictionary_hint",
   "audio.stt_dictionary_correct",
   "audio.tts_voice",
-  "audio.tts_max_chars",
-  "audio.tts_timeout_seconds",
-  "audio.tts_normalize",
+  "audio.tts_playback_rate",
   "audio.tts_style",
   "audio.tts_pronunciations",
   "audio.zz_future",
@@ -243,10 +241,14 @@ assert.equal(byKey["audio.voice_dictionary"], undefined, "the dictionary has its
 assert.equal(byKey["audio.tts_styles"], undefined, "the styles editor has its own tab");
 assert.equal(byKey["audio.stt_model_alias"], undefined, "role pickers live in Models -> Roles");
 assert.equal(byKey["audio.tts_model_alias"], undefined);
+assert.equal(byKey["audio.tts_profiles"], undefined, "the pacing profile editor owns it");
+assert.equal(byKey["audio.tts_rewrite_rules"], undefined, "the Text cleanup tab owns it");
+assert.equal(byKey["audio.tts_cleanup_disabled"], undefined, "the Text cleanup tab owns it");
+assert.equal(byKey["audio.tts_builtin_terms_off"], undefined, "the Dictionary tab owns it");
+assert.equal(byKey["audio.tts_normalize"], undefined, "the cleanup master switch moved tabs");
 assert.equal(byKey["audio.stt_prompt"].source, "storage");
 assert.equal(byKey["audio.stt_prompt"].description, "audio.stt_prompt description");
 assert.equal(byKey["audio.stt_prompt"].help, "audio.stt_prompt help");
-assert.equal(byKey["audio.tts_max_chars"].max_value, 50000);
 assert.equal(byKey["audio.tts_pronunciations"].multiline, true);
 assert.deepEqual(byKey["audio.tts_style"].choices, ["", "Professional", "Social", "Plain"]);
 assert.equal(byKey["audio.tts_style"].value, "Social", "case-insensitive match, canonical spelling");

@@ -345,6 +345,29 @@ next sub-agent invocation — no restart required.
 
 ---
 
+## Audio
+
+The `audio.*` settings configure dictation (speech-to-text) and read-aloud
+(text-to-speech). They are edited on **Admin › Voice**, except the two model
+aliases, which are **Models → Roles** pickers. See [Voice](voice.md) for the
+per-setting help, the pacing profile fields, the cleanup rule groups and
+worked rewrite-rule examples.
+
+| Group | Settings | Documented in |
+|-------|----------|---------------|
+| Dictation | `audio.stt_model_alias`, `audio.stt_prompt`, `audio.stt_dictionary_hint`, `audio.stt_dictionary_correct` | [Dictation](voice.md#dictation) |
+| Read aloud | `audio.tts_model_alias`, `audio.tts_voice`, `audio.tts_normalize`, `audio.tts_style`, `audio.tts_pronunciations` | [Read aloud](voice.md#read-aloud) |
+| Pacing profiles | `audio.tts_profiles` | [Pacing profiles](voice.md#pacing-profiles) |
+| Text cleanup | `audio.tts_rewrite_rules`, `audio.tts_cleanup_disabled`, `audio.tts_builtin_terms_off` | [Text cleanup](voice.md#text-cleanup) |
+| Dictionary and styles | `audio.voice_dictionary`, `audio.tts_styles` | [Dictionary](voice.md#dictionary), [Styles](voice.md#styles) |
+| Playback | `audio.tts_playback_rate` | [Playback speed](voice.md#playback-speed) |
+
+All are hot-read: a saved change applies to the next request, except playback
+speed and the pacing profile, which the browser player reads when it loads its
+read-aloud configuration.
+
+---
+
 ## Bootstrap vs ConfigStore
 
 **Bootstrap settings** are required before storage is available (database
