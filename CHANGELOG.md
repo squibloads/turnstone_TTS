@@ -299,6 +299,410 @@ already shipped on the 1.8 line are not repeated here.
 
 ### Changed
 
+- **Read-aloud speaks a reply one block at a time** — headings, paragraphs and table rows
+  are each read as their own clip with a pause after them (a heading or paragraph under 20 characters joins the clip that follows and takes no pause of its own; a whole list is one clip, see below), instead of
+  running into the next sentence, and a code block is replaced by "Code omitted." (consecutive blocks by one marker). A diagram (a ```mermaid block, rendered or not) says "Diagram omitted." instead of reading its labels aloud, and inline SVG, images, canvas, video and audio are skipped. Inline code of
+  40 or more characters is replaced the same way; shorter inline code is read aloud. A reply is read
+  up to its first 200 clips, with a toast saying the rest was skipped. Playback starts as soon as the first clip is
+  synthesized rather than after the whole reply, using the same `/v1/api/tts` endpoint with one
+  request in flight at a time. A request that fails, or a browser that blocks playback, now shows an
+  error toast and stops.
+- **Read-aloud plays a list as one clip and pauses 150 ms between table rows** — all the items of a list (nested lists and definition lists included) are read as a single clip with no pause between items or after it, and a short lead-in such as "To deploy:" is carried into it; a long list is still cut at item ends. Table rows stay one clip each, now with a 150 ms pause (cells are read comma-joined, empty cells skipped), and short rows are no longer merged into one another. Chosen by listening tests.
+- **Read-aloud keeps playing when the tab is hidden** — it used to stop, because hiding the tab
+  closes the live stream and the stream teardown also stopped the audio. It now stops on Stop,
+  when the conversation is rebuilt from history, and when the pane is closed.
+- **`spawn_batch` sends every child's create at once (#1457).** It sent them one after another,
+  and each create waits up to 30 seconds for the console, which waits up to 30 seconds for the
+  node, so a stalled console or node held the coordinator's call for up to five minutes. A stall
+  now costs about one timeout, and the children bound for healthy nodes are still created. A Stop
+  or force-cancel holds back only a child whose create hasn't been sent, which once the batch has
+  started is usually none of them. The console's cancel cascade reaches only the children it had
+  registered when the Stop landed, so the batch cancels each child whose create returns after the
+  stop, and audits those cancels as `coordinator.cancel_cascaded` with `src: spawn_batch`. The
+  children can be created in any order (`results` stays keyed by input index). With a node's rate
+  limiting on, a batch's creates arrive together and count against their creator's bucket; a
+  create the limiter refuses is sent once more after the wait it names, and a second refusal is
+  reported as denied (#1464).
+- **The denial nudge no longer waits out `memory.nudge_cooldown` (#924).** The note asking the
+  model whether a rejected tool call reflects a lasting preference now follows each batch a person
+  rejects; the cooldown spaces only the correction and completion nudges and the coordinator's
+  open-task reminder. A rejection during a wake-driven turn gets no note, and it used to start the
+  cooldown anyway, so a rejection in the next `memory.nudge_cooldown` seconds got none either. In
+  the CLI, an approval prompt left unanswered (its input closed, or Ctrl+D) no longer counts as a
+  person's rejection, also when a tool policy refused another call in the same batch.
+- **A console exits when it can't start the TLS certificate authority it has enabled, or when a
+  setting's `TURNSTONE_*` variable holds a value the setting refuses (#1406)** *(BREAKING)* — a
+  failed CA load (a storage error, a corrupt row) used to leave the console running without TLS
+  until a restart, and nodes that started meanwhile fell back to plain HTTP; a refused value such
+  as `TURNSTONE_TLS_ENABLED=on` was logged and skipped, leaving its setting at the default, and
+  one for a setting already stored was never read. The console now logs `tls.init_failed`, or
+  `config.seed_refused` once per refused variable, and exits, seeding nothing on a start that
+  refuses a value; a bool takes `true`, `1`, `yes`, `false`, `0` or `no`. An empty variable now
+  counts as unset, so it no longer stores an empty string. A console whose CA can't start for a
+  lasting reason doesn't serve its Settings tab either, so turning TLS off then means setting
+  `tls.enabled` to `false` in the `system_settings` table. A failure issuing the console's own
+  certificate is still logged, now as `tls.console_setup_failed`, and the console keeps serving.
+- **Database errors no longer quote the values a failed statement was sent** — an error message,
+  and a traceback logged with it, names the statement and the database's reason only; the values
+  stay on the exception's `params`.
+- **A SQLite database path holding `%` and two hex digits, or a `?`, opens the file it names**
+  *(BREAKING)* — the path was read as a URL, so `/data/a%20b/turnstone.db` opened
+  `/data/a b/turnstone.db`, and a `?` ended the path. Before upgrading, set the path the
+  deployment was using: when the escape is in the file name, the upgraded process opens a new,
+  empty database beside the old one.
+- **The MCP client runs on the MCP Python SDK 2.3 (#679)** *(BREAKING)* — turnstone requires
+  `mcp>=2.3,<3`, so an MCP server run from turnstone's own Python environment must work with it
+  (FastMCP is now `MCPServer`); the cluster-ops and Understone examples move with it. MCP HTTP
+  connections now go through httpx2: TLS is verified against the operating system's trust store
+  instead of certifi's bundle (`SSL_CERT_FILE` and `SSL_CERT_DIR` still override it), and one
+  streamed event may be up to 16 MiB, so a larger tool result fails (1.x had no limit). When a
+  global OpenTelemetry tracer provider is configured, the SDK opens a span for each MCP request and
+  passes the trace context to the server in `_meta`; turnstone configures none. A server's JSON-RPC
+  error with the positive code 32600, the 1.x SDK's stand-in for a lost session that a proxy built
+  on it can still forward, is now an ordinary protocol error: a call that gets one keeps its
+  session, is not counted by the circuit breaker and reconnects nothing, and a connection test or a
+  failed connect shows the server's own message.
+- **OIDC sign-in and OAuth run on httpx2 (#1011)** — the identity provider's discovery, keys and
+  code exchange at sign-in, and every OAuth request for MCP servers and models (discovery, client
+  registration, code exchange, refresh, revocation, and the on-behalf-of and client-credential
+  mints) now go through httpx2. Certificates are verified against the operating system's trust
+  store instead of certifi's bundle. A deployment that trusted its identity provider's or
+  authorization server's private CA through a modified `certifi` bundle must install that CA's
+  root certificate in the system store (an intermediate CA on its own no longer verifies), or point
+  `SSL_CERT_FILE` / `SSL_CERT_DIR` at a bundle holding the public roots as well as the private CA.
+  Those variables apply to every httpx2 client in the process, and strict X.509 checks and
+  `SSLKEYLOGFILE` apply only while one of them is set. The proxy variables still apply; `NO_PROXY`
+  now also matches IPv4 and IPv6 CIDR ranges and bracketed IPv6 addresses, and ignores an entry it
+  can't parse or that carries a path, so list such a host without its path. These requests send a
+  `python-httpx2` User-Agent and also accept zstd-compressed responses, and when something lowers
+  httpx2's log level (for example `ANTHROPIC_LOG=info`) they now log request lines, which show
+  only each URL's scheme, host and port.
+- **The rest of Turnstone's HTTP clients run on httpx2, and `httpx`, `httpx-sse` and `certifi` are
+  no longer dependencies (#1011)** — web search through SearXNG, the reranker, skill sources, the
+  MCP registry, notifications to channel gateways, the CLI's `/cluster` commands, the console's
+  connections to its nodes (the routing proxy, the event relay, the cluster collector and the
+  coordinator's client), the channel adapters and the Python SDK now go through httpx2, as OAuth
+  does (above): certificates are verified against the operating system's trust store instead of
+  certifi's bundle, `SSL_CERT_FILE` and `SSL_CERT_DIR` still override it, the proxy variables still
+  apply with httpx2's reading of `NO_PROXY`, and requests send a `python-httpx2` User-Agent and also
+  accept zstd. When something lowers httpx2's log level (for example `ANTHROPIC_LOG=info`), these
+  clients log request lines too, showing only each URL's scheme, host and port; a program that
+  quieted the `httpx` logger for the SDK quiets `httpx2` instead. The cluster collector, the channel
+  adapters and the SDK accept one server-sent event of up to 16 MiB, as the MCP client does; a
+  larger event ends the stream, which the collector and the adapters reconnect (`httpx-sse` had no
+  limit). A node whose snapshot is over the limit, which a large backlog of pending approvals with
+  big tool arguments could produce, shows as unreachable in the console until the backlog shrinks.
+  Code run from Turnstone's Python environment that imports `httpx`, `httpx_sse` or `certifi`, such
+  as an MCP server started with that environment's Python, must now install them itself.
+- **The Python SDK runs on httpx2 and takes only an httpx2 client** *(BREAKING)* — `httpx_client=`
+  must be an `httpx2.AsyncClient`; an `httpx` client, or anything else, raises `TypeError` when the
+  SDK client is built rather than failing later mid-request or mid-stream. A request that fails in
+  transport raises one of `turnstone.sdk.REQUEST_FAILURES`: httpx2's own errors
+  (`httpx2.ConnectError`, `httpx2.SSEError` for an event stream it can't read, and the rest of
+  `httpx2.HTTPError`), and those httpx2 raises outside that family, for a redirect it can't follow
+  (`httpx2.InvalidURL`, `UnicodeError`) or a TLS alert after the handshake (`ssl.SSLError`). Code
+  that catches `httpx.HTTPError` or `httpx_sse.SSEError` around SDK calls must catch
+  `REQUEST_FAILURES` instead.
+- **A model that isn't loaded is never replaced by another (#1359)** *(BREAKING)* — when the default
+  model, the task model, the coordinator model or the channel model names a definition that isn't
+  loaded (deleted, disabled, misspelled, or left out of a reload because its secret reference
+  couldn't be read), whatever relies on it now fails instead of quietly running on another model,
+  possibly a different provider. Creating a workstream without a model returns 503 with `"code":
+  "model_not_loaded"` and a message naming the model, which the console launcher, the CLI and the
+  Slack and Discord bots turn into their own wording; `task_agent` refuses the call before asking
+  for approval, saying why and suggesting a retry only when the secret store didn't answer (never
+  another model), and no longer falls through to `[model].agent_model`; the CLI exits at startup
+  naming the model. The coordinator check now blocks only creating a coordinator, so list, open,
+  events, send and close keep working while its model is missing. A fork (the node's Fork,
+  continuing elsewhere, a channel conversation's recovery) builds on its source's model when that
+  model is loaded, and fails if that model's client can't be built, as a reopen does; otherwise it
+  builds on the model the request names (for a channel recovery, the channel's model), else the
+  default, and fails when that one isn't loaded either. With nothing stored or configured, the
+  default is `[model].default`, else the model named `default`, else the first chat model defined
+  (not a reranker or speech model), whether or not it loaded. Adding or enabling the first chat
+  model in the Models tab stores it as `model.default_alias` when nothing is stored there; nothing
+  else stores it, so a reset in the Settings tab stays reset. Nodes read it with their model
+  definitions, at a Sync or at the secret-store refresh, which now also reloads settings that
+  changed. It outranks each node's config.toml default, so a cluster's default is uniform. The
+  Models tab refuses to delete, disable or rename a model that `model.default_alias`,
+  `model.task_alias`, `coordinator.model_alias` or `channels.default_model_alias` names, saying
+  which setting to change first; deleting or disabling the last enabled model clears them. A changed
+  or cleared `model.default_alias` or `model.task_alias` now takes effect at once on running nodes;
+  before, a node kept the previous value until the next Sync or restart. The model pickers name a
+  default their list doesn't hold instead of showing a bare "Default model", and the node's picker
+  marks one the node didn't load as not available.
+- **A workstream whose model isn't loaded waits for it (#1359)** *(BREAKING)* — reopening a
+  workstream whose saved model isn't loaded (deleted, disabled, renamed, or left out of a reload
+  because its secret reference couldn't be read) no longer runs it on the default model, which the
+  next save then made permanent, including on unattended watch restores. The workstream opens, keeps
+  and saves its own model, and each message is recorded and then refused before any model call,
+  naming the model and a remedy its reader can use: `/model <alias>` on the web and in the CLI; an
+  admin for coordinators, a coordinator's workstreams (whose errors the coordinator's model reads)
+  and scheduled runs; and in Slack and Discord, which can't run `/model`, the channels' own "Ask a
+  Turnstone admin" advice, saying the message is kept. Once the model loads again, the next message
+  continues on it, and `/retry` re-sends a refused text message (one with attachments has to be sent
+  again). A live workstream whose model a reload removes, or whose reloaded model's client can't be
+  built, waits the same way from its next model round, instead of sending to the client the reload
+  retired (a build that failed is retried at the next registry change); each round and each creation
+  retry first catches up with the registry, so a model rebuilt mid-send continues on its new client.
+  A fork whose source model isn't loaded waits too, unless its request names a model: the fork then
+  switches to that model as `/model` would, with that model's own sampling settings, and records it
+  as its model, so the source model's reasoning effort no longer reaches another model (part of
+  #1272). A source model that is out only for now (its secret store didn't answer) keeps the fork
+  waiting instead, so it doesn't move for good. The chat channels' recovery forks name no model (a
+  Slack DM names `channels.default_model_alias` when it is set), so a chat conversation whose model
+  was removed waits until an admin restores it. Coordinators wait the same way. A workstream saved
+  before model aliases were recorded names only a backend model id, which no loaded model is matched
+  to, so it waits until it is switched with `/model`. When the default isn't loaded either, a reopen
+  still fails with the 503 `model_not_loaded`. `/model` prints the same message as a refused turn;
+  the model chip doesn't show the state yet (#1382). Custom code that forks with `fork_from_storage`
+  or `adopt_fork_snapshot` passes `switch_to=<alias>` to run the fork on a model it names. The
+  `session_mgr.stale_alias_dropped` and `session.model_refresh_alias_removed` warnings become
+  `session_mgr.saved_alias_not_loaded` and `session.model_held`.
+- **Slack uses the channel adapter model (#1359).** New Slack conversations run on
+  `channels.default_model_alias`, as the Roles tab says, instead of always the server default;
+  before, only Discord used it. Both bots now re-read the setting every 30 seconds instead of every
+  5 minutes, since a channel model that was removed fails new conversations until they do.
+- **A coordinator create ignores `resume_ws` (#1359).** Coordinators can't be forked, but a
+  coordinator create carrying `resume_ws` read the named workstream, without checking that the
+  caller could see it, and stamped that workstream's persona onto the new coordinator. Only a create
+  endpoint that forks (the node's) now reads a fork source.
+- **A node's health says when its default model isn't loaded (#1359).** `/health` and the console's
+  node status are `degraded` while the node's default model isn't loaded, since every create that
+  relies on it fails, and `/health` gains `default_model` (`alias`, `loaded`); it still answers 200.
+  The console now shows the status the node computes (its default model's backend, and whether that
+  model is loaded) instead of the state of whichever backend changed last, so an outage of a backend
+  other than the default's no longer marks the node degraded there, as it never did in `/health`.
+- **Claude models without a capability row get adaptive thinking (#1366).** An Anthropic model id
+  with no row, such as the first model of a new line, took a default shaped for models that take a
+  thinking budget: any configured reasoning effort sent `budget_tokens`, which adaptive-only models
+  reject with a 400, and with no effort set a configured temperature was sent, which Claude 4.7 and
+  later models also reject. The default now sends adaptive thinking with summarized display, effort
+  on the `low` through `high` ladder (`xhigh` and `max` ride `high`; left unset, the model's own
+  default applies) and no temperature. It keeps the 200K context and 64K output limits, and tool
+  search, native mid-conversation system messages and the binding control for thinking bound to the
+  conversation prefix stay off until the model has its own row; a model definition on auto-detect
+  keeps the 32,768-token fallback window. An id with no row that names a model which thinks only
+  when asked, such as a gateway's name for Claude Opus 4.6 to 4.8 or Sonnet 4.6, now thinks on every
+  request, at the model's own default effort when none is set: a `low` effort on the alias bounds
+  that, and a `thinking_mode` of `none` in the definition's capabilities turns it off. In the admin
+  model form, the effort ladder for any id with no row on the `anthropic` provider lists effort
+  levels instead of thinking budgets, and its capability tiles show the default row's flags, as they
+  now do on every commercial provider (they showed generic defaults). Claude Haiku 4.5, Sonnet 4.5
+  and Opus 4.5 take a thinking budget and reject adaptive thinking, so a name for one of them that
+  no row matches, such as a gateway's own, now fails every request with a 400: use the model's
+  Anthropic id as that name, or set `thinking_mode` to `manual` and `supports_temperature` to `true`
+  in the definition's capabilities, plus `supports_effort` to `false` for Haiku 4.5 and Sonnet 4.5.
+  A non-Claude model behind an Anthropic-style API on the `anthropic` provider now gets adaptive
+  thinking on every request, which its server may reject; move it to the `anthropic-compatible`
+  provider, which sends no native thinking params, and set its vision and PDF capabilities there if
+  the model takes them.
+- **Model definitions saved in the console no longer expand `${VAR}`** *(BREAKING)* — a `${NAME}`
+  placeholder in a definition's `api_key` or `base_url` is no longer filled in from the environment;
+  only config.toml `[models.*]` entries expand one. The console refuses a placeholder in either
+  field when a definition is saved, and a definition saved with one earlier is skipped when models
+  load, named with its field in the console's save and Sync to Nodes replies (and in
+  `turnstone-doctor`'s report when it cannot resolve its model). Edit such a definition to hold the
+  key or URL itself, or a `secret://` reference for the key, or define the model in config.toml,
+  where a URL that carries a credential belongs.
+- **Two kinds of model key that loaded no longer do** *(BREAKING)* — a config.toml `[models.*]`
+  `api_key` whose `${VAR}` expands to nothing, and a reranker key with a space at either end. The
+  first fell back to the provider SDK's own variable, which then went to that entry's endpoint (or,
+  on a local server with that variable unset, to the placeholder key); the second was trimmed. Both
+  now follow the model key rule (under Fixed): the model is skipped and named with the reason. Set
+  the variable, or remove the `api_key` line for a server without auth, and trim the key.
+- **Bash commands no longer read the CLI's terminal.** They inherited the stdin of the process that
+  ran them, so in the CLI a command that read its input took keys typed into the terminal, perhaps
+  for another workstream, and one that prompted waited until its timeout for an answer nobody
+  could give. A `bash` command now gets `/dev/null`: it reads end-of-file at once and finds that
+  stdin is not a terminal. A background shell gets `/dev/null` too, unless the process's own stdin
+  is a terminal, as the CLI's is: then it gets a terminal of its own that nothing is typed into,
+  so a long-running program keeps running as before, and one that waits for input waits until the
+  shell is killed. That terminal has no window size, so a program that sizes its output by it uses
+  its default width, as a `bash` command now does.
+- **A message to a waiting coordinator ends the wait at once (#1339).** A message the user sends
+  while the coordinator blocks in `wait_for_workstream` no longer queues until the wait ends (up to
+  600 seconds): the wait returns at once with `complete: false` and `interrupted: "user_message"`,
+  the message reaches the coordinator right after the tool result unless the user withdrew it first,
+  and the coordinator waits again if it still needs to. A wait that times out or is interrupted now
+  returns the children's states without their last messages; only the wait that completes carries
+  those, so a coordinator that waits again no longer receives the same output each time. The
+  `wait_ended` event carries the same `interrupted` field, and the tool row reads "interrupted after
+  Ns". A message that `/send` refuses while the coordinator works still waits for the turn to end:
+  one with attachments, or one from a second signed-in user.
+- **A failed MCP connect says what went wrong (#1328).** A server's recorded error and the connect
+  logs name the HTTP status, the TLS failure or the timeout instead of `ExceptionGroup: unhandled
+  errors in a TaskGroup (1 sub-exception)`, and a wrong URL path reads `HTTP 404 Not Found: no MCP
+  endpoint at this URL` instead of `McpError: Session terminated`, while a 404 after the session
+  opened reads as a dropped session (a restart, or replicas without session affinity). An invalid
+  catalog entry is recorded without its `InvalidCatalogError:` prefix. A connect that fails at
+  startup is logged in those words, without the exception chain; a failure none of those words fit
+  adds its traceback at debug level. The health loop's per-attempt `reconnecting` line drops to
+  debug after three attempts, as its failure line already did. A refresh that cannot reach its
+  server records `ServerUnreachableError` where it recorded `ConnectionError`. A host name that
+  cannot be looked up as written, such as one with an empty label (`mcp..example.com`), reads as
+  unreachable at that host.
+- **An MCP URL that serves something other than MCP fails at once (#1328).** A server that answers
+  initialize with neither an MCP message nor an event stream, such as a docs page, a proxy's sign-in
+  page or a REST API's JSON, fails the connect immediately, saying what came back, instead of after
+  the 30 s connect timeout. So does one that answers with a JSON-RPC error the SDK cannot read (one
+  with a null id), giving the server's error code and message.
+- **Saving an MCP server checks its URL and headers (#1328).** Creating, importing or installing a
+  Streamable HTTP server, or changing its URL or headers, answers `400` (an import lists the server
+  among its errors) when the URL is not `http://` or `https://` with a host or does not parse (a
+  malformed bracketed IPv6 host, a port out of range), or when a header name is not an HTTP token or
+  a value has a space at either end, a control character or a character outside ASCII, instead of
+  saving a server that can never connect. An edit that leaves a saved row's URL and headers
+  unchanged still saves. A URL whose parse error would quote part of it before the host, where a
+  password can sit, is refused as `url has an invalid host or port`. A server name that ends in a
+  line break once cut to 64 characters is refused too, where it could be saved before.
+- **`/skill` quotes skill names in its operator note (#1292).** The note `/skill` writes into the
+  conversation quotes each skill name as JSON, so a name cannot break the note into extra lines,
+  and says `no skill` where it said `defaults`.
+- **Skills check `notify_on_complete` like a workstream's `notify_targets` (#1292).** At most 10
+  targets, each naming a `channel_type` and one of `channel_id` or `user_id`: a skill can no longer
+  store targets that workstream create then dropped without a word or could not deliver. An explicit
+  `null` leaves the targets unchanged. The `skills` tool's create, update and enable cards show the
+  targets whole, and the approval judge sees them; the tool's `update` no longer sets `enabled`,
+  which only `enable` and `disable` change, with their card. The shared check also refuses a target
+  whose `channel_type` is `null`, so node workstream create (`POST /v1/api/workstreams/new` and the
+  console routes that forward to it) and the console's schedule create and update now answer 400 for
+  one. Such a target was stored without a type: a workstream's notification never arrived, and the
+  node refused every run of a schedule that held one.
+- **Saved sessions page, search and sort on the server (#1268).** `GET /v1/api/workstreams/saved`
+  on nodes and the console takes `limit` (default 50, at most 200; `0` returns only the total),
+  `offset`, `q` (a case-insensitive substring of at most 256 characters), `sort` and `order`, and
+  its response adds `total`, `limit` and `offset`; a malformed parameter answers 400. Search folds
+  letters beyond ASCII on SQLite, and on PostgreSQL as far as the database's locale does. Project
+  names count for search and the project sort only for callers with `project.read`, who are the
+  ones the dashboards can show them to.
+  A saved session is now one with history that no process has loaded (no live owner lease), for
+  both kinds: a node's list no longer includes workstreams loaded on it or on any other node, and
+  the console's no longer includes interactive sessions that nodes have loaded. The dashboards'
+  saved tables fetch each page, search and sort from the server, so they reach every stored
+  session; sorting and searching pause while rows are selected for deletion, as paging already
+  did. While a page loads its rows dim and keyboard focus stays on the control that asked for it,
+  and a failed load on a node's dashboard shows the error with a Retry button, as the console's
+  already did. Each dashboard keeps one request for the list in flight and asks once more after it,
+  however many refreshes arrive meanwhile. The Python and TypeScript SDKs'
+  `list_saved_workstreams` / `listSavedWorkstreams` take the same options and still read an older
+  server's unpaged answer.
+- **A workstream's `updated` is the last change to its conversation (#1268).** Saving or removing
+  messages (rewind, retry) sets it; state changes, renames, opening, closing and cleanup no longer
+  do. Lists ordered by `updated` (the saved sessions, the CLI's `/workstreams`, a project's
+  workstreams, the console cluster view's stored coordinators and a coordinator's children) now
+  order by real use, so a coordinator closed today but last used long ago no longer jumps into the
+  cluster view's 200 most recent. `session.retention_days` ages an unnamed workstream from its last
+  conversation change, so opening an old unnamed workstream no longer restarts its clock; naming it
+  still keeps it. Cleanup of a workstream no process holds now waits for the idle timeout from its
+  last conversation change rather than from its last state change, and orphan close and retention
+  also leave a workstream whose owner lease ran out within their window, since a holder whose
+  renewals are failing may still have it open.
+- **Routing prefers a workstream's owner, and cleanup keys on leases.** The console router sends a
+  workstream to the live node holding its owner lease (after any required node). Orphan close and
+  stale-create recovery skip workstreams with a live lease instead of trusting node heartbeats, and
+  boot prune, which had no liveness check, now skips them too, so a crashed process's workstreams
+  are reclaimed whatever node id the next process carries, and orphaned coordinators are now reaped.
+  On PostgreSQL, a workstream whose holder crashed can be reopened elsewhere after at most 30
+  seconds, and the router stops sending requests to it once its lease expires. `turnstone-server
+  --resume` waits once, up to that TTL, when its own previous process still holds the workstream,
+  and it and the CLI's `--resume` report any failure to resume as a one-line error; resuming a
+  workstream with no stored turns now opens it, with its saved settings, and resuming a
+  coordinator from the CLI or server startup is refused. Coordinator deletes now run on the
+  console. A watch is ended when another node opens its workstream, because a watch runs only on
+  the node that created it, and the model is told why unless the workstream has no messages.
+  Opening a workstream whose history or saved settings cannot be read answers 503 and can be
+  retried, instead of opening it empty or on default settings, and opening one (or viewing it
+  with write scope) on a node whose session slots are all busy answers 429, as a create does.
+- **Watch delivery reopens the workstream like a pane.** A watch fire for a workstream that is not
+  loaded now opens it through the session manager instead of building a separate session that
+  switched to it, so a pane opened meanwhile joins the same session and no empty workstream is left
+  behind. While nobody else is in it, a workstream opened this way approves its own tool calls,
+  audited as `unattended_watch` rather than as skip-permissions, until the first client opens it,
+  views it, sends to it, approves in it, stops it or attaches to its stream; a call an admin `ask`
+  policy matches takes the normal approval flow instead, as in an attended session (the
+  smart-approval judge, if enabled, or a person; the old restore approved it). A workstream with no
+  stored turns ends the watch.
+- **Containers run Turnstone under an init process.** The image's entrypoint is now `tini`, and
+  the Helm chart's server and console pods set `shareProcessNamespace: true`, so the pod's
+  pause container is PID 1. Either one reaps orphaned processes, such as the helpers stdio MCP
+  servers leave behind, which Turnstone as PID 1 left as zombies. Turnstone now handles
+  SIGTERM in containers as it already does elsewhere: it shuts down as before, but the
+  container's exit code on `docker stop` or pod termination is 143 rather than 0. Overriding
+  the image entrypoint (`docker run --entrypoint ...`) bypasses `tini`.
+
+- **Shared model completion recovery.** Conversations, task agents, summaries, utilities,
+  judges, and perception share a bounded retry allowance for empty responses and transient
+  response failures. Task, summary, utility, judge, and perception calls also spend it on
+  compatible gateways returning transient JSON errors with HTTP 200; the conversation loop treats those
+  as ordinary creation failures with its existing retry, health, and fallback handling. Task
+  and summary calls no longer multiply retries through additional caller loops. Accepted
+  responses that may run server-side tools are never automatically replayed; compaction after
+  a context overflow is not a replay and still runs. Direct eval and optimizer sampling keep
+  their existing behavior.
+- **Independent OAuth runtime.** MCP and model authentication share a process-owned runtime
+  for token requests, credential rotation and durable writes. Model authentication works without
+  an MCP manager and stays available when a persona disables MCP tools.
+- **Shared delegated-auth modules.** OAuth/OIDC protocol code, generic encrypted token storage,
+  and model-provider mint orchestration now have separate homes from MCP consent and transport.
+- **Shared OAuth token storage.** MCP grants and model mint caches now use consumer-neutral
+  storage names, and model lifecycle purges delete only their token rows. Shared operator
+  guidance covers the deployment keyring, rotation, and credential lifecycle.
+- **Python 3.13 minimum for Turnstone 1.9.** Python 3.11 and 3.12 are no longer supported; 1.8 is
+  the last series that accepts them. Native installations must recreate their virtual environment
+  with Python 3.13 or newer before upgrading. CI tests Python 3.13 and 3.14, and Docker images
+  already include Python 3.14.
+- **Anthropic SDK v1 and its HTTPX2 transport are now required (#1050).** The dependency is
+  `anthropic>=1,<2`; the temporary `<1` cap is gone. Native Anthropic and anthropic-compatible
+  streams normalize the SDK's HTTPX2 connection deaths through the same retry boundary as the
+  OpenAI lanes, including a wire failure observed after a model-registry reload closed the client
+  from another thread. SDK v1 removed the `temperature`, `top_p`, and `top_k` request parameters, so
+  capability-gated temperature now reaches the wire through the request's `extra_body` with
+  unchanged send/omit semantics, and an operator `server_compat.extra_body` pin of the same key
+  keeps precedence over the session value. Anthropic connections follow HTTPX2's operating-system
+  trust store by default, as OpenAI connections already do; deployments that relied on a modified
+  `certifi` bundle must install that CA in the system store or set `SSL_CERT_FILE` /
+  `SSL_CERT_DIR`.
+- **Credential headers are refused in `extra_headers`.** Both SDKs merge caller headers over
+  their own credential header case-insensitively, even over a `with_options(api_key=...)`
+  delegated credential, so an injected `x-api-key` or `Authorization` header would silently
+  replace it. Every provider adapter now raises at request assembly instead; delegated
+  credentials ride `with_options(api_key=...)` only.
+- **URL fetches use HTTPX2.** `web_fetch` and URL targets of `open_preview` now run on HTTPX2 and
+  its connection layer, with the same per-hop address screening, pinned connections, manual
+  redirects, and decoded-size ceiling. Compressed bodies are decoded in bounded pieces, so a small
+  compressed response can no longer expand in memory before the ceiling applies, and fetches now
+  accept brotli- and zstd-compressed responses as well as gzip and deflate (HTTPX2's `brotli` and
+  `zstd` extras, which add `brotli` and, before Python 3.14, `backports.zstd`). Certificates are
+  verified against the operating system's trust store instead of the `certifi` bundle; deployments
+  that trusted a private CA through a modified `certifi` bundle must install it in the system store
+  or set `SSL_CERT_FILE` / `SSL_CERT_DIR`, which apply to the whole process. HTTPX2 and its
+  connection layer log at `WARNING` and above, as HTTPX did, so fetched URLs stay out of `INFO`
+  logs; if something lowers that level (for example `ANTHROPIC_LOG=info`), HTTPX2 request lines show
+  only each URL's scheme, host, and port, since a fetched URL can carry a secret anywhere after its
+  host, and the rest of each line passes through the output guard's credential redaction. This also
+  removes the OpenAI SDK's per-request `HTTP Request:` lines logged at `INFO` since 1.8.0; model
+  calls are still logged as `model_turn.completed`. The `httpx2` minimum is now 2.12, and
+  `httpcore2` replaces `httpcore` as a direct dependency.
+- **URL fetches ask for web pages.** `web_fetch` and URL targets of `open_preview` send
+  `Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8` and
+  `Accept-Language: en-US,en;q=0.9` on the first request and every redirect. Hops to https URLs and
+  loopback hosts also send navigation metadata (`Sec-Fetch-Dest: document`,
+  `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Site: none`), which browsers omit on plain http. The
+  `User-Agent` is still `turnstone/1.0`. Other content types remain acceptable, but an endpoint that
+  negotiates content may now return HTML where it previously returned JSON or CSV, and some image
+  hosts (for example `i.imgur.com`, `i.redd.it`) redirect a direct image link to their HTML page,
+  which a preview shows without its scripts.
+- **The output guard judges on `judge.model` when it has no model of its own (#1291).** With
+  `judge.output_guard_model` empty, the guard's LLM stage ran on the session's model, the model
+  whose tool output it judges. It now uses `judge.model`, and the session's model only when that is
+  empty too; a set alias that is not registered is passed over with a warning. Installs that set
+  `judge.model` but not `judge.output_guard_model` switch the guard's model on upgrade: the guard
+  then shares that alias's `max_concurrency` with the intent judge, and long tool output may exceed
+  a small judge's context window, which skips the LLM stage for that result. Set
+  `judge.output_guard_model` to keep a separate model for the guard. A workstream's own judge model
+  (the launcher's judge picker, the create API's `judge_model`, the CLI's `--judge-model`) is that
+  workstream's `judge.model`, so it runs the guard too unless `judge.output_guard_model` is set.
 - **Model selection is explicit (#1359).** A missing, disabled, or unreadable
   model is no longer silently replaced. New work that depends on it fails with
   a useful error; an existing workstream keeps its selected model and waits for
