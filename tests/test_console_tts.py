@@ -9,6 +9,7 @@ affordances on.  ``synthesize`` is mocked: no backend is ever called.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -20,7 +21,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from tests._coord_test_helpers import _AuthMiddleware, _FakeConfigStore
-from turnstone.console.server import list_available_models, text_to_speech
+from turnstone.console.server import list_available_models, list_tts_styles, text_to_speech
 from turnstone.core.audio import AudioBackendError, AudioUnavailableError, SpeechResult
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 from turnstone.core.web_helpers import SpeechCapacity
@@ -44,8 +45,8 @@ class _Registry:
         return ""
 
 
-def _cfg(model: str) -> SimpleNamespace:
-    return SimpleNamespace(provider="openai", model=model, capabilities={})
+def _cfg(model: str, capabilities: dict[str, Any] | None = None) -> SimpleNamespace:
+    return SimpleNamespace(provider="openai", model=model, capabilities=capabilities or {})
 
 
 _SETTINGS = {
@@ -86,6 +87,7 @@ def _client(
     app = Starlette(
         routes=[
             Route("/v1/api/tts", text_to_speech, methods=["POST"]),
+            Route("/v1/api/tts/styles", list_tts_styles),
             Route("/v1/api/models", list_available_models),
         ],
         middleware=[Middleware(_AuthMiddleware)],
@@ -133,6 +135,133 @@ def test_cancel_ref_is_aborted_after_synthesis() -> None:
     # abort() in ``finally`` is what releases an in-flight backend stream when
     # the client disconnects; it must also run on the success path.
     assert synth.call_args.kwargs["cancel_ref"].aborted
+
+
+# ---------------------------------------------------------------------------
+# speaking styles
+# ---------------------------------------------------------------------------
+
+_STYLES = json.dumps(
+    [
+        {"name": "Professional", "instruction": "Calm and even.", "in_menu": True},
+        {"name": "Plain", "instruction": "", "in_menu": False},
+    ]
+)
+
+_INSTRUCTION_CAPS = {
+    "supports_speech_synthesis": True,
+    "supports_speech_instructions": True,
+}
+
+
+def _instruction_registry() -> _Registry:
+    return _Registry(
+        {
+            "voice-tts": _cfg("gpt-4o-mini-tts-", _INSTRUCTION_CAPS),
+            "voice-stt": _cfg("whisper-1"),
+        }
+    )
+
+
+def _style_settings(**overrides: Any) -> dict[str, Any]:
+    return {**_SETTINGS, "audio.tts_styles": _STYLES, **overrides}
+
+
+def _post_tts(client: TestClient, body: dict[str, Any]) -> tuple[Any, Any]:
+    with patch("turnstone.core.audio.synthesize", return_value=_speech()) as synth:
+        resp = client.post("/v1/api/tts", json=body)
+    return resp, synth
+
+
+def test_body_style_is_resolved_to_its_instruction() -> None:
+    resp, synth = _post_tts(
+        _client(settings=_style_settings(), registry=_instruction_registry()),
+        {"text": "hi", "style": "professional"},  # match is case-insensitive
+    )
+    assert resp.status_code == 200, resp.text
+    assert synth.call_args.kwargs["instructions"] == "Calm and even."
+
+
+@pytest.mark.parametrize("body", [{"text": "hi"}, {"text": "hi", "style": None}])
+def test_absent_or_null_style_uses_the_configured_default(body: dict[str, Any]) -> None:
+    resp, synth = _post_tts(
+        _client(
+            settings=_style_settings(**{"audio.tts_style": "Professional"}),
+            registry=_instruction_registry(),
+        ),
+        body,
+    )
+    assert resp.status_code == 200, resp.text
+    assert synth.call_args.kwargs["instructions"] == "Calm and even."
+
+
+@pytest.mark.parametrize("style", ["No Such Style", ""])
+def test_unknown_or_empty_style_sends_no_instruction(style: str) -> None:
+    # An explicit "" suppresses the configured default rather than selecting it;
+    # an unknown name is never a 400 — the clip still plays, plainly.
+    resp, synth = _post_tts(
+        _client(
+            settings=_style_settings(**{"audio.tts_style": "Professional"}),
+            registry=_instruction_registry(),
+        ),
+        {"text": "hi", "style": style},
+    )
+    assert resp.status_code == 200, resp.text
+    assert synth.call_args.kwargs["instructions"] == ""
+
+
+def test_style_with_no_instruction_sends_nothing() -> None:
+    resp, synth = _post_tts(
+        _client(settings=_style_settings(), registry=_instruction_registry()),
+        {"text": "hi", "style": "Plain"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert synth.call_args.kwargs["instructions"] == ""
+
+
+def test_style_is_ignored_when_the_model_lacks_instruction_support() -> None:
+    resp, synth = _post_tts(
+        _client(settings=_style_settings()),  # default registry model has no flag
+        {"text": "hi", "style": "Professional"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert synth.call_args.kwargs["instructions"] == ""
+
+
+def test_styles_lists_names_and_menu_flags_without_instructions() -> None:
+    resp = _client(settings=_style_settings()).get("/v1/api/tts/styles")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "styles": [
+            {"name": "Professional", "in_menu": True},
+            {"name": "Plain", "in_menu": False},
+        ],
+        "default": "",
+        "instructions_supported": False,
+        "playback_rate": 1.0,
+    }
+
+
+def test_styles_default_is_the_configured_setting() -> None:
+    resp = _client(settings=_style_settings(**{"audio.tts_style": "Professional"})).get(
+        "/v1/api/tts/styles"
+    )
+    assert resp.json()["default"] == "Professional"
+
+
+def test_styles_reports_instruction_support_for_a_capable_tts_role() -> None:
+    resp = _client(settings=_style_settings(), registry=_instruction_registry()).get(
+        "/v1/api/tts/styles"
+    )
+    assert resp.json()["instructions_supported"] is True
+
+
+def test_styles_report_no_instruction_support_without_a_tts_role() -> None:
+    client = _client(settings=_style_settings(), registry=_instruction_registry())
+    client.app.state.config_store = _FakeConfigStore(  # type: ignore[attr-defined]
+        {k: v for k, v in _style_settings().items() if k != "audio.tts_model_alias"}
+    )
+    assert client.get("/v1/api/tts/styles").json()["instructions_supported"] is False
 
 
 @pytest.mark.parametrize("body", [{}, {"text": ""}, {"text": "   "}, {"text": None}])
@@ -280,3 +409,11 @@ def test_models_role_aliases_blank_without_config_store(storage: Any) -> None:
     body = client.get("/v1/api/models").json()
     assert body["tts_default_alias"] == ""
     assert body["stt_default_alias"] == ""
+
+
+def test_styles_reports_the_admin_playback_rate() -> None:
+    client = _client(settings=_style_settings(**{"audio.tts_playback_rate": 1.25}))
+    assert client.get("/v1/api/tts/styles").json()["playback_rate"] == 1.25
+    assert (
+        _client(settings=_style_settings()).get("/v1/api/tts/styles").json()["playback_rate"] == 1.0
+    )

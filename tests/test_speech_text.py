@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
 
 from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
+from turnstone.core.voice_config import DictionaryEntry, parse_dictionary
 
 RULE_CASES: list[tuple[str, str]] = [
     # symbols
@@ -297,6 +299,107 @@ class TestPronunciations:
 
     def test_parse_value_with_equals(self) -> None:
         assert parse_pronunciations("a = b = c") == {"a": "b = c"}
+
+
+def _entry(
+    term: str,
+    respelling: str,
+    *,
+    match_case: bool = False,
+    kind: str = "respelling",
+    ipa: str = "",
+    also_hears: tuple[str, ...] = (),
+) -> DictionaryEntry:
+    return DictionaryEntry(term, kind, respelling, ipa, match_case, also_hears)
+
+
+class TestVoiceDictionary:
+    def test_entry_is_applied(self) -> None:
+        assert normalize_for_speech("Use SQL", None, [_entry("SQL", "sequel")]) == "Use sequel"
+
+    def test_dictionary_beats_legacy_pronunciations(self) -> None:
+        entries = [_entry("SQL", "sequel")]
+        assert normalize_for_speech("Use SQL", {"SQL": "ess cue ell"}, entries) == "Use sequel"
+
+    def test_dictionary_beats_built_in_terms(self) -> None:
+        assert normalize_for_speech("the YAML file", None, []) == "the yammel file"
+        entries = [_entry("YAML", "why-ammel")]
+        assert normalize_for_speech("the YAML file", None, entries) == "the why-ammel file"
+
+    def test_match_case_false_is_case_insensitive(self) -> None:
+        entries = [_entry("Turnstone", "turn stone")]
+        assert (
+            normalize_for_speech("Turnstone and turnstones", None, entries)
+            == "turn stone and turnstones"
+        )
+        assert normalize_for_speech("turnstone", None, entries) == "turn stone"
+
+    def test_match_case_true_is_exact_case(self) -> None:
+        entries = [_entry("BAA", "B A A", match_case=True)]
+        assert normalize_for_speech("the sheep said baa", None, entries) == "the sheep said baa"
+        assert normalize_for_speech("BAA is the code", None, entries) == "B A A is the code"
+        assert normalize_for_speech("Baa is not BAA", None, entries) == "Baa is not B A A"
+
+    def test_case_sensitive_entry_wins_over_case_insensitive(self) -> None:
+        # Input order deliberately puts the broader entry first.
+        entries = [_entry("baa", "bah"), _entry("BAA", "B A A", match_case=True)]
+        assert normalize_for_speech("BAA", None, entries) == "B A A"
+        assert normalize_for_speech("baa", None, entries) == "bah"
+        assert normalize_for_speech("Baa", None, entries) == "bah"
+
+    def test_longest_key_first(self) -> None:
+        entries = [_entry("C", "see"), _entry("C++", "see plus plus")]
+        assert normalize_for_speech("C++ and C", None, entries) == "see plus plus and see"
+
+    def test_longer_key_beats_shorter_case_sensitive_key(self) -> None:
+        # Length ordering applies before the case-sensitive tie-break: the
+        # longer, case-insensitive entry must own the whole token.
+        entries = [_entry("C", "see", match_case=True), _entry("c++", "see plus plus")]
+        assert normalize_for_speech("C++", None, entries) == "see plus plus"
+
+    def test_replacement_is_not_rescanned(self) -> None:
+        entries = [_entry("foo", "bar"), _entry("bar", "baz")]
+        assert normalize_for_speech("foo bar", None, entries) == "bar baz"
+
+    def test_empty_respelling_is_dictation_only(self) -> None:
+        entries = [_entry("nginx", "", also_hears=("engine x",))]
+        assert normalize_for_speech("run nginx", None, entries) == "run nginx"
+        # The entry is skipped, so a legacy pronunciation for the same word stands.
+        assert normalize_for_speech("run nginx", {"nginx": "engine ex"}, entries) == "run engine ex"
+
+    def test_ipa_entry_reads_aloud_from_respelling(self) -> None:
+        entries = [
+            _entry(
+                "nginx", "engine ex", kind="ipa", ipa="/\u02c8\u025bnd\u0292\u026an \u02c8\u025bks/"
+            )
+        ]
+        assert normalize_for_speech("run nginx", None, entries) == "run engine ex"
+
+    def test_ipa_entry_without_respelling_is_dictation_only(self) -> None:
+        entries = [
+            _entry("nginx", "", kind="ipa", ipa="/\u02c8\u025bnd\u0292\u026an \u02c8\u025bks/")
+        ]
+        assert normalize_for_speech("run nginx", None, entries) == "run nginx"
+
+    def test_key_is_literal_and_whole_word(self) -> None:
+        entries = [_entry("a.b", "ay bee")]
+        assert normalize_for_speech("a.b ok axb", None, entries) == "ay bee ok axb"
+
+    def test_applied_after_the_rules(self) -> None:
+        assert (
+            normalize_for_speech("v1.2.3 is ready", None, [_entry("point", "dot")])
+            == "version 1 dot 2 dot 3 is ready"
+        )
+
+    def test_parsed_dictionary_entries_work(self) -> None:
+        entries = parse_dictionary(
+            json.dumps([{"term": "SQL", "respelling": "sequel", "match_case": False}])
+        )
+        assert normalize_for_speech("Use SQL", None, entries) == "Use sequel"
+
+    def test_none_and_empty_dictionary_are_noops(self) -> None:
+        assert normalize_for_speech("the YAML file", None, None) == "the yammel file"
+        assert normalize_for_speech("the YAML file", None, []) == "the yammel file"
 
 
 class TestUnicodeCaseFolds:

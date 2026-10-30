@@ -1734,6 +1734,22 @@ async def text_to_speech(request: Request) -> Response:
     )
 
 
+async def list_tts_styles(request: Request) -> JSONResponse:
+    """GET /v1/api/tts/styles — speaking styles for coordinator read-aloud.
+
+    Mirrors the node's route against the coordinator registry (``coord_registry``),
+    so the picker offers the same choices wherever a reply is read aloud.
+    """
+    from turnstone.core.web_helpers import tts_styles_payload
+
+    return JSONResponse(
+        tts_styles_payload(
+            config_store=getattr(request.app.state, "config_store", None),
+            registry=getattr(request.app.state, "coord_registry", None),
+        )
+    )
+
+
 async def _authorize_coordinator_ws(request: Request, ws_id: str) -> JSONResponse | None:
     """Gate a speech-to-text request on the caller's access to coordinator ``ws_id``.
 
@@ -18287,6 +18303,7 @@ def create_app(
                     Route("/api/route", route_lookup, methods=["GET"]),
                     Route("/api/models", list_available_models),
                     Route("/api/tts", text_to_speech, methods=["POST"]),
+                    Route("/api/tts/styles", list_tts_styles),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
