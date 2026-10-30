@@ -147,6 +147,7 @@ from turnstone.core.storage import (
     WorkstreamLeaseLostError,
 )
 from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
+from turnstone.core.voice_config import VOICE_MEMORY_SCOPE
 from turnstone.core.web_helpers import (
     WORKSTREAM_UNREADABLE_CODE,
     RevalidatingStaticFiles,
@@ -1748,6 +1749,20 @@ async def list_tts_styles(request: Request) -> JSONResponse:
             config_store=getattr(request.app.state, "config_store", None),
             registry=getattr(request.app.state, "coord_registry", None),
         )
+    )
+
+
+async def stt_config(request: Request) -> JSONResponse:
+    """GET /v1/api/stt/config — the browser-side dictation knobs.
+
+    Coordinator sessions run in the console, so the console's own composers
+    must be able to read its settings without a node in between; the payload is
+    the node's, served from this process's config store.
+    """
+    from turnstone.core.web_helpers import stt_config_payload
+
+    return JSONResponse(
+        stt_config_payload(config_store=getattr(request.app.state, "config_store", None))
     )
 
 
@@ -10244,9 +10259,10 @@ def _memory_scope_label(
     scope: str, scope_id: str, storage: Any, cache: dict[tuple[str, str], str]
 ) -> str:
     """Resolve a memory's ``scope_id`` to a human label — username for user /
-    coordinator scope, workstream title for workstream scope, project name for
-    project scope.  Cached per (scope, scope_id) so a list of 200 memories costs
-    one lookup per distinct target; falls back to the raw id on miss/error."""
+    coordinator / voice scope, workstream title for workstream scope, project
+    name for project scope.  Cached per (scope, scope_id) so a list of 200
+    memories costs one lookup per distinct target; falls back to the raw id on
+    miss/error."""
     if not scope_id:
         return ""
     key = (scope, scope_id)
@@ -10254,7 +10270,7 @@ def _memory_scope_label(
         return cache[key]
     label = scope_id
     try:
-        if scope in ("user", "coordinator"):
+        if scope in ("user", "coordinator", VOICE_MEMORY_SCOPE):
             user = storage.get_user(scope_id)
             label = (user or {}).get("username") or scope_id
         elif scope == "workstream":
@@ -18305,6 +18321,7 @@ def create_app(
                     Route("/api/models", list_available_models),
                     Route("/api/tts", text_to_speech, methods=["POST"]),
                     Route("/api/tts/styles", list_tts_styles),
+                    Route("/api/stt/config", stt_config),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),

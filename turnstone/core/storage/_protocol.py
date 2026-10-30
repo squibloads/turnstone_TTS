@@ -3321,6 +3321,55 @@ class StorageBackend(Protocol):
         the flag on other personas sharing a kind."""
         ...
 
+    # -- Voice reports ----------------------------------------------------------
+    # A voice coordinator never blocks its turn on a child.  A finished child
+    # leaves a row here; the next genuine user turn offers the outstanding
+    # reports.  Rows outlive the session, so the queue survives a resume.
+    # Dict shape: every column as a string (``state`` is one of
+    # ``voice_config.VOICE_REPORT_STATES``), ordered oldest first.
+
+    def create_voice_report(
+        self,
+        coord_ws_id: str,
+        child_ws_id: str,
+        title: str,
+        body: str,
+        *,
+        report_id: str = "",
+        state: str = "pending",
+    ) -> dict[str, Any]:
+        """Insert one report and return its stored row.
+
+        ``report_id`` defaults to a fresh uuid hex.  Raises ValueError on an
+        empty coordinator/child id, an unknown ``state``, or a title/body
+        over the storage-edge caps (see ``_utils``).  A duplicate explicit
+        ``report_id`` also raises rather than overwriting a live report.
+        """
+        ...
+
+    def list_voice_reports(
+        self,
+        coord_ws_id: str,
+        states: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return one coordinator's reports, oldest first.
+
+        ``states`` narrows to those lifecycle values (``None`` = every
+        state); an empty iterable returns nothing.  An unknown state raises
+        ValueError, so a typo cannot masquerade as "no reports".
+        """
+        ...
+
+    def update_voice_report_state(self, report_id: str, state: str) -> bool:
+        """Move one report to ``state``; return whether the row existed.
+
+        An unknown state raises ValueError.  Transitions are not ordered here
+        — the lifecycle rules live with the producers (capture writes
+        ``pending``, the offer marks ``offered``, the tool reads/dismisses) —
+        so a caller can also repair a row without a state machine in storage.
+        """
+        ...
+
     # -- Prompt policies -------------------------------------------------------
 
     def list_prompt_policies(self, org_id: str = "") -> list[dict[str, Any]]:

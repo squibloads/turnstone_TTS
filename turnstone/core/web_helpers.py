@@ -596,8 +596,9 @@ def tts_style_instruction(
 
 def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, Any]:
     """The body of ``GET /v1/api/tts/styles``: the style picker's choices, the
-    admin playback rate every read-aloud plays at, and the active model's
-    pacing profile.
+    admin playback rate every read-aloud plays at, the active model's pacing
+    profile, and whether replies are read aloud while they are still being
+    written.
 
     Instruction text never leaves the server; the browser only needs names and
     ``in_menu``.  ``instructions_supported`` is the exact gate the POST path
@@ -621,6 +622,7 @@ def tts_styles_payload(*, config_store: Any, registry: Any | None) -> dict[str, 
         "instructions_supported": supported,
         "playback_rate": _tts_playback_rate(config_store),
         "profile": _tts_profile(config_store, alias),
+        "stream": _tts_stream_enabled(config_store),
     }
 
 
@@ -641,6 +643,17 @@ def _tts_profile(config_store: Any, alias: str | None) -> dict[str, Any]:
     return profile_json(resolve_profile(profiles, alias or ""))
 
 
+def _tts_stream_enabled(config_store: Any) -> bool:
+    """``audio.tts_stream`` for the player; missing or store-less reads as off.
+
+    It rides the styles probe for the same reason the playback rate and profile
+    do: that is the one read-aloud config fetch the player already makes per
+    transport base.  Off is the pre-streaming behaviour — read a finished reply
+    only — so every failure mode falls back to it.
+    """
+    return bool(config_store.get("audio.tts_stream")) if config_store is not None else False
+
+
 def _tts_playback_rate(config_store: Any) -> float:
     """``audio.tts_playback_rate`` for the player; anything unusable reads as 1.0.
 
@@ -653,6 +666,66 @@ def _tts_playback_rate(config_store: Any) -> float:
     except (TypeError, ValueError):
         return 1.0
     return rate if 0.5 <= rate <= 2.0 else 1.0
+
+
+def _stt_bool(raw: Any) -> bool:
+    """A stored flag as the detector should see it.
+
+    ``ConfigStore`` hands back typed values, but a degraded store or a raw row
+    may hand back ``None`` or a string; only an explicit truthy spelling turns
+    auto-stop on, so a missing setting can never start watching the mic.
+    """
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("true", "1", "yes")
+    return bool(raw)
+
+
+def stt_config_payload(*, config_store: Any) -> dict[str, Any]:
+    """The body of ``GET /v1/api/stt/config``: the browser-side dictation knobs.
+
+    Auto-stop is decided frame by frame in the browser, so the mic module needs
+    these at recording time rather than when a page loads.  The route rides the
+    same transport base as the clip upload, which is what lets a console pane
+    read the settings of the node hosting its session.  Defaults and bounds come
+    from the settings registry, so a stored value and this fallback cannot
+    drift; an unusable value degrades per field rather than breaking dictation.
+    """
+    from math import isfinite
+
+    from turnstone.core.settings_registry import SETTINGS
+
+    def raw(key: str) -> Any:
+        return config_store.get(key) if config_store is not None else None
+
+    silence = SETTINGS["audio.stt_silence_ms"]
+    try:
+        silence_ms = int(raw(silence.key))
+    except (TypeError, ValueError):
+        silence_ms = silence.default
+    if silence.min_value is not None and silence_ms < silence.min_value:
+        silence_ms = int(silence.min_value)
+    if silence.max_value is not None and silence_ms > silence.max_value:
+        silence_ms = int(silence.max_value)
+
+    threshold = SETTINGS["audio.stt_vad_threshold"]
+    try:
+        vad_threshold = float(raw(threshold.key))
+    except (TypeError, ValueError):
+        vad_threshold = threshold.default
+    if not isfinite(vad_threshold):
+        vad_threshold = threshold.default
+    if threshold.min_value is not None and vad_threshold < threshold.min_value:
+        vad_threshold = float(threshold.min_value)
+    if threshold.max_value is not None and vad_threshold > threshold.max_value:
+        vad_threshold = float(threshold.max_value)
+
+    return {
+        "auto_stop": _stt_bool(raw("audio.stt_auto_stop")),
+        "silence_ms": silence_ms,
+        "vad_threshold": vad_threshold,
+    }
 
 
 async def text_to_speech_response(
@@ -1363,7 +1436,7 @@ def cors_middleware(origins: list[str]) -> Middleware:
 # policy.  These directories already carry their library version in the URL,
 # so their contents can be cached immutably; every other first-party asset must
 # revalidate because ES-module imports do not inherit the entry module's ?v=.
-_VERSIONED_VENDOR_DIR = r"(?:katex|hljs|hls|mermaid|inter|jetbrains-mono|dejavu-sans)-\d+(?:\.\d+)+"
+_VERSIONED_VENDOR_DIR = r"(?:katex|hljs|hls|mermaid|inter|jetbrains-mono|dejavu-sans|vad)-\d+(?:\.\d+)+"
 _VERSIONED_VENDOR_PATH_RE = re.compile(rf"^{_VERSIONED_VENDOR_DIR}/")
 
 

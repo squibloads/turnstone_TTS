@@ -27,6 +27,7 @@ _NOTICE_NAMES = {
     "jetbrains-mono": "JetBrains Mono",
     "katex": "KaTeX",
     "mermaid": "Mermaid",
+    "vad": "@ricky0123/vad-web",
 }
 # The line of "=" signs between sections; the text before the first is the
 # preamble.

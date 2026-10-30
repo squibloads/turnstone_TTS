@@ -656,6 +656,53 @@ def _build_registry() -> dict[str, SettingDef]:
             reference_url=VOICE_DOCS_URL + "#transcription-prompt",
         ),
         SettingDef(
+            "audio.stt_auto_stop",
+            "bool",
+            False,
+            "Stop dictation automatically when you stop talking",
+            "audio",
+            help="When on, the microphone listens for the end of your speech and stops "
+            "recording by itself, so you click once instead of twice. If the speech "
+            "detector cannot load in your browser, the mic falls back to click-to-stop.",
+            reference_url=VOICE_DOCS_URL + "#auto-stop",
+        ),
+        SettingDef(
+            "audio.stt_silence_ms",
+            "int",
+            900,
+            "Silence (ms) before dictation auto-stops",
+            "audio",
+            min_value=300,
+            max_value=5000,
+            help="How long you must be quiet before auto-stop ends the recording. Raise "
+            "it if dictation cuts you off mid-thought; lower it for snappier turns.",
+            reference_url=VOICE_DOCS_URL + "#auto-stop",
+        ),
+        SettingDef(
+            "audio.stt_vad_threshold",
+            "float",
+            0.5,
+            "Speech probability that counts as talking",
+            "audio",
+            min_value=0.1,
+            max_value=0.9,
+            help="Auto-stop treats audio at or above this speech probability as you "
+            "talking, and audio below this value minus 0.15 as silence. Raise it in a "
+            "noisy room; lower it if quiet speech is missed.",
+            reference_url=VOICE_DOCS_URL + "#auto-stop",
+        ),
+        SettingDef(
+            "audio.tts_stream",
+            "bool",
+            False,
+            "Read replies aloud while they are still being written",
+            "audio",
+            help="When on, read-aloud starts speaking each sentence as soon as it is "
+            "complete instead of waiting for the whole reply. Off by default until "
+            "the timing is proven on this deployment.",
+            reference_url=VOICE_DOCS_URL + "#streaming-read-aloud",
+        ),
+        SettingDef(
             "audio.tts_model_alias",
             "str",
             "",
@@ -1233,6 +1280,17 @@ def _build_registry() -> dict[str, SettingDef]:
             "alias instead of the default model, so it never waits on a model that is "
             "not loaded. Empty falls back to the normal default model.",
             reference_url=VOICE_DOCS_URL + "#voice-persona",
+        ),
+        SettingDef(
+            "coordinator.voice_report_chime",
+            "bool",
+            False,
+            "Chime when an agent report is waiting in a voice session",
+            "coordinator",
+            help="Applies only to voice sessions. When an agent finishes and nobody has "
+            "spoken for a while, play a short chime and show a badge instead of "
+            "speaking. The report is still offered on your next turn either way.",
+            reference_url=VOICE_DOCS_URL + "#agent-reports",
         ),
         SettingDef(
             "coordinator.session_jwt_ttl_seconds",

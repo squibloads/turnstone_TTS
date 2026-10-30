@@ -877,3 +877,8 @@ def is_voice_persona(name: str | None) -> bool:
     """Persona names arrive from session config, API bodies and tool args with
     inconsistent case and padding; one forgiving check keeps them agreeing."""
     return (name or "").strip().lower() == VOICE_PERSONA
+
+
+# Lifecycle of a finished agent's report in a voice session: written pending,
+# offered on the next spoken turn, then read or dismissed by the user.
+VOICE_REPORT_STATES = ("pending", "offered", "read", "dismissed")
