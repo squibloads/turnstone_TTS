@@ -641,6 +641,30 @@ function confirmRemoveUserPicture(userId, username) {
   );
 }
 
+// An unlink or a user deletion can't always confirm that every process dropped the user's cached
+// model tokens; a process it names keeps serving them until they expire.
+function _toastUnconfirmedEviction(done, data) {
+  // Fails closed: only a reply that says "ok" and names no host gets the plain toast; an
+  // unreadable reply ({}) or one the server could not complete warns.
+  const unconfirmed = (data && data.model_memo_unconfirmed) || [];
+  if (unconfirmed.length) {
+    showToast(
+      done +
+        ", but cached tokens may stay on " +
+        unconfirmed.join(", ") +
+        " until they expire",
+      "warn",
+    );
+  } else if (!data || data.status !== "ok") {
+    showToast(
+      done + ", but part of the result could not be confirmed; check the audit log",
+      "warn",
+    );
+  } else {
+    showToast(done);
+  }
+}
+
 function confirmDeleteUser(userId, username) {
   showConfirmModal(
     "Delete User",
@@ -654,7 +678,12 @@ function confirmDeleteUser(userId, username) {
       })
         .then(function (r) {
           if (!r.ok) throw new Error("Delete failed");
-          showToast("User '" + username + "' deleted");
+          return r.json().catch(function () {
+            return {};
+          });
+        })
+        .then(function (data) {
+          _toastUnconfirmedEviction("User '" + username + "' deleted", data);
           loadAdminUsers();
         })
         .catch(function () {
@@ -827,7 +856,7 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
       shortSubject +
       "\u2019 from user " +
       username +
-      "?\n\nThe user will need to log in via OIDC again to re-link.",
+      "?\n\nTheir next OIDC sign-in will create a new user; this account stays, unlinked.",
     "Unlink",
     function () {
       authFetch(
@@ -839,7 +868,12 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
       )
         .then(function (r) {
           if (!r.ok) throw new Error("Unlink failed");
-          showToast("OIDC identity unlinked");
+          return r.json().catch(function () {
+            return {};
+          });
+        })
+        .then(function (data) {
+          _toastUnconfirmedEviction("OIDC identity unlinked", data);
           // Refresh the panel content in place (no close/reopen flicker)
           const allRows = document.querySelectorAll(
             "#admin-users-table .admin-row[data-expandable]",
@@ -4648,11 +4682,12 @@ function _renderMcpServers(items) {
     const detailAttr = isConfig
       ? 'data-mcp-detail-name="' + escapeHtml(s.name) + '"'
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
-    // Phase 9: surface the connect/bulk-revoke affordances only for
-    // user-OAuth servers, and bulk-revoke only once a user has consented.
-    // oauth_obo has NO per-server connect (it uses the org sign-in); its
-    // "flush cache" drops minted tokens so users re-mint (honest label — it is
-    // not a durable revoke; that is governed by the identity provider).
+    // Phase 9: surface the connect/bulk-revoke affordances only for user-OAuth
+    // servers, connect only while the server is enabled (/start answers a
+    // disabled one as unknown), and bulk-revoke only once a user has consented.
+    // oauth_obo has NO per-server connect (it uses the org sign-in); its "flush
+    // cache" drops minted tokens so users re-mint (honest label — it is not a
+    // durable revoke; that is governed by the identity provider).
     const isOauth = s.auth_type === "oauth_user";
     const isObo = s.auth_type === "oauth_obo";
     const consentCount =
@@ -4660,7 +4695,7 @@ function _renderMcpServers(items) {
     const actions = _kebabMenu([
       { label: "refresh", attrs: { "data-mcp-refresh": s.name } },
       { label: "reconnect", attrs: { "data-mcp-reconnect": s.name } },
-      isOauth
+      isOauth && s.enabled
         ? { label: "connect", attrs: { "data-mcp-oauth-connect": s.name } }
         : null,
       isOauth && consentCount > 0
