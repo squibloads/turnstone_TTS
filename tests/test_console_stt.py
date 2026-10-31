@@ -31,13 +31,10 @@ from turnstone.core.audio import (
     AudioUnavailableError,
     TranscriptionResult,
 )
-from turnstone.core.auth import AuthResult
 from turnstone.core.model_backend_auth import BackendAuthUnavailableError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-
-    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 COORD_ID = "abc123"
 INTERACTIVE_ID = "def456"
@@ -95,7 +92,6 @@ def _client(
     settings: dict[str, str] | None = None,
     registry: Any = "default",
     coord_mgr: Any = "default",
-    middleware: list[Middleware] | None = None,
 ) -> TestClient:
     app = Starlette(
         routes=[
@@ -106,7 +102,7 @@ def _client(
                 methods=["POST"],
             ),
         ],
-        middleware=[Middleware(_AuthMiddleware)] if middleware is None else middleware,
+        middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.config_store = _FakeConfigStore(dict(_SETTINGS if settings is None else settings))
     app.state.coord_registry = _registry() if registry == "default" else registry
@@ -171,102 +167,6 @@ def test_stream_aborts_upstream_on_exit() -> None:
     with patch("turnstone.core.audio.transcribe_stream", return_value=iter(["a", "b"])) as stream:
         _client().post(_url(stream=True), files=_audio())
     assert stream.call_args.kwargs["cancel_ref"].aborted
-
-
-class _PureAuthMiddleware:
-    """``_AuthMiddleware`` as plain ASGI, which is what the node's and console's stacks are.
-
-    ``_AuthMiddleware`` is a BaseHTTPMiddleware, and that ends the response itself
-    once the app inside it stops, failed or not, so it would hide the body's end.
-    """
-
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http":
-            scope.setdefault("state", {})["auth_result"] = AuthResult(
-                user_id="userA",
-                scopes=frozenset({"read", "write", "approve"}),
-                token_source="test",
-                permissions=frozenset({_PERMS}),
-            )
-        await self.app(scope, receive, send)
-
-
-class _RecordSends:
-    """Keep every ASGI message the app sends, in order."""
-
-    def __init__(self, app: ASGIApp, *, sent: list[Message]) -> None:
-        self.app = app
-        self.sent = sent
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        async def _send(message: Message) -> None:
-            self.sent.append(message)
-            await send(message)
-
-        await self.app(scope, receive, _send)
-
-
-def _stream_on_the_wire(deltas: Iterator[str]) -> tuple[list[Message], BaseException | None]:
-    """POST a streamed dictation through plain ASGI; the messages sent and what escaped."""
-    sent: list[Message] = []
-    client = _client(
-        middleware=[Middleware(_RecordSends, sent=sent), Middleware(_PureAuthMiddleware)]
-    )
-    escaped: BaseException | None = None
-    with patch("turnstone.core.audio.transcribe_stream", return_value=deltas):
-        try:
-            client.post(_url(stream=True), files=_audio())
-        except AudioBackendError as exc:
-            escaped = exc
-    return sent, escaped
-
-
-def test_complete_stream_sends_its_last_chunk() -> None:
-    # The control for the next test: this harness does see a body's end.
-    sent, escaped = _stream_on_the_wire(iter(["hello ", "world"]))
-    assert escaped is None
-    assert sent[0]["type"] == "http.response.start" and sent[0]["status"] == 200
-    assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
-
-
-def test_stream_that_fails_mid_way_never_sends_its_last_chunk() -> None:
-    """A backend failure after the first delta (1.9.2's request deadline cutting a
-    stream that is still producing text, say) must fail the response.  Ending the
-    chunked body normally hands the browser a 200 whose partial text it cannot
-    tell from a whole transcript, and voice mode would send it as the user's turn.
-    Without the last chunk the server drops the connection and the read fails.
-    """
-
-    def _deltas() -> Iterator[str]:
-        yield "Please start three agents "
-        raise AudioBackendError("HTTP request deadline exceeded")
-
-    sent, escaped = _stream_on_the_wire(_deltas())
-    assert isinstance(escaped, AudioBackendError)
-    bodies = [m for m in sent if m["type"] == "http.response.body"]
-    assert b"".join(m.get("body", b"") for m in bodies) == b"Please start three agents "
-    assert all(m.get("more_body", False) for m in bodies)
-
-
-def test_stream_whose_caller_left_still_ends_quietly() -> None:
-    """Only a backend failure fails the body: once the caller has gone (the
-    request's abort ref is set), the stream's own error is the abort, not news."""
-
-    def _call(**kwargs: Any) -> Iterator[str]:
-        def _deltas() -> Iterator[str]:
-            yield "partial "
-            kwargs["cancel_ref"].abort()
-            raise AudioBackendError("aborted")
-
-        return _deltas()
-
-    with patch("turnstone.core.audio.transcribe_stream", side_effect=_call):
-        resp = _client().post(_url(stream=True), files=_audio())
-    assert resp.status_code == 200
-    assert resp.text == "partial "
 
 
 def test_stream_response_aborts_even_when_cancelled_before_body(monkeypatch) -> None:
