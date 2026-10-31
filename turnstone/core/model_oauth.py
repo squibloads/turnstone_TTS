@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -22,7 +22,11 @@ from turnstone.core.oauth import locking as oauth_locking
 from turnstone.core.oauth import tokens as oauth_tokens
 from turnstone.core.oauth.context import OAuthContext, oauth_context
 from turnstone.core.oauth.runtime import ensure_oauth_runtime
-from turnstone.core.oauth.work import OAuthUnavailableError, durable_write
+from turnstone.core.oauth.work import (
+    OAuthRuntimeRefusedError,
+    OAuthUnavailableError,
+    durable_write,
+)
 from turnstone.core.token_store import crypto as token_store_crypto
 from turnstone.core.token_store import store as token_store_store
 
@@ -229,6 +233,10 @@ def _model_mint_memo(app_state: Any) -> dict[tuple[str, str], token_store_store.
     return memo
 
 
+def _memo_generation(app_state: Any, user_id: str) -> int:
+    return oauth_context(app_state).token_memo_generation.get(user_id, 0)
+
+
 def invalidate_model_mint_memo(
     app_state: Any,
     *,
@@ -239,13 +247,35 @@ def invalidate_model_mint_memo(
 
     This must run on the OAuth loop. OIDC unlink schedules it there
     alongside deleting the corresponding DB rows, so the in-process fast path
-    cannot extend a revoked bearer beyond the purge.
+    cannot extend a revoked bearer beyond the purge. It also bumps the
+    principal's generation, so a read or mint already in flight does not
+    memoize its token afterwards.
     """
+    generations = oauth_context(app_state).token_memo_generation
+    generations[user_id] = generations.get(user_id, 0) + 1
     memo = _model_mint_memo(app_state)
     keys = [key for key in memo if key[0] == user_id and key[1].startswith(server_prefix)]
     for key in keys:
         memo.pop(key, None)
     return len(keys)
+
+
+# How far back an unlink looks for nodes to drop a user's memoized delegated tokens (the console
+# reads the registry, where a node records a heartbeat every 30 s), and so how long one may sit in
+# a memo: a node the unlink cannot reach serves an evicted token for at most this long. The margin
+# covers the heartbeat interval.
+MEMO_EVICTION_WINDOW_S = 3600
+_MEMO_MAX_AGE_S = MEMO_EVICTION_WINDOW_S - 60
+
+
+def _memo_expiry(expires_at: str | None) -> str:
+    """The expiry a memo entry carries: the token's own, or ``_MEMO_MAX_AGE_S`` from now if
+    sooner. The token's row keeps its own, so an entry that ages out is read from it again."""
+    cap = datetime.now(UTC) + timedelta(seconds=_MEMO_MAX_AGE_S)
+    own = oauth_tokens._parse_iso_to_utc(expires_at or "")
+    if expires_at and own is not None and own <= cap:
+        return expires_at
+    return cap.replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 async def _serve_fresh_mint_cache(
@@ -264,6 +294,7 @@ async def _serve_fresh_mint_cache(
     if oauth_tokens._is_fresh_obo_cache_row(plain, audience, scopes) and plain is not None:
         return plain["access_token"]
     memo.pop(key, None)
+    generation = _memo_generation(app_state, user_id)
     try:
         plain = await asyncio.to_thread(token_store.get_user_token, user_id, cache_server)
     except token_store_crypto.TokenDecryptError:
@@ -271,7 +302,10 @@ async def _serve_fresh_mint_cache(
         return None
     if not oauth_tokens._is_fresh_obo_cache_row(plain, audience, scopes) or plain is None:
         return None
-    memo[key] = plain
+    if _memo_generation(app_state, user_id) != generation:
+        # Evicted while the row was being read: the read may predate a revocation.
+        return None
+    memo[key] = {**plain, "expires_at": _memo_expiry(plain.get("expires_at"))}
     return plain["access_token"]
 
 
@@ -285,15 +319,22 @@ def _memoize_minted_token(
     scopes: str,
     issuer: str,
     audience: str,
+    generation: int,
 ) -> None:
-    """Install a freshly minted token in the loop-local memo."""
+    """Install a freshly minted token in the loop-local memo.
+
+    *generation* is the principal's memo generation when the mint began; a token minted before
+    an eviction is not memoized after it.
+    """
+    if _memo_generation(app_state, user_id) != generation:
+        return
     now = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
     _model_mint_memo(app_state)[(user_id, cache_server)] = {
         "user_id": user_id,
         "token_key": cache_server,
         "access_token": access_token,
         "refresh_token": None,
-        "expires_at": expires_at,
+        "expires_at": _memo_expiry(expires_at),
         "scopes": scopes or None,
         "as_issuer": issuer,
         "audience": audience,
@@ -466,7 +507,10 @@ async def _mint_obo_access_token(
     Returns ``None`` — the signal for callers to fall back to their static
     credential — when OIDC is disabled/unconfigured, the profile has no mint
     leg or contradicts ``grant_leg``, the user has no captured credential (or
-    it won't decrypt), or the mint is rejected.  This is the model-provider
+    it won't decrypt), the mint is rejected, the minted token could not be
+    stored (the store could not confirm the credential still exists, which
+    arms the 30 s cooldown), or the credential was removed while the mint was
+    in flight.  This is the model-provider
     entry point; the MCP-server path uses
     :func:`get_obo_access_token_classified`, which additionally owns
     per-server cache rows, dead-grant classification, and consent affordances
@@ -616,6 +660,7 @@ async def _mint_obo_access_token(
             ):
                 return None
 
+            generation = _memo_generation(app_state, user_id)
             try:
                 credential = await asyncio.to_thread(
                     token_store.get_oidc_credential, user_id, issuer
@@ -703,7 +748,7 @@ async def _mint_obo_access_token(
                 tokens, default_ttl_seconds=oauth_tokens._OBO_DEFAULT_TTL_SECONDS
             )
             try:
-                await oauth_tokens._persist_obo_cache_row(
+                written = await oauth_tokens._persist_obo_cache_row(
                     token_store,
                     user_id,
                     cache_server,
@@ -714,12 +759,27 @@ async def _mint_obo_access_token(
                     audience=audience,
                 )
             except Exception:
+                # The write also checks that the credential still exists; a failed check is not
+                # a pass, so the token is not used.
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, user_id, cooldown_key
+                )
+                _record_mint_refusal_cause("model_obo", cause_key, user_id, "cache_persist_failed")
                 log.warning(
                     "model_obo.cache_persist_failed",
                     user_id=user_id,
                     audience=audience,
                     exc_info=True,
                 )
+                return None
+            if written not in ("stored", "already_stored"):
+                # Revoked while the mint was in flight.
+                oauth_tokens._arm_cooldown(
+                    oauth_context(app_state).coordination, user_id, cooldown_key
+                )
+                _record_mint_refusal_cause("model_obo", cause_key, user_id, "credential_removed")
+                log.info("model_obo.credential_removed_during_mint", user_id=user_id, alias=alias)
+                return None
             _memoize_minted_token(
                 app_state,
                 user_id=user_id,
@@ -729,6 +789,7 @@ async def _mint_obo_access_token(
                 scopes=scopes,
                 issuer=issuer,
                 audience=audience,
+                generation=generation,
             )
             oauth_tokens._clear_refresh_backoff(
                 oauth_context(app_state).coordination, user_id, cooldown_key
@@ -909,6 +970,7 @@ async def _mint_app_access_token(
                 oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
             ):
                 return None
+            app_generation = _memo_generation(app_state, _APP_CACHE_USER)
 
             try:
                 async with oauth_http._enter_mint_client(app_state) as mint_client:
@@ -941,7 +1003,7 @@ async def _mint_app_access_token(
                 tokens, default_ttl_seconds=oauth_tokens._OBO_DEFAULT_TTL_SECONDS
             )
             try:
-                await oauth_tokens._persist_obo_cache_row(
+                await oauth_tokens._persist_app_mint_cache_row(
                     token_store,
                     _APP_CACHE_USER,
                     cache_server,
@@ -962,6 +1024,7 @@ async def _mint_app_access_token(
                 scopes="",
                 issuer=issuer,
                 audience=audience,
+                generation=app_generation,
             )
             oauth_tokens._clear_refresh_backoff(
                 oauth_context(app_state).coordination, _APP_CACHE_USER, cooldown_key
@@ -987,15 +1050,22 @@ class ModelTokenClient(Protocol):
         scopes: str = "",
         grant_leg: str | None = None,
         timeout: float = 20.0,
+        deadline: float | None = None,
     ) -> str | None: ...
 
     def mint_app_token_sync(
-        self, *, alias: str, audience: str, timeout: float = 20.0
+        self, *, alias: str, audience: str, timeout: float = 20.0, deadline: float | None = None
     ) -> str | None: ...
 
     def invalidate_model_mint_memo_sync(
         self, *, user_id: str, server_prefix: str, timeout: float = 5.0
-    ) -> int: ...
+    ) -> int:
+        """Evict one user's memoized tokens under *server_prefix*; return how many were held.
+
+        Raises when the eviction cannot be confirmed, so a caller never reads a failure as
+        "nothing was held".
+        """
+        ...
 
 
 class OAuthModelTokenClient:
@@ -1013,11 +1083,13 @@ class OAuthModelTokenClient:
         scopes: str = "",
         grant_leg: str | None = None,
         timeout: float = 20.0,
+        deadline: float | None = None,
     ) -> str | None:
         if not user_id or not alias or not audience:
             return None
         try:
-            runtime = ensure_oauth_runtime(self.context)
+            deadline_kwargs = {"deadline": deadline} if deadline is not None else {}
+            runtime = ensure_oauth_runtime(self.context, **deadline_kwargs)
             if runtime is None:
                 return None
             return runtime.call_sync(
@@ -1030,6 +1102,7 @@ class OAuthModelTokenClient:
                     grant_leg=grant_leg,
                 ),
                 timeout=timeout,
+                **deadline_kwargs,
             )
         except MintDispatchContractError:
             log.error(
@@ -1046,12 +1119,13 @@ class OAuthModelTokenClient:
         return None
 
     def mint_app_token_sync(
-        self, *, alias: str, audience: str, timeout: float = 20.0
+        self, *, alias: str, audience: str, timeout: float = 20.0, deadline: float | None = None
     ) -> str | None:
         if not alias or not audience:
             return None
         try:
-            runtime = ensure_oauth_runtime(self.context)
+            deadline_kwargs = {"deadline": deadline} if deadline is not None else {}
+            runtime = ensure_oauth_runtime(self.context, **deadline_kwargs)
             if runtime is None:
                 return None
             return runtime.call_sync(
@@ -1059,6 +1133,7 @@ class OAuthModelTokenClient:
                     app_state=self.context, alias=alias, audience=audience
                 ),
                 timeout=timeout,
+                **deadline_kwargs,
             )
         except OAuthUnavailableError:
             log.warning("model app token mint unavailable alias=%s", alias)
@@ -1071,6 +1146,7 @@ class OAuthModelTokenClient:
     ) -> int:
         runtime = self.context.runtime
         if runtime is None:
+            # Tokens are memoized only on the runtime's loop: with none, nothing was held.
             return 0
 
         async def invalidate() -> int:
@@ -1080,8 +1156,9 @@ class OAuthModelTokenClient:
 
         try:
             return runtime.call_sync(invalidate, timeout=timeout)
-        except Exception:
-            log.warning("model token memo invalidation failed user=%s", user_id, exc_info=True)
+        except OAuthRuntimeRefusedError:
+            # A runtime that never started, or has stopped, serves no memo: every read of it runs
+            # as an operation on that runtime. Nothing it holds can be served, so nothing is held.
             return 0
 
 
