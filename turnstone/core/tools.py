@@ -109,9 +109,13 @@ _COORDINATOR_KIND_TOOLS = [
     for t in TOOLS
     if _META[t["function"]["name"]].get("coordinator")
 ]
-# ``"voice": true`` marks a tool that belongs to the voice persona only; it
-# rides TOOLS (and the coordinator-kind metadata) so the tool loader and
-# introspection see it, but it is not on the plain coordinator surface.
+# ``"voice": true`` takes a tool OFF the plain coordinator surface and leaves
+# it on the voice one.  It is subtractive, so it needs ``"coordinator": true``
+# as its carrier; the tool rides TOOLS (and the coordinator-kind metadata) so
+# the loader and introspection still see it.  A tool may also carry
+# ``"interactive": true`` (``open_preview``): voice is its own surface, sitting
+# between coordinator and interactive, so some tools belong to voice and
+# interactive while staying off the text coordinator shelf.
 COORDINATOR_TOOLS = [
     t for t in _COORDINATOR_KIND_TOOLS if not _META[t["function"]["name"]].get("voice")
 ]

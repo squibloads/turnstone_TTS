@@ -78,18 +78,73 @@ def test_a_voice_session_is_built_with_the_swap(storage: Any) -> None:
     voice = _voice_session()
     assert "voice_report" in _names(voice._tools)
     assert "wait_for_workstream" not in _names(voice._tools)
+    # #1442: the shelf fix must survive the session-build path, not just the
+    # module constant.
+    assert "open_preview" in _names(voice._tools)
 
     plain = _plainer_session()
     assert "wait_for_workstream" in _names(plain._tools)
     assert "voice_report" not in _names(plain._tools)
+    # #1442: the preview pane is the voice surface's, not the text
+    # coordinator's — voice sits between coordinator and interactive.
+    assert "open_preview" not in _names(plain._tools)
+
+
+def test_a_voice_session_prepares_a_local_preview(storage: Any) -> None:
+    """A voice turn can dispatch the tool without approval or a spinner."""
+    session = _voice_session()
+    item = session._prepare_tool(
+        {
+            "id": "c1",
+            "type": "function",
+            "function": {
+                "name": "open_preview",
+                "arguments": '{"target": "chart.png"}',
+            },
+        }
+    )
+    assert "error" not in item
+    assert item["target_kind"] == "path"
+    assert item["needs_approval"] is False
 
 
 def test_voice_surface_is_the_coordinator_surface_plus_the_swap() -> None:
-    # Nothing else may drift: the two lists differ by exactly one tool each
-    # way, so a later tool change cannot silently fall out of voice.
+    # Nothing else may drift: the two lists differ by exactly the voice-only
+    # tools one way and the voice-excluded wait the other, so a later tool
+    # change cannot silently fall out of voice.
     voice, plain = _names(VOICE_COORDINATOR_TOOLS), _names(COORDINATOR_TOOLS)
-    assert voice - plain == {"voice_report"}
+    assert voice - plain == {"voice_report", "open_preview"}
     assert plain - voice == {"wait_for_workstream"}
+
+
+def test_open_preview_is_voice_and_interactive_but_not_text_coordinator() -> None:
+    # #1442: the preview pane was a shelf gap, not a transport gap.  Voice is
+    # its own environment between coordinator and interactive, so this is one
+    # tool landing on voice AND interactive — not a dual-kind coordinator
+    # widening.
+    from turnstone.core.tools import INTERACTIVE_TOOLS
+
+    assert "open_preview" in _names(VOICE_COORDINATOR_TOOLS)
+    assert "open_preview" in _names(INTERACTIVE_TOOLS)
+    assert "open_preview" not in _names(COORDINATOR_TOOLS)
+
+
+def test_voice_open_preview_steers_away_from_url_targets() -> None:
+    # The voice persona does not browse the web, and a URL preview is
+    # approval-gated network egress.  The ``voice`` kind variant keeps the
+    # tool available while steering a spoken session to local/attachment
+    # targets.  Pinned loosely (phrases, not full prose) so wording edits
+    # do not turn this into a change detector.
+    from turnstone.core.tools import INTERACTIVE_TOOLS
+
+    voice = next(t for t in VOICE_COORDINATOR_TOOLS if t["function"]["name"] == "open_preview")
+    interactive = next(t for t in INTERACTIVE_TOOLS if t["function"]["name"] == "open_preview")
+    voice_desc = voice["function"]["description"].lower()
+    assert "do not open http(s) urls" in voice_desc
+    assert "attachment:" in voice_desc
+    assert voice["function"]["description"] != interactive["function"]["description"]
+    target_desc = voice["function"]["parameters"]["properties"]["target"]["description"]
+    assert "do not pass an http(s) url" in target_desc.lower()
 
 
 # ---------------------------------------------------------------------------

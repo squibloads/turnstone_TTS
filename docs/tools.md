@@ -37,6 +37,7 @@ set lives in `_META_KEYS` in `turnstone/core/tools.py`):
 | `task_agent`     | bool | Tool is available to task sub-agents. |
 | `coordinator`    | bool | Tool is available to coordinator sessions. Without `interactive: true` alongside it, this reads as coord-only and the tool is stripped from interactive sessions. |
 | `interactive`    | bool | Opt a `coordinator: true` tool back into interactive sessions (dual-kind tools like `memory`). |
+| `voice`          | bool | Voice-surface tool. Subtractive: it removes the tool from the text coordinator shelf (`COORDINATOR_TOOLS`) and leaves it on `VOICE_COORDINATOR_TOOLS`. Needs `coordinator: true` as its carrier, and may combine with `interactive: true` (see `voice_report.json`, `open_preview.json`). |
 | `auto_approve`   | bool | Tool runs without user confirmation (read-only, safe operations). |
 | `primary_key`    | str  | When the model sends a bare string instead of JSON args, map it to this parameter name. |
 | `kind_variants`  | dict | Per-kind description / parameter-schema overlays so each session kind sees only the surface it can use (see `memory.json`). |
@@ -509,8 +510,12 @@ Show the user rich content in a preview pane beside the conversation.
   the workstream.
 - **Auto-approve**: URL targets require confirmation (network access); file
   paths and `attachment:` targets run unprompted (local reads).
-- **Agent availability**: interactive sessions only (not `task_agent`, not
-  coordinators).
+- **Agent availability**: interactive and voice-coordinator sessions. Voice is
+  its own surface, between coordinator and interactive: it gets this tool, the
+  text coordinator does not. A voice session sees a description variant
+  steering it to local paths and `attachment:` targets — its persona does not
+  browse the web, and URL previews are approval-gated. Not available to
+  `task_agent`.
 - **Surfaces**: the pane renders in the web UI (standalone and console). The
   CLI prints the confirmation line only — there is no terminal pane.
 
