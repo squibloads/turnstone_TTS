@@ -124,6 +124,10 @@ globalThis.window = { innerWidth: 1200, innerHeight: 800 };
 STUBS = r"""
 const log = { toasts: [], fetches: [], announce: [], audios: [], revoked: [] };
 let authGen = 0, fetchMode = "ok";
+// The clip POST can fail while the styles probe still answers, which
+// fetchMode cannot express: it fails the probe too, and a run with streaming
+// off never fetches a clip.
+let ttsMode = "ok";
 // Speaking-style probe: "off" (instructions unsupported), "ok" (three menu
 // styles + one hidden), "empty" (supported but nothing in the menu) or "down".
 let stylesMode = "off";
@@ -175,6 +179,7 @@ function authFetch(url, opts) {
   if (url.endsWith("/v1/api/models")) {
     return Promise.resolve({ ok: true, json: async () => ({ tts_default_alias: fetchMode === "tts" ? "tts-1" : undefined, stt_default_alias: "stt-1" }) });
   }
+  if (ttsMode === "down" && url.endsWith("/v1/api/tts")) return Promise.reject(new Error("down"));
   return Promise.resolve({ ok: true, blob: async () => "audio" });
 }
 function _stylesResponse() {

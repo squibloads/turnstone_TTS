@@ -81,6 +81,10 @@ const _scheduleScroll = () => {};
 function _retryLast() {}
 // The dictation mic (covered by test_stt_coordinator_js) is inert here.
 const mic = { setAvailable() {}, syncBusy() {}, destroy() {} };
+// Hands-free voice mode (covered by test_voice_loop_wiring_js) is inert here;
+// the settle edge calls both, so both must exist.
+function _voiceRefresh() {}
+function _voiceSpeakAwaiting() {}
 """
 
 _HELPERS = r"""
@@ -115,7 +119,11 @@ _PRELUDE = "\n".join(
 
 
 def _run(body: str, extra: str = "") -> Any:
-    src = _PRELUDE + extra + f"\n(async () => {{\n{body}\n}})().catch((e) => {{ console.error(e); process.exit(1); }});"
+    src = (
+        _PRELUDE
+        + extra
+        + f"\n(async () => {{\n{body}\n}})().catch((e) => {{ console.error(e); process.exit(1); }});"
+    )
     r = run_node_source(src)
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout.strip().splitlines()[-1])
@@ -250,6 +258,9 @@ let staleRetryTimer = null, cancelTimeoutId = null, forceTimeoutId = null, tasks
   liveBadgeFlushTimer = null, pruneTimer = null, unmountTranscriptPresentation = null;
 const removeVisibilityHandler = () => {}, _childObserver = null, unregisterTranscriptScroller = () => {};
 const scrollFollow = { destroy() {} };
+let voiceModeOn = false;
+let voiceLoop = null;
+const voiceBtn = new El("button"), voiceStatusEl = new El("div");
 """
 
 
