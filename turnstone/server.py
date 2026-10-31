@@ -1697,9 +1697,14 @@ async def list_available_models(request: Request) -> JSONResponse:
 # generation on a shared alias that is about to end.  The console's wait for a
 # forwarded request is _PROXY_CLIENT_TIMEOUT_S (30 s), and this leaves half of it
 # for the transcode and the transcription, so a busy node says so instead of the
-# console reporting no reply.  test_dictation_wait_leaves_room_in_the_console_wait
-# pins the two numbers.
+# console reporting no reply.
 _STT_ADMISSION_WAIT_S = 15.0
+
+# Budget from arrival for HTTP dictation preparation and one backend attempt.
+# The transcode, admission and credential lookup all reduce the backend's I/O
+# timeout. Active network I/O also shares this deadline, including uploads and
+# progressing streams. Leave room before the console's 30 s wait.
+_STT_REQUEST_TIMEOUT_S = 25.0
 
 # How many dictations a node admits at once.  Each transcodes, waits for its slot
 # and makes or opens its backend call on a thread of its own; a streamed
@@ -1712,11 +1717,13 @@ _STT_ADMISSION_WAIT_S = 15.0
 _STT_MAX_THREADS = 4
 
 
-def _audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
+def _audio_backend_auth_resolver(
+    request: Request, *, deadline: float | None = None
+) -> Callable[[str, Any], str | None]:
     """Bind one audio HTTP request to its authenticated model principal."""
     from turnstone.core.web_helpers import audio_backend_auth_resolver
 
-    return audio_backend_auth_resolver(request)
+    return audio_backend_auth_resolver(request, deadline=deadline)
 
 
 async def _authorize_ws_access(request: Request, ws_id: str) -> JSONResponse | None:
@@ -4577,10 +4584,17 @@ async def internal_model_auth_cache_invalidate(request: Request) -> JSONResponse
 
     from turnstone.core.token_store.store import MODEL_OBO_CACHE_PREFIX
 
-    evicted = model_client.invalidate_model_mint_memo_sync(
-        user_id=user_id,
-        server_prefix=MODEL_OBO_CACHE_PREFIX,
-    )
+    # Off the event loop: the eviction waits on the OAuth runtime's loop. A failure answers
+    # non-200, so the console reports this node as not evicted rather than as holding nothing.
+    try:
+        evicted = await asyncio.to_thread(
+            model_client.invalidate_model_mint_memo_sync,
+            user_id=user_id,
+            server_prefix=MODEL_OBO_CACHE_PREFIX,
+        )
+    except Exception:
+        log.warning("model_auth_cache_invalidate.failed user=%s", user_id, exc_info=True)
+        return JSONResponse({"error": "The cached tokens could not be evicted"}, status_code=503)
     return JSONResponse({"status": "ok", "evicted": evicted})
 
 
@@ -5335,6 +5349,7 @@ def create_app(
                 ui._ws_turn_tool_calls = 0
 
     from turnstone.core.attachments import classify_upload as _classify_upload
+    from turnstone.core.filesystem import make_filesystem_handlers
 
     interactive_attachment_helpers = AttachmentUploadHelpers(
         classify_upload=_classify_upload,
@@ -5467,6 +5482,7 @@ def create_app(
             history=history_handler,  # lifted: shared body (interactive feature gain)
             export=export_handler,  # lifted: shared body (#613, conversation-only)
             attachments=attachment_handlers,  # lifted: shared body (P1.5)
+            filesystem=make_filesystem_handlers(interactive_endpoint_config),
         ),
     )
     v1_routes.append(Route("/api/dashboard", dashboard))
