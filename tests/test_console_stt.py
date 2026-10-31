@@ -11,6 +11,7 @@ is not a coordinator must 404 rather than leak an interactive workstream.
 from __future__ import annotations
 
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -24,6 +25,7 @@ from starlette.testclient import TestClient
 
 from tests._coord_test_helpers import _AuthMiddleware, _FakeConfigStore
 from turnstone.console.server import speech_to_text, speech_to_text_stream
+from turnstone.core import web_helpers
 from turnstone.core.audio import (
     AudioBackendError,
     AudioUnavailableError,
@@ -286,6 +288,68 @@ def test_stream_response_aborts_even_when_cancelled_before_body(monkeypatch) -> 
         asyncio.run(response({}, MagicMock(), MagicMock()))
     assert abort_ref.aborted
     handle.close.assert_called()
+
+
+# -- the console's dictation budget (1.9.2, #1509) ---------------------------
+#
+# Coordinator dictation gets one backend attempt within a budget from arrival,
+# as a node's does, instead of the client default (600 s per attempt, retried),
+# which held speech capacity through the retries.
+
+
+def _transcriber(stream: bool) -> tuple[str, Any]:
+    """The audio call a route makes, and a reply for its patch."""
+    if stream:
+        return "transcribe_stream", iter(["ok"])
+    return "transcribe", _result()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_dictation_deadline_is_the_console_budget_from_arrival(stream: bool) -> None:
+    name, reply = _transcriber(stream)
+    client = _client()
+    before = time.monotonic()
+    with patch(f"turnstone.core.audio.{name}", return_value=reply) as call:
+        resp = client.post(_url(stream=stream), files=_audio())
+    after = time.monotonic()
+    assert resp.status_code == 200, resp.text
+    kwargs = call.call_args.kwargs
+    budget = web_helpers.STT_REQUEST_TIMEOUT_S
+    assert before + budget <= kwargs["deadline"] <= after + budget
+    # The slot wait comes out of the console's admission budget, also from arrival.
+    assert 0 <= kwargs["admission_wait_s"] <= web_helpers.STT_ADMISSION_WAIT_S
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_dictation_credential_lookup_shares_the_call_deadline(stream: bool) -> None:
+    # The patched call never mints, so the test calls the resolver it was given.
+    name, reply = _transcriber(stream)
+    with (
+        patch(f"turnstone.core.audio.{name}", return_value=reply) as call,
+        patch(
+            "turnstone.core.model_backend_auth.resolve_model_backend_auth_token",
+            return_value="minted",
+        ) as resolve,
+    ):
+        resp = _client().post(_url(stream=stream), files=_audio())
+        assert resp.status_code == 200, resp.text
+        kwargs = call.call_args.kwargs
+        assert kwargs["backend_auth_resolver"]("voice-stt", _cfg("whisper-1")) == "minted"
+    assert resolve.call_args.kwargs["deadline"] == kwargs["deadline"]
+
+
+def test_console_admission_wait_leaves_room_in_its_request_budget() -> None:
+    # The console's twin of the node's test_dictation_wait_leaves_room_in_the_console_wait:
+    # a slot wait as long as the whole budget would leave no time to transcribe.
+    assert 0 < web_helpers.STT_ADMISSION_WAIT_S < web_helpers.STT_REQUEST_TIMEOUT_S
+
+
+def test_console_dictation_budget_is_the_nodes() -> None:
+    # One contract, so the coordinator mic behaves like a node's: the console
+    # keeps the node's budget until it is given one of its own on purpose.
+    import turnstone.server as srv
+
+    assert web_helpers.STT_REQUEST_TIMEOUT_S == srv._STT_REQUEST_TIMEOUT_S
 
 
 # -- access: coordinators only -----------------------------------------------
