@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from turnstone.core.token_store import crypto as token_store_crypto
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping, Sequence
 
-    from turnstone.core.storage._protocol import StorageBackend
+    from turnstone.core.storage._protocol import DelegatedTokenWrite, StorageBackend
 
 # Storage owns the reserved token-key namespace shared by consumers. Model
 # mints create these keys and MCP adapters filter them; the store otherwise
@@ -142,12 +142,57 @@ class TokenStore:
             audience=audience,
         )
 
+    def replace_consented_user_token(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        access_token: str,
+        refresh_token: str | None,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        expected_server: Mapping[str, Any],
+        pins: Sequence[str | None],
+    ) -> bool:
+        """Encrypt and replace a consented grant while its server is the one consented to.
+
+        See :meth:`StorageBackend.replace_consented_oauth_token`.
+        """
+        access_ct = self._cipher.encrypt(access_token.encode("utf-8"))
+        refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8")) if refresh_token else None
+        return self._storage.replace_consented_oauth_token(
+            user_id,
+            token_key,
+            access_token_ct=access_ct,
+            refresh_token_ct=refresh_ct,
+            expires_at=expires_at,
+            scopes=scopes,
+            as_issuer=as_issuer,
+            audience=audience,
+            expected_server=expected_server,
+            pins=pins,
+        )
+
     def get_user_token(self, user_id: str, token_key: str) -> UserTokenPlain | None:
         """Returns plaintext dict or None.
 
         Raises ``TokenDecryptError`` on key mismatch — caller MUST NOT
         auto-delete the row. The configured decrypt-failure hook receives the
         token identity and attempted key fingerprints.
+        """
+        got = self.get_user_token_and_version(user_id, token_key)
+        return None if got is None else got[0]
+
+    def get_user_token_and_version(
+        self, user_id: str, token_key: str
+    ) -> tuple[UserTokenPlain, bytes] | None:
+        """Like :meth:`get_user_token`, plus the version of the row it read.
+
+        The version is the stored access-token ciphertext, fresh on every write, so a writer
+        can make its write conditional on the row still being the one it read
+        (:meth:`update_user_token_after_refresh`, :meth:`delete_user_token_if_unchanged`).
         """
         row = self._storage.get_oauth_token(user_id, token_key)
         if row is None:
@@ -162,7 +207,7 @@ class TokenStore:
         except token_store_crypto.TokenDecryptError as exc:
             self._decrypt_failure(token_key, exc.key_fingerprints_attempted)
             raise
-        return UserTokenPlain(
+        plain = UserTokenPlain(
             user_id=row["user_id"],
             token_key=row["token_key"],
             access_token=access_pt,
@@ -174,6 +219,7 @@ class TokenStore:
             created=row["created"],
             last_refreshed=row["last_refreshed"],
         )
+        return plain, row["access_token_ct"]
 
     def update_user_token_after_refresh(
         self,
@@ -183,10 +229,14 @@ class TokenStore:
         access_token: str,
         refresh_token: str | None,
         expires_at: str | None,
+        expected_as_issuer: str,
+        expected_version: bytes,
     ) -> bool:
         """Atomic write of new tokens after a refresh-grant exchange.
 
-        Returns True when a row was updated.
+        Writes only while the row is still the grant the refresh read (*expected_as_issuer* and
+        *expected_version* from :meth:`get_user_token_and_version`). Returns True when a row was
+        updated; False means the grant was replaced or removed meanwhile.
 
         ``refresh_token=None`` CLEARS the column — it does NOT preserve
         the existing value.  Per RFC 6749 §6, an authorization server MAY
@@ -203,16 +253,70 @@ class TokenStore:
             access_token_ct=access_ct,
             refresh_token_ct=refresh_ct,
             expires_at=expires_at,
+            expected_as_issuer=expected_as_issuer,
+            expected_access_token_ct=expected_version,
         )
 
     def delete_user_token(self, user_id: str, token_key: str) -> bool:
         """Delete the user-token row. Returns True if existed."""
         return self._storage.delete_oauth_token(user_id, token_key)
 
+    def delete_user_token_if_unchanged(
+        self, user_id: str, token_key: str, *, expected_as_issuer: str, expected_version: bytes
+    ) -> bool:
+        """Delete the user-token row only while it is the grant the caller read."""
+        return self._storage.delete_oauth_token_if_unchanged(
+            user_id,
+            token_key,
+            expected_as_issuer=expected_as_issuer,
+            expected_access_token_ct=expected_version,
+        )
+
+    def replace_delegated_user_token(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        access_token: str,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        obo_server: str | None = None,
+    ) -> DelegatedTokenWrite:
+        """Encrypt and replace a delegated mint-cache row while the user's credential exists.
+
+        See :meth:`StorageBackend.replace_delegated_oauth_token`.
+        """
+        access_ct = self._cipher.encrypt(access_token.encode("utf-8"))
+        return self._storage.replace_delegated_oauth_token(
+            user_id,
+            token_key,
+            access_token_ct=access_ct,
+            expires_at=expires_at,
+            scopes=scopes,
+            as_issuer=as_issuer,
+            audience=audience,
+            obo_server=obo_server,
+        )
+
     def upsert_oidc_credential(self, user_id: str, issuer: str, *, refresh_token: str) -> None:
         """Encrypt and create-or-replace the user's captured IdP refresh token."""
         refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8"))
         self._storage.upsert_oidc_user_credential(user_id, issuer, refresh_token_ct=refresh_ct)
+
+    def capture_oidc_credential(
+        self, user_id: str, issuer: str, subject: str, *, refresh_token: str
+    ) -> bool:
+        """Encrypt and store a sign-in's credential only while its identity still links the user.
+
+        Returns ``False``, storing nothing, when the identity was unlinked meanwhile. See
+        :meth:`StorageBackend.upsert_oidc_user_credential_for_identity`.
+        """
+        refresh_ct = self._cipher.encrypt(refresh_token.encode("utf-8"))
+        return self._storage.upsert_oidc_user_credential_for_identity(
+            user_id, issuer, subject, refresh_token_ct=refresh_ct
+        )
 
     def get_oidc_credential(self, user_id: str, issuer: str) -> OIDCCredentialPlain | None:
         """Returns plaintext dict or None.
@@ -263,10 +367,6 @@ class TokenStore:
         return self._storage.update_oidc_user_credential_refresh(
             user_id, issuer, refresh_token_ct=refresh_ct
         )
-
-    def delete_oidc_credential(self, user_id: str, issuer: str) -> bool:
-        """Remove the captured credential (logout-all / admin revoke)."""
-        return self._storage.delete_oidc_user_credential(user_id, issuer)
 
     def list_user_token_metadata(self, user_id: str) -> list[UserTokenMetadata]:
         """Return non-secret metadata for every token row owned by ``user_id``.

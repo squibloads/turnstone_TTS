@@ -22,7 +22,7 @@ migrations):
 | Role | Permissions |
 |------|-------------|
 | admin | Admin-default baseline: ordinary admin, lifecycle, tool-approval, coordinator, project, and persona capabilities. Explicit opt-in capabilities such as `model.skills.write` remain ungranted. |
-| operator | read, write, workstreams.create, workstreams.close, conversation.modify |
+| operator | read, write, workstreams.create, workstreams.close, conversation.modify, files.read |
 | viewer | read |
 
 Custom roles can be created with any subset of the valid permissions. Built-in
@@ -32,6 +32,12 @@ The `persona.create` / `persona.read` / `persona.write` family gates
 persona administration; migration `063` seeds all three onto
 `builtin-admin`, and any role can be granted them through the standard
 role and permission-override editors.
+
+The `files.read` permission gates the Files pane and its directory-listing, preview,
+and download endpoints. It is included in the built-in admin and operator roles;
+viewers do not receive it. File browsing also requires `write` scope and access to
+an active interactive workstream on the selected node. Role overrides can revoke
+direct browsing without changing the role's other conversation capabilities.
 
 **Auth flow:**
 1. User logs in (password or API token) → `_load_user_permissions()` aggregates
@@ -115,8 +121,9 @@ alias and the `tools.agent_max_turns` setting.
   array. Migration 010 adds `template` column to `scheduled_tasks`.
 - **MCP sync**: MCP server prompts auto-sync into the `prompt_templates` table
   with `origin="mcp"`, `mcp_server` set, and `readonly=True`. Manual skills take
-  precedence on name collision. Admin UI shows origin badge and disables
-  edit/delete for MCP-sourced skills.
+  precedence on name collision. MCP-sourced skills cannot be unlocked or
+  renamed, and one an admin has disabled stays when its server stops listing
+  the prompt. The admin UI shows an origin badge and opens them for viewing.
 - **Spec fields**: Skills support the full Agent Skills standard frontmatter:
   `name`, `description`, `license`, `compatibility`, `metadata` (author, version),
   `allowed-tools`. The `license` and `compatibility` fields are preserved on import
