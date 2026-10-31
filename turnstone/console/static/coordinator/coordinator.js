@@ -66,6 +66,11 @@ import { redactCredentials } from "/shared/redact_credentials.js";
 import { mountConversationScroll } from "/shared/conversation_scroll.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "/shared/mcp_error.js";
 import {
+  addTtsActionsToFinished,
+  createTtsPlayer,
+  getVoiceRoles,
+} from "/shared/tts_player.js";
+import {
   acceptUserTurnEvent,
   clientSendMaySettleForViewer,
   createQueueController,
@@ -6737,7 +6742,33 @@ function createCoordinatorPane(root, wsId, opts) {
     bar.insertBefore(btn, bar.firstChild);
   }
 
+  // Read-aloud: the console's own /v1/api/tts (base ""), one player per pane
+  // so a destroyed pane silences itself.  The affordance stays hidden until
+  // /v1/api/models reports a tts role (see init).
+  let voiceRoles = { stt: false, tts: false };
+  const ttsPlayer = createTtsPlayer({ base: "" });
+
+  // Speaker on every FINISHED assistant reply, beside copy.  The bubble still
+  // streaming is skipped so half a reply is never read; the settle edge
+  // (_refreshRetryButton, via finishAssistantStream) picks it up.
+  function _addTtsActions() {
+    if (!voiceRoles.tts) return;
+    addTtsActionsToFinished(messagesEl, currentAssistantEl, (el, btn) =>
+      ttsPlayer.play(el, btn),
+    );
+  }
+
+  // The roles resolve after the first history paint, so the bubbles it built
+  // get their speaker now.
+  function _applyVoiceRoles(roles) {
+    voiceRoles = roles;
+    _addTtsActions();
+  }
+
   function _refreshRetryButton() {
+    // Every settle edge and history render lands here, so the speakers follow
+    // the same cadence as retry (and are persistent, unlike it).
+    _addTtsActions();
     // Remove only the transient retry buttons — a bar that still holds
     // other controls (the copy button appendMsg attaches) persists.  On
     // the degraded no-bridge path the fallback bar held ONLY retry, and
@@ -6775,6 +6806,9 @@ function createCoordinatorPane(root, wsId, opts) {
   // ------------------------------------------------------------------
 
   async function init() {
+    // Voice roles are memoized per base, so this is one /v1/api/models fetch
+    // however many panes open; a failed probe resolves to "no roles".
+    getVoiceRoles("").then(_applyVoiceRoles);
     let wsSnapshot = null;
     try {
       wsSnapshot = await getJSON(
@@ -6961,6 +6995,7 @@ function createCoordinatorPane(root, wsId, opts) {
     )
       return;
     const scrollTop = messagesEl.scrollTop;
+    ttsPlayer.stop(); // the speaker button is about to be detached
     messagesEl.replaceChildren();
     _syncApprovalChip();
     // A full committed-history render repairs any recorded truncation gap —
@@ -7399,6 +7434,7 @@ function createCoordinatorPane(root, wsId, opts) {
   // backgrounded pane keeps an SSE open and fires renders into detached DOM.
   function destroy() {
     reasoningActivity.finish();
+    ttsPlayer.stop();
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
     // truncated resync).
     closeStreamTransport();

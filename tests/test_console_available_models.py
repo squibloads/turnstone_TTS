@@ -139,6 +139,8 @@ def test_no_settings_leaves_all_defaults_blank(storage: SQLiteBackend) -> None:
         "channel_default_alias": "",
         "coordinator_default_alias": "",
         "judge_default_alias": "",
+        "stt_default_alias": "",
+        "tts_default_alias": "",
     }
 
 

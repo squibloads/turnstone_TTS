@@ -129,7 +129,11 @@ from turnstone.core.session_ui_base import (
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.trajectory import final_assistant_text
+from turnstone.core.web_helpers import (
+    TTS_TEXT_CAP as _TTS_TEXT_CAP,  # noqa: F401 — the node's name for it
+)
 from turnstone.core.web_helpers import RevalidatingStaticFiles
+from turnstone.core.web_helpers import SpeechCapacity as _SpeechCapacity
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
@@ -1715,78 +1719,14 @@ _STT_REQUEST_TIMEOUT_S = 25.0
 # refused with 429 when none comes free in time.
 _STT_MAX_THREADS = 4
 
-# Longest text one synthesis request may carry.  The browser's read-aloud sends a
-# whole message in one request, so this is also the longest message it can read.
-# A hosted backend may refuse first (OpenAI's speech models take at most 4,096
-# characters), but a local backend has no limit of its own, so this one bounds
-# the work, the buffered reply and the console's wait for it.  At ~107 chars/s,
-# the slowest backend measured, a full-cap clip takes ~75 s;
-# test_the_console_outwaits_a_full_cap_clip pins the deadlines against it.
-_TTS_TEXT_CAP = 8000  # characters per synthesis request
-
-# How many clips a node synthesizes at once, each on a thread of its own.
-_TTS_MAX_CONCURRENT = 2
-
-
-class _SpeechCapacity:
-    """The node's synthesis threads, and how many of them are taken.
-
-    Each thread blocks for a whole clip, so they are a pool of their own: on the
-    default executor a few long clips would take the workers the service
-    heartbeat needs, and the console would mark a working node offline.
-
-    A play that finds every thread taken is refused rather than queued, because
-    queue time would come out of the console's wait, which a long clip needs most
-    of.  Two at once lets a play start beside a long one, and lets a user who
-    replaces a play start the new one before the old one's abort lands.  On a
-    backend that synthesizes one clip at a time, a play started beside a long one
-    waits behind it there and can still time out: after 80 s of silence at the
-    node, or at the console's 90 s.  A play also needs one of the TTS alias's
-    max_concurrency slots, and for the same reason is refused when none is free.
-
-    Only the event loop admits and releases, so the count needs no lock.
-    """
-
-    def __init__(self) -> None:
-        self.executor = ThreadPoolExecutor(
-            max_workers=_TTS_MAX_CONCURRENT, thread_name_prefix="tts"
-        )
-        self.in_flight = 0
-
-    def try_admit(self) -> bool:
-        if self.in_flight >= _TTS_MAX_CONCURRENT:
-            return False
-        self.in_flight += 1
-        return True
-
-    def release(self) -> None:
-        self.in_flight -= 1
-
-    def shutdown(self) -> None:
-        self.executor.shutdown(wait=True, cancel_futures=True)
-
 
 def _audio_backend_auth_resolver(
     request: Request, *, deadline: float | None = None
 ) -> Callable[[str, Any], str | None]:
     """Bind one audio HTTP request to its authenticated model principal."""
-    from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
+    from turnstone.core.web_helpers import audio_backend_auth_resolver
 
-    principal_id = _auth_user_id(request).strip()
-    config_store = getattr(request.app.state, "config_store", None)
-    mint_client = get_model_token_client(request.app.state)
-
-    def _resolve(alias: str, config: Any) -> str | None:
-        return resolve_model_backend_auth_token(
-            alias,
-            config,
-            principal_id=principal_id,
-            config_store=config_store,
-            mint_client=mint_client,
-            deadline=deadline,
-        )
-
-    return _resolve
+    return audio_backend_auth_resolver(request, deadline=deadline)
 
 
 class _AbortOnExitStreamingResponse(StreamingResponse):
@@ -2140,114 +2080,13 @@ async def speech_to_text_stream(request: Request) -> Response:
 
 async def text_to_speech(request: Request) -> Response:
     """POST /v1/api/tts — synthesize assistant text into playable audio."""
-    from turnstone.core.audio import (
-        AudioBackendError,
-        AudioBusyError,
-        AudioUnavailableError,
-        resolve_role_alias,
-        synthesize,
-    )
-    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
-    from turnstone.core.model_backend_auth import BackendAuthUnavailableError
-    from turnstone.core.speech_text import normalize_for_speech, parse_pronunciations
-    from turnstone.core.web_helpers import read_json_or_400
+    from turnstone.core.web_helpers import text_to_speech_response
 
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    text = str(body.get("text") or "").strip()
-    if not text:
-        return JSONResponse({"error": "text is required"}, status_code=400)
-    if len(text) > _TTS_TEXT_CAP:
-        return JSONResponse(
-            {"error": f"text too long (cap {_TTS_TEXT_CAP} chars)"}, status_code=400
-        )
-
-    registry = getattr(request.app.state, "registry", None)
-    config_store = getattr(request.app.state, "config_store", None)
-    alias = resolve_role_alias(config_store=config_store, registry=registry, role="tts")
-    if not alias:
-        return JSONResponse(
-            {
-                "error": (
-                    "Text-to-speech is not configured. Assign a TTS model role in Models → Roles."
-                )
-            },
-            status_code=503,
-        )
-
-    voice = str(body.get("voice") or "").strip()
-    if not voice and config_store is not None:
-        voice = (config_store.get("audio.tts_voice") or "").strip()
-
-    # On by default (the registry default applies); a missing config store
-    # means defaults, not "off".
-    if config_store is None or config_store.get("audio.tts_normalize"):
-        pronunciations = ""
-        if config_store is not None:
-            pronunciations = config_store.get("audio.tts_pronunciations") or ""
-        # Every rule is linear and the length cap bounds the work; a thread would
-        # not help (the regex holds the GIL).
-        text = normalize_for_speech(text, parse_pronunciations(pronunciations))
-        # Cleanup grows text (units and dates become words), and the cap is what
-        # sizes the backend call and the console's wait, so it bounds the text
-        # actually synthesized as well as the text sent.
-        if len(text) > _TTS_TEXT_CAP:
-            return JSONResponse(
-                {"error": f"text too long after speech cleanup (cap {_TTS_TEXT_CAP} chars)"},
-                status_code=400,
-            )
-    # Refused, not queued, by the node's threads and by the alias's slots alike:
-    # see _SpeechCapacity.  429 like the node's other capacity refusals.
-    busy = "Speech synthesis is busy; try again shortly"
-    capacity: _SpeechCapacity = request.app.state.tts
-    if not capacity.try_admit():
-        return _audio_busy(busy)
-
-    abort_ref = StreamAbortRef()
-    try:
-        call = functools.partial(
-            synthesize,
-            registry=registry,
-            alias=alias,
-            text=text,
-            voice=voice,
-            config_store=config_store,
-            backend_auth_resolver=_audio_backend_auth_resolver(request),
-            cancel_ref=abort_ref,
-            admission_wait_s=0,
-        )
-        # Blocking SDK round-trip, off the event loop.  The context copy carries
-        # the request's log fields, as asyncio.to_thread does.
-        context = contextvars.copy_context()
-        async with _caller_watched(request, abort_ref):
-            speech = await asyncio.get_running_loop().run_in_executor(
-                capacity.executor, context.run, call
-            )
-    except DeadlineCancelledError:
-        # Only the watcher aborts during the call, so the caller has gone and
-        # nobody reads this answer.
-        log.debug("text_to_speech.caller_left")
-        return JSONResponse({"error": "Speech synthesis was cancelled"}, status_code=499)
-    except AudioBusyError:
-        return _audio_busy(busy)
-    except BackendAuthUnavailableError:
-        log.warning("text_to_speech.backend_auth_unavailable", exc_info=True)
-        return JSONResponse({"error": "Model backend authentication unavailable"}, status_code=503)
-    except AudioUnavailableError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=503)
-    except AudioBackendError as exc:
-        # Static body to the caller; backend SDK detail stays in the log.
-        log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
-        return JSONResponse({"error": "Speech synthesis backend failed"}, status_code=502)
-    finally:
-        abort_ref.abort()
-        capacity.release()
-
-    return Response(
-        speech.audio_bytes,
-        media_type=speech.media_type,
-        headers={"X-Model-Alias": speech.model_alias},
+    return await text_to_speech_response(
+        request,
+        registry=getattr(request.app.state, "registry", None),
+        capacity=request.app.state.tts,
+        poll_s=_AUDIO_DISCONNECT_POLL_S,
     )
 
 

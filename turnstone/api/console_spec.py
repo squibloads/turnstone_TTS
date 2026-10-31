@@ -168,6 +168,7 @@ from turnstone.api.server_schemas import (
     SendRequest,
     SendResponse,
     SkillSummary,
+    TextToSpeechRequest,
     UploadAttachmentResponse,
     WorkstreamDetailResponse,
     WorkstreamHistoryResponse,
@@ -686,6 +687,16 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "GET",
         "List enabled model aliases for workstream creation",
         response_model=ListAvailableModelsResponse,
+        tags=["Models"],
+    ),
+    EndpointSpec(
+        "/v1/api/tts",
+        "POST",
+        "Synthesize text to speech audio for browser playback (coordinator "
+        "read-aloud) using the configured TTS model role.  Returns audio bytes; "
+        "503 when no TTS role is configured.",
+        request_model=TextToSpeechRequest,
+        error_codes=[400, 502, 503],
         tags=["Models"],
     ),
     # --- Skills ---
@@ -1919,6 +1930,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CancelResponse,
     CloseWorkstreamRequest,
     CommandRequest,
+    TextToSpeechRequest,
     DequeueRequest,
     SendRequest,
     SendResponse,
