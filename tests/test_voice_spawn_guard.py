@@ -533,6 +533,73 @@ def test_voice_single_spawn_without_ws_id_releases_its_slot(monkeypatch):
     assert sess._voice_spawns_this_turn == 0
 
 
+def _closed_result(ws_id: str = "child-1") -> dict[str, Any]:
+    """1.9.2: the child was closed while being created and never took its message."""
+    return {**_spawn_result(ws_id), "initial_message_status": "refused_closed"}
+
+
+def test_voice_child_closed_before_its_first_message_releases_its_slot(monkeypatch):
+    """1.9.2 tells the model to spawn a refused_closed child again.  That child
+    never started any work, so the budget must allow the respawn it asks for."""
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.return_value = _closed_result()
+
+    first = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "one"}))
+    _call_id, output = sess._exec_spawn_workstream(first)
+    reply = json.loads(output)
+    assert reply["initial_message_status"] == "refused_closed"
+    assert "spawn it again" in reply["note"]
+    assert sess._voice_spawns_this_turn == 0
+
+    coord.spawn.return_value = _spawn_result("child-2")
+    again = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "one"}))
+    assert "error" not in again
+    _call_id, output = sess._exec_spawn_workstream(again)
+    assert "child-2" in output
+    assert coord.spawn.call_count == 2
+    assert sess._voice_spawns_this_turn == 1
+
+
+def test_voice_child_created_without_its_message_keeps_its_slot(monkeypatch):
+    # queue_full: the child exists and takes its message by send_to_workstream.
+    sess, coord, _ui = _make_session(monkeypatch, voice=True)
+    coord.spawn.return_value = {**_spawn_result(), "initial_message_status": "queue_full"}
+
+    item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "one"}))
+    sess._exec_spawn_workstream(item)
+
+    assert sess._voice_spawns_this_turn == 1
+    assert "error" in sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "two"}))
+
+
+def test_voice_batch_row_closed_before_its_first_message_releases_its_slot(monkeypatch):
+    sess, coord, _ui = _make_session(
+        monkeypatch,
+        voice=True,
+        settings={"coordinator.voice_max_agents_per_turn": 2},
+    )
+
+    def _spawn(**kwargs):
+        if kwargs["initial_message"] == "a":
+            return _closed_result("child-a")
+        return _spawn_result("child-b")
+
+    coord.spawn.side_effect = _spawn
+    batch = sess._prepare_tool(
+        _tc(
+            "spawn_batch",
+            {"children": [{"initial_message": "a"}, {"initial_message": "b"}]},
+        )
+    )
+    _call_id, output = sess._exec_spawn_batch(batch)
+
+    statuses = [row.get("initial_message_status") for row in json.loads(output)["results"].values()]
+    assert statuses.count("refused_closed") == 1
+    assert sess._voice_spawns_this_turn == 1
+    again = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": "a"}))
+    assert "error" not in again
+
+
 def test_voice_skill_refused_at_exec_costs_no_slot(monkeypatch):
     """1.9.0 re-checks a child's skill after the approval wait; a refusal there
     must not spend the voice budget, for a single spawn or a batch row."""
