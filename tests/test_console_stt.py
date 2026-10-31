@@ -321,6 +321,21 @@ def test_dictation_deadline_is_the_console_budget_from_arrival(stream: bool) -> 
 
 
 @pytest.mark.parametrize("stream", [False, True])
+def test_dictation_reads_the_console_budget_at_call_time(stream: bool, monkeypatch) -> None:
+    # As the admission wait is, and as the node reads its own budget: a default
+    # bound at import would ignore the change.
+    monkeypatch.setattr(web_helpers, "STT_REQUEST_TIMEOUT_S", 7.0)
+    name, reply = _transcriber(stream)
+    client = _client()
+    before = time.monotonic()
+    with patch(f"turnstone.core.audio.{name}", return_value=reply) as call:
+        resp = client.post(_url(stream=stream), files=_audio())
+    after = time.monotonic()
+    assert resp.status_code == 200, resp.text
+    assert before + 7.0 <= call.call_args.kwargs["deadline"] <= after + 7.0
+
+
+@pytest.mark.parametrize("stream", [False, True])
 def test_dictation_credential_lookup_shares_the_call_deadline(stream: bool) -> None:
     # The patched call never mints, so the test calls the resolver it was given.
     name, reply = _transcriber(stream)

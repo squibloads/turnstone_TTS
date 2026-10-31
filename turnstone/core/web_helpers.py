@@ -809,7 +809,7 @@ async def speech_to_text_response(
     authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
     run: Callable[..., Awaitable[Any]] = _console_dictation,
     poll_s: float = 1.0,
-    request_timeout_s: float = STT_REQUEST_TIMEOUT_S,
+    request_timeout_s: float | None = None,
 ) -> JSONResponse:
     """Serve ``POST /v1/api/workstreams/{ws_id}/speech-to-text`` against *registry*.
 
@@ -821,7 +821,8 @@ async def speech_to_text_response(
     *run* runs the transcription on the process's dictation threads within its
     admission budget (:func:`run_dictation`); the node passes its own budget.
     *request_timeout_s* is the HTTP budget from arrival (the node passes its
-    own): the credential lookup, transcode, admission and the one backend
+    own; ``None`` is the console's ``STT_REQUEST_TIMEOUT_S``, read at call
+    time): the credential lookup, transcode, admission and the one backend
     attempt all come out of it.
     Everything else is one contract so the coordinator mic behaves like a node's.
     """
@@ -866,7 +867,9 @@ async def speech_to_text_response(
         stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
     abort_ref = StreamAbortRef()
     # One budget from arrival: the credential lookup and the call share it.
-    deadline = arrived + request_timeout_s
+    # The console's budget is read now, as its admission wait is.
+    budget = STT_REQUEST_TIMEOUT_S if request_timeout_s is None else request_timeout_s
+    deadline = arrived + budget
     backend_auth_resolver = audio_backend_auth_resolver(request, deadline=deadline)
     try:
         # Blocking SDK round-trip, off the event loop.
@@ -926,7 +929,7 @@ async def speech_to_text_stream_response(
     authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
     run: Callable[..., Awaitable[Any]] = _console_dictation,
     poll_s: float = 1.0,
-    request_timeout_s: float = STT_REQUEST_TIMEOUT_S,
+    request_timeout_s: float | None = None,
 ) -> Response:
     """Serve ``POST .../speech-to-text/stream``: the transcript as plain-text deltas.
 
@@ -982,7 +985,9 @@ async def speech_to_text_stream_response(
         stt_prompt = (config_store.get("audio.stt_prompt") or "").strip()
     abort_ref = StreamAbortRef()
     # One budget from arrival: the credential lookup and the call share it.
-    deadline = arrived + request_timeout_s
+    # The console's budget is read now, as its admission wait is.
+    budget = STT_REQUEST_TIMEOUT_S if request_timeout_s is None else request_timeout_s
+    deadline = arrived + budget
     backend_auth_resolver = audio_backend_auth_resolver(request, deadline=deadline)
 
     # Resolve + transcode + admission + open the stream eagerly (off the event
