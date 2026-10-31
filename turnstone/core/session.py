@@ -22257,6 +22257,10 @@ class ChatSession:
             )
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
+        if voice and result.get("initial_message_status") == "refused_closed":
+            # Closed before it took its first message, so it never started any
+            # work, and the reply tells the model to spawn it again.
+            self._voice_release_spawns(1)
         if stopped():
             # Audited as the console's cascade records its own cancels, as spawn_batch does.
             cancelled = self._cancel_child_created_after_stop(child_ws_id)
@@ -22597,6 +22601,9 @@ class ChatSession:
                 _child_not_started()
             else:
                 results[str(idx)] = row
+                if row.get("initial_message_status") == "refused_closed":
+                    # Closed before its first message; the row says spawn it again.
+                    _child_not_started()
 
         # ``truncated`` intentionally omitted — the prepare step
         # hard-errors on >10 children rather than silent truncation,
