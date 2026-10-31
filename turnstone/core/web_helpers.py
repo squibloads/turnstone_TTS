@@ -509,10 +509,11 @@ async def _abort_when_caller_leaves(
     cancelled once it is inside the SDK read.  Aborting ``abort_ref`` is what
     stops the work: a wait for the alias's admission slot gives up its place, and
     the backend response the call published on ``abort_ref`` is closed, so the
-    next read raises and the worker returns instead of reading an answer nobody
-    is waiting for.  A read already waiting on a silent backend notices only when
-    bytes arrive, and before the backend sends headers there is no handle yet.
-    The backend call's own timeout bounds both.
+    transport shuts down its socket, waking even a read already blocked on a
+    silent backend.  Before the backend sends headers there is no response handle
+    to publish.  The backend call's own timeout bounds that interval: 80 s of
+    silence for a play, and the remainder of the dictation's HTTP request budget
+    (25 s from arrival) for a dictation.  Neither retries.
 
     The caller is the browser on a direct connection, or the console, which
     closes its node request when the browser leaves (``_proxy_tts``).  Polls
@@ -543,11 +544,16 @@ async def caller_watched(request: Request, abort_ref: Any, poll_s: float) -> Asy
             await watcher
 
 
-def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
+def audio_backend_auth_resolver(
+    request: Request, *, deadline: float | None = None
+) -> Callable[[str, Any], str | None]:
     """Bind one audio HTTP request to its authenticated model principal.
 
     Shared by node and console so a per-user OBO token is minted for the
     *requesting* user on either process, never for a workstream owner.
+    A dictation passes its monotonic *deadline* so a slow credential mint
+    comes out of the same HTTP budget as the backend call instead of
+    outliving it; synthesis passes none.
     """
     from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
     from turnstone.core.model_oauth import get_model_token_client
@@ -563,6 +569,7 @@ def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | 
             principal_id=principal_id,
             config_store=config_store,
             mint_client=mint_client,
+            deadline=deadline,
         )
 
     return _resolve
