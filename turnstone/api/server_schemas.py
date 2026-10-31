@@ -483,6 +483,7 @@ class PendingApprovalItem(BaseModel):
     approval_label: str = ""
     needs_approval: bool = False
     error: str | None = None
+    file_path: str | None = None
     heuristic_verdict: dict[str, Any] | None = None
     judge_verdict: dict[str, Any] | None = None
 
@@ -977,6 +978,34 @@ class PersonaChoice(BaseModel):
 class ListPersonaChoicesResponse(BaseModel):
     personas: list[PersonaChoice] = Field(default_factory=list)
     total: int = 0
+
+
+class FilesystemEntry(BaseModel):
+    name: str
+    path: str = Field(description="Path relative to the selected node filesystem root")
+    kind: Literal["directory", "file"]
+    modified: float = Field(description="Modification time as Unix seconds")
+    size: int | None = Field(default=None, description="File size in bytes")
+    preview_kind: str | None = Field(default=None, description="Preview kind, or binary")
+    content_type: str | None = None
+
+
+class ListFilesystemResponse(BaseModel):
+    root: str = Field(description="Absolute selected node-shared filesystem root")
+    root_id: Literal["workspace", "data", "tmp"]
+    path: str = Field(description="Current directory relative to root; empty for root")
+    parent: str | None
+    entries: list[FilesystemEntry]
+    truncated: bool = Field(description="Only the first 1000 directory entries were examined")
+
+
+class ResolveFilesystemResponse(ListFilesystemResponse):
+    selected: str = Field(
+        description=(
+            "Selected file path relative to root; included in entries even when the "
+            "directory listing is truncated"
+        )
+    )
 
 
 class AvailableModelInfo(BaseModel):
