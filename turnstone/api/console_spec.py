@@ -168,6 +168,7 @@ from turnstone.api.server_schemas import (
     SendRequest,
     SendResponse,
     SkillSummary,
+    SpeechToTextResponse,
     TextToSpeechRequest,
     UploadAttachmentResponse,
     WorkstreamDetailResponse,
@@ -698,6 +699,28 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         request_model=TextToSpeechRequest,
         error_codes=[400, 502, 503],
         tags=["Models"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/speech-to-text",
+        "POST",
+        "Transcribe a short audio clip for a coordinator composer "
+        "(multipart/form-data, field 'audio') using the configured STT model "
+        "role.  Returns the transcript for the client to place into the "
+        "composer; this endpoint never sends on the user's behalf.  Returns "
+        "503 when no STT role is configured or the coordinator subsystem is down.",
+        response_model=SpeechToTextResponse,
+        error_codes=[400, 403, 404, 413, 422, 502, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/speech-to-text/stream",
+        "POST",
+        "Stream the transcript of a short audio clip as plain-text deltas "
+        "(multipart/form-data, field 'audio') for lower perceived latency than "
+        "the JSON route.  Setup failures surface as 502/503 before any bytes "
+        "are sent.",
+        error_codes=[400, 403, 404, 413, 502, 503],
+        tags=["Coordinator"],
     ),
     # --- Skills ---
     EndpointSpec(
@@ -1930,6 +1953,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CancelResponse,
     CloseWorkstreamRequest,
     CommandRequest,
+    SpeechToTextResponse,
     TextToSpeechRequest,
     DequeueRequest,
     SendRequest,

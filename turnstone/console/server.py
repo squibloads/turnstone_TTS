@@ -1741,6 +1741,54 @@ async def text_to_speech(request: Request) -> Response:
     )
 
 
+async def _authorize_coordinator_ws(request: Request, ws_id: str) -> JSONResponse | None:
+    """Gate a speech-to-text request on the caller's access to coordinator ``ws_id``.
+
+    Same ladder as the other per-coordinator verbs (``admin.coordinator``, then
+    coordinator subsystem up, then a kind-strict, project-tenancy-aware lookup).
+    Kind-strictness matters here: this route shares its path with the node's
+    interactive one, and a console that answered for any stored workstream
+    would be an existence oracle for interactive sessions it does not serve.
+    """
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    _ws, err404 = await _resolve_coordinator_or_404(request, coord_mgr, ws_id)
+    return err404
+
+
+async def speech_to_text(request: Request) -> JSONResponse:
+    """POST /v1/api/workstreams/{ws_id}/speech-to-text — dictate into a coordinator composer.
+
+    Coordinators run in the console, so it serves the node's STT contract
+    against the coordinator registry; the transcript only fills the composer.
+    """
+    from turnstone.core.web_helpers import speech_to_text_response
+
+    return await speech_to_text_response(
+        request,
+        registry=getattr(request.app.state, "coord_registry", None),
+        authorize=_authorize_coordinator_ws,
+    )
+
+
+async def speech_to_text_stream(request: Request) -> Response:
+    """POST /v1/api/workstreams/{ws_id}/speech-to-text/stream — streamed dictation.
+
+    Console twin of the node route; see :func:`speech_to_text`.
+    """
+    from turnstone.core.web_helpers import speech_to_text_stream_response
+
+    return await speech_to_text_stream_response(
+        request,
+        registry=getattr(request.app.state, "coord_registry", None),
+        authorize=_authorize_coordinator_ws,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Route handlers — workstream creation
 # ---------------------------------------------------------------------------
@@ -6497,6 +6545,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None]:
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
     app.state.tts.shutdown()
+    app.state.stt.shutdown(wait=True, cancel_futures=True)
     # Console-hosted MCP manager: coordinator sessions stay LOADED at
     # console shutdown (there is no session-close loop here, unlike the
     # node), so their MCP listeners are intentionally still registered
@@ -18409,6 +18458,17 @@ def create_app(
                 "/v1",
                 routes=[
                     *coord_workstream_routes,
+                    # Dictation for the coordinator composer (coordinators live here).
+                    Route(
+                        "/api/workstreams/{ws_id}/speech-to-text",
+                        speech_to_text,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/workstreams/{ws_id}/speech-to-text/stream",
+                        speech_to_text_stream,
+                        methods=["POST"],
+                    ),
                     Route("/api/cluster/overview", cluster_overview),
                     Route("/api/cluster/nodes", cluster_nodes),
                     Route("/api/cluster/workstreams", cluster_workstreams),
@@ -19044,9 +19104,12 @@ def create_app(
     # Coordinator read-aloud is synthesized here, not on a node.  Built here
     # rather than in the lifespan so test apps run through it too; its threads
     # start on first use.
-    from turnstone.core.web_helpers import SpeechCapacity
+    from turnstone.core.web_helpers import STT_MAX_THREADS, SpeechCapacity
 
     app.state.tts = SpeechCapacity()
+    # Coordinator dictation runs here, not on a node: its own threads, as the
+    # node's app.state.stt (see web_helpers.run_dictation).
+    app.state.stt = ThreadPoolExecutor(max_workers=STT_MAX_THREADS, thread_name_prefix="stt")
     app.state.tls_manager = tls_manager
     app.state.router = router
     app.state.console_metrics = console_metrics or ConsoleMetrics()
