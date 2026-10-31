@@ -510,10 +510,11 @@ async def _abort_when_caller_leaves(
     cancelled once it is inside the SDK read.  Aborting ``abort_ref`` is what
     stops the work: a wait for the alias's admission slot gives up its place, and
     the backend response the call published on ``abort_ref`` is closed, so the
-    next read raises and the worker returns instead of reading an answer nobody
-    is waiting for.  A read already waiting on a silent backend notices only when
-    bytes arrive, and before the backend sends headers there is no handle yet.
-    The backend call's own timeout bounds both.
+    transport shuts down its socket, waking even a read already blocked on a
+    silent backend.  Before the backend sends headers there is no response handle
+    to publish.  The backend call's own timeout bounds that interval: 80 s of
+    silence for a play, and the remainder of the dictation's HTTP request budget
+    (25 s from arrival) for a dictation.  Neither retries.
 
     The caller is the browser on a direct connection, or the console, which
     closes its node request when the browser leaves (``_proxy_tts``).  Polls
@@ -544,11 +545,16 @@ async def caller_watched(request: Request, abort_ref: Any, poll_s: float) -> Asy
             await watcher
 
 
-def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | None]:
+def audio_backend_auth_resolver(
+    request: Request, *, deadline: float | None = None
+) -> Callable[[str, Any], str | None]:
     """Bind one audio HTTP request to its authenticated model principal.
 
     Shared by node and console so a per-user OBO token is minted for the
     *requesting* user on either process, never for a workstream owner.
+    A dictation passes its monotonic *deadline* so a slow credential mint
+    comes out of the same HTTP budget as the backend call instead of
+    outliving it; synthesis passes none.
     """
     from turnstone.core.model_backend_auth import resolve_model_backend_auth_token
     from turnstone.core.model_oauth import get_model_token_client
@@ -564,6 +570,7 @@ def audio_backend_auth_resolver(request: Request) -> Callable[[str, Any], str | 
             principal_id=principal_id,
             config_store=config_store,
             mint_client=mint_client,
+            deadline=deadline,
         )
 
     return _resolve
@@ -1042,9 +1049,12 @@ _STT_NOT_CONFIGURED = (
 )
 
 # The console's dictation budget and threads, which it uses for coordinator
-# dictation; the node passes its own (_STT_ADMISSION_WAIT_S / _STT_MAX_THREADS in
-# turnstone/server.py, where the reasoning for both numbers lives).
+# dictation; the node passes its own (_STT_ADMISSION_WAIT_S / _STT_MAX_THREADS /
+# _STT_REQUEST_TIMEOUT_S in turnstone/server.py, where the reasoning for each
+# number lives).  STT_REQUEST_TIMEOUT_S is the budget from arrival for the
+# transcode, admission, credential lookup and one backend attempt together.
 STT_ADMISSION_WAIT_S = 15.0
+STT_REQUEST_TIMEOUT_S = 25.0
 STT_MAX_THREADS = 4
 
 
@@ -1064,8 +1074,11 @@ async def run_dictation[T](
     free dictation thread (``app.state.stt``), and the call's ``admission_wait_s``
     for its model's slot.  A dictation that gets no thread in time is refused as
     one that gets no slot is, so a process whose threads are all held by long
-    transcriptions still answers 429 before the console stops waiting.  The
-    context copy carries the request's log fields, as asyncio.to_thread does.
+    transcriptions still answers 429 before the console stops waiting.  The HTTP
+    handlers also pass the call a ``deadline`` from arrival in *kwargs*, so
+    preparation and admission reduce the backend timeout instead of restarting
+    its budget.  The context copy carries the request's log fields, as
+    asyncio.to_thread does.
     """
     import asyncio
     import contextvars
@@ -1178,6 +1191,7 @@ async def speech_to_text_response(
     authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
     run: Callable[..., Awaitable[Any]] = _console_dictation,
     poll_s: float = 1.0,
+    request_timeout_s: float = STT_REQUEST_TIMEOUT_S,
 ) -> JSONResponse:
     """Serve ``POST /v1/api/workstreams/{ws_id}/speech-to-text`` against *registry*.
 
@@ -1188,6 +1202,9 @@ async def speech_to_text_response(
     both are injected; ``authorize`` returns an error response or ``None``.
     *run* runs the transcription on the process's dictation threads within its
     admission budget (:func:`run_dictation`); the node passes its own budget.
+    *request_timeout_s* is the HTTP budget from arrival (the node passes its
+    own): the credential lookup, transcode, admission and the one backend
+    attempt all come out of it.
     Everything else is one contract so the coordinator mic behaves like a node's.
     """
     import time
@@ -1229,7 +1246,9 @@ async def speech_to_text_response(
     dictionary = stt_dictionary(config_store)
     prompt = stt_prompt(config_store, dictionary)
     abort_ref = StreamAbortRef()
-    backend_auth_resolver = audio_backend_auth_resolver(request)
+    # One budget from arrival: the credential lookup and the call share it.
+    deadline = arrived + request_timeout_s
+    backend_auth_resolver = audio_backend_auth_resolver(request, deadline=deadline)
     try:
         # Blocking SDK round-trip, off the event loop.
         async with caller_watched(request, abort_ref, poll_s):
@@ -1245,6 +1264,7 @@ async def speech_to_text_response(
                 config_store=config_store,
                 backend_auth_resolver=backend_auth_resolver,
                 cancel_ref=abort_ref,
+                deadline=deadline,
             )
     except DeadlineCancelledError:
         # Only the watcher aborts during the call, so the caller has gone.
@@ -1288,6 +1308,7 @@ async def speech_to_text_stream_response(
     authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
     run: Callable[..., Awaitable[Any]] = _console_dictation,
     poll_s: float = 1.0,
+    request_timeout_s: float = STT_REQUEST_TIMEOUT_S,
 ) -> Response:
     """Serve ``POST .../speech-to-text/stream``: the transcript as plain-text deltas.
 
@@ -1345,7 +1366,9 @@ async def speech_to_text_stream_response(
     dictionary = stt_dictionary(config_store)
     prompt = stt_prompt(config_store, dictionary)
     abort_ref = StreamAbortRef()
-    backend_auth_resolver = audio_backend_auth_resolver(request)
+    # One budget from arrival: the credential lookup and the call share it.
+    deadline = arrived + request_timeout_s
+    backend_auth_resolver = audio_backend_auth_resolver(request, deadline=deadline)
 
     # Resolve + transcode + admission + open the stream eagerly (off the event
     # loop) so the common failures map to a clean status before any bytes are
@@ -1363,6 +1386,7 @@ async def speech_to_text_stream_response(
                 config_store=config_store,
                 backend_auth_resolver=backend_auth_resolver,
                 cancel_ref=abort_ref,
+                deadline=deadline,
             )
     except DeadlineCancelledError:
         # Only the watcher aborts during the call, so the caller has gone.
