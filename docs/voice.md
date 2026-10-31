@@ -1145,6 +1145,23 @@ off clears it, so the next session starts listening. With auto-stop off the
 mic button keeps its dictation job (it is how a spoken turn ends), so there
 is no mute switch.
 
+### Idle microphone
+
+`audio.voice_idle_mute_seconds` · default `60` · range 0–3600 seconds
+
+A voice session left open is a live microphone. Talking to someone in the room
+("yeah, go ahead and delete that") or to another model in another tab would be
+heard and sent as an instruction. So after this many seconds with the mic open
+and no speech heard, voice mode turns its own mic off. It is the same switch as
+the mic button: the status line reads **Mic off — replies still play**, voice
+mode stays on, and anything still coming is read aloud. Press the mic button to
+listen again.
+
+Only open-mic time counts. Speech restarts the clock, and the time spent
+waiting for a reply or playing one does not count, so a long job never mutes
+the mic out from under the next turn. `0` never turns the mic off. With
+auto-stop off there is no mute switch, so this has no effect.
+
 ### Half-duplex
 
 The microphone is closed while anything plays. While a reply is being read —
@@ -1229,12 +1246,13 @@ configured, and a browser that supports microphone capture — are checked
 separately, so turning this on cannot make the button appear where it could
 not work.
 
-The button appears **on** for a coordinator created with the
-[`voice` persona](#voice-persona) and **off** for every other persona. That is
-the whole default: a voice session is a spoken conversation by construction, so
-it opens listening; a coordinator you opened to read and type does not start
-recording at you. Either way the button is the override — press it to turn the
-mode on in a text session, or off in a voice one.
+The button appears **on** only for a voice session you have just started
+from the launcher's **Voice** tab, in the same page. Everything else opens
+with the mode **off**: other personas, and a voice session the page did not
+just start. That includes a reload, a browser restoring the tab after a
+restart, and a Turnstone redeploy, so a session you forgot about never comes
+back as a live microphone. Either way the button is the override: press it to
+turn the mode on in any session, or off in a voice one.
 
 ### Turning the setting off for one session
 
@@ -1243,9 +1261,10 @@ where the microphone must not open without a deliberate click. Dictation is
 unaffected: the mic button still records a clip per click. The setting only
 controls the hands-free loop.
 
-Leave it on where a voice session is the point. A voice session opens
-listening as soon as the page has confirmed both roles, so the browser's
-microphone permission prompt appears at open rather than on a click. A browser
+Leave it on where a voice session is the point. A voice session you have
+just started opens listening as soon as the page has confirmed both roles, so
+the browser's microphone permission prompt appears at open rather than on a
+click. A browser
 that refuses the microphone leaves the mic button in its blocked state and
 nothing is recorded; other personas start with the loop off and wait for the
 button.

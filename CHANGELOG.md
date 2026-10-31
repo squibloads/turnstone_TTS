@@ -305,6 +305,14 @@ already shipped on the 1.8 line are not repeated here.
 
 ### Added
 
+- **Voice mode no longer comes back on by itself, and an idle mic turns off.** A voice session
+  opens listening only right after you start it from the launcher's Voice tab in the same page; a
+  reload, a browser restoring the tab or a redeploy brings it back with voice mode off. While voice
+  mode is on, `audio.voice_idle_mute_seconds` (default 60, 0 = never) turns the microphone off
+  after that long with the mic open and no speech heard. Voice mode stays on and replies still
+  play; press the mic to listen again. Waiting for or playing a reply does not count. A forgotten
+  session would otherwise hear the next thing said in the room and send it as an instruction.
+
 - **Read-aloud speaks symbols, units and version numbers.** Before text goes to the text-to-speech
   backend, a small English rule set rewrites things models read badly into plain words: `~5`
   becomes "about 5", `32GB` "32 gigabytes", `120ms` "120 milliseconds", `3-5` "3 to 5", `1.8.5`

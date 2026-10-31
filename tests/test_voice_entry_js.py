@@ -54,6 +54,7 @@ let _homeCoordBusy = false;
 const _homeStagedFiles = [];
 const _PROJECT_NEW = "__new__";
 const _SCHEDULE_NO_FILES_MSG = "";
+const _freshVoiceLaunches = new Set();
 """ + "\n".join(
     extract_braced(_APP, sig)
     for sig in (
@@ -66,6 +67,7 @@ const _SCHEDULE_NO_FILES_MSG = "";
         "function _paintLauncherVisibility() {",
         "function _setLauncherKind(kind, focus) {",
         "function startVoiceSession(opts) {",
+        "function takeVoiceLaunch(wsId) {",
         "function submitHomeCoord(textFromComposer) {",
     )
 )
@@ -125,9 +127,13 @@ globalThis._consoleHasPermission = function () { return true; };
 const fetched = [];
 const sent = [];
 const opened = [];
+let createFails = false;          // the create answers 500 with no ws_id
 globalThis.authFetch = function (url, opts) {
   fetched.push(url);
   sent.push({ url: url, opts: opts });
+  if (createFails) {
+    return Promise.resolve({ ok: false, status: 500, json: function () { return Promise.resolve({}); } });
+  }
   return Promise.resolve({
     ok: true,
     status: 200,
@@ -534,3 +540,43 @@ console.log(JSON.stringify({
     ]
     assert out["byId"]["read-aloud"] == ["audio.tts_stream"]
     assert "other" not in out["byId"]
+
+
+# ---------------------------------------------------------------------------
+# A launch is the only thing that opens a voice session listening
+# ---------------------------------------------------------------------------
+
+
+def test_a_voice_launch_is_taken_exactly_once() -> None:
+    # The pane takes it when it mounts; a later mount of the same session (a
+    # rebuild, a second pane) must find nothing and open with voice mode off.
+    out = _run_app(
+        _PAGE
+        + """
+startVoiceSession();
+await new Promise(setImmediate);
+console.log(JSON.stringify({ first: takeVoiceLaunch("ws-voice"),
+  again: takeVoiceLaunch("ws-voice"), other: takeVoiceLaunch("ws-other") }));
+"""
+    )
+    assert out == {"first": True, "again": False, "other": False}
+
+
+def test_a_failed_voice_create_marks_nothing() -> None:
+    out = _run_app(
+        _PAGE
+        + """
+createFails = true;
+startVoiceSession();
+await new Promise(setImmediate);
+console.log(JSON.stringify({ taken: takeVoiceLaunch("ws-voice"), size: _freshVoiceLaunches.size }));
+"""
+    )
+    assert out == {"taken": False, "size": 0}
+
+
+def test_the_launch_record_reaches_the_pane_through_ts_app() -> None:
+    assert "window.TS_APP.takeVoiceLaunch = takeVoiceLaunch;" in _APP
+    # Page memory only: a reload must forget it, so nothing may persist it.
+    body = _APP[_APP.index("function takeVoiceLaunch(wsId) {") :][:600]
+    assert "Storage" not in body

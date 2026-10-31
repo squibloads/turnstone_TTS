@@ -591,6 +591,9 @@ function createCoordinatorPane(root, wsId, opts) {
   // the mic button becomes voice mode's mic on/off switch; with it off the
   // press is still how a spoken turn ends, so dictation keeps it.
   let voiceAutoStop = false;
+  // audio.voice_idle_mute_seconds: how long the open mic may hear nothing
+  // before voice mode turns it off (0 = never).  Read on the same probe.
+  let voiceIdleMuteSeconds = 60;
   const mic = createMicController({
     composer: composer,
     base: "",
@@ -7061,6 +7064,8 @@ function createCoordinatorPane(root, wsId, opts) {
       .then((r) => (r.ok ? r.json() : null))
       .then((body) => {
         voiceAutoStop = !!body && body.auto_stop === true;
+        const idle = body ? Number(body.voice_idle_mute_seconds) : NaN;
+        voiceIdleMuteSeconds = Number.isFinite(idle) && idle >= 0 ? idle : 60;
         return !body || body.voice_mode_enabled !== false;
       })
       .catch(() => true);
@@ -7092,6 +7097,8 @@ function createCoordinatorPane(root, wsId, opts) {
       thinking: "Thinking\u2026",
       speaking: "Speaking\u2026",
       muted: "Mic off \u2014 replies still play",
+      // The loop muted itself after a quiet stretch (onIdleMute below).
+      "idle-muted": "Mic off after a quiet stretch \u2014 press the mic to listen",
     };
     const label = labels[state] || "";
     voiceStatusEl.textContent = label;
@@ -7131,6 +7138,13 @@ function createCoordinatorPane(root, wsId, opts) {
       // what is there; `text` is the fallback for a mic that does not.
       send: (text) => _sendVoiceText(text),
       setStatus: _voiceSetStatus,
+      // A forgotten session must not stay a live microphone: after this long
+      // with the mic open and nothing heard, the loop mutes itself.
+      idleMuteMs: voiceIdleMuteSeconds * 1000,
+      onIdleMute: () => {
+        _voicePaintMute();
+        _voiceSetStatus("idle-muted");
+      },
     });
   }
 
@@ -7244,9 +7258,16 @@ function createCoordinatorPane(root, wsId, opts) {
           return;
         }
         _voiceShow(true);
-        // A voice-persona session is a spoken conversation by construction,
-        // so it opens listening.  Every other persona offers the button off.
-        if (voicePersona) _voiceTurnOn();
+        // Only a voice session this page just launched opens listening.  A
+        // reload, a browser restoring the tab or a redeploy mounts the same
+        // session with no launch behind it, and a mic that comes back on by
+        // itself hears whatever is said next in the room.  The launcher's
+        // record lives in page memory, so a reload forgets it by construction;
+        // a page without the launcher (a missing bridge) opens off.
+        const app = window.TS_APP;
+        const justLaunched =
+          !!app && typeof app.takeVoiceLaunch === "function" && app.takeVoiceLaunch(wsId);
+        if (voicePersona && justLaunched) _voiceTurnOn();
       });
     });
   }

@@ -764,6 +764,12 @@ def stt_config_payload(*, config_store: Any) -> dict[str, Any]:
             raw("audio.stt_frame_capture_max_seconds"),
             "audio.stt_frame_capture_max_seconds",
         ),
+        # How long voice mode's open mic may hear nothing before it turns
+        # itself off (0 = never).  Read with the other mic knobs because the
+        # pane fetches these when voice mode starts.
+        "voice_idle_mute_seconds": _bounded_int(
+            raw("audio.voice_idle_mute_seconds"), "audio.voice_idle_mute_seconds"
+        ),
     }
 
 

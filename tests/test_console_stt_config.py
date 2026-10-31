@@ -28,6 +28,7 @@ _DEFAULTS = {
     "frame_capture": False,
     "segment_gap_ms": 250,
     "frame_capture_max_seconds": 300,
+    "voice_idle_mute_seconds": 60,
 }
 
 
@@ -72,6 +73,7 @@ def test_stored_values_pass_through() -> None:
         "frame_capture": False,
         "segment_gap_ms": 250,
         "frame_capture_max_seconds": 300,
+        "voice_idle_mute_seconds": 60,
     }
 
 
@@ -120,6 +122,7 @@ def test_the_console_route_serves_the_payload() -> None:
         "frame_capture": False,
         "segment_gap_ms": 250,
         "frame_capture_max_seconds": 300,
+        "voice_idle_mute_seconds": 60,
     }
 
 
@@ -136,6 +139,7 @@ def test_the_node_route_serves_the_payload() -> None:
         "frame_capture": False,
         "segment_gap_ms": 250,
         "frame_capture_max_seconds": 300,
+        "voice_idle_mute_seconds": 60,
     }
 
 
@@ -202,3 +206,33 @@ def test_frame_capture_knobs_are_typed_bounded_and_off_by_default() -> None:
         ]
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# The quiet-minute mic mute
+# ---------------------------------------------------------------------------
+
+
+def test_the_idle_mute_defaults_to_a_minute() -> None:
+    from turnstone.core.settings_registry import SETTINGS
+
+    defn = SETTINGS["audio.voice_idle_mute_seconds"]
+    assert (defn.type, defn.default, defn.min_value, defn.max_value) == ("int", 60, 0, 3600)
+    assert defn.help and defn.reference_url
+    assert stt_config_payload(config_store=_store({}))["voice_idle_mute_seconds"] == 60
+
+
+def test_zero_turns_the_idle_mute_off() -> None:
+    body = stt_config_payload(config_store=_store({"audio.voice_idle_mute_seconds": 0}))
+    assert body["voice_idle_mute_seconds"] == 0
+
+
+def test_the_idle_mute_clamps_and_falls_back() -> None:
+    def seconds(value: Any) -> int:
+        store = _store({"audio.voice_idle_mute_seconds": value})
+        return stt_config_payload(config_store=store)["voice_idle_mute_seconds"]
+
+    assert seconds(-5) == 0
+    assert seconds(99999) == 3600
+    assert seconds("soon") == 60
+    assert seconds(None) == 60
