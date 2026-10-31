@@ -270,6 +270,7 @@ def compose_system_message(
     db_policies: list[dict[str, Any]] | None = None,
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
     base_override: str | None = None,
+    environment_notes: str = "",
 ) -> str:
     """Compose a system message from modular components.
 
@@ -298,6 +299,11 @@ def compose_system_message(
         Persona base prompt.  When set it replaces the BASE module and
         NOTHING else — ENV / CONTEXT / TOOLS / POLICIES keep composing,
         so mandatory prompt policies ride on top of every persona.
+    environment_notes:
+        Operator-supplied facts about the deployment's host, appended
+        under an ``## Environment`` heading.  Empty (the default) leaves
+        the message byte-identical; the text is trusted operator input,
+        not user content.
 
     Returns
     -------
@@ -382,5 +388,14 @@ def compose_system_message(
         if gate and gate not in available_tools:
             continue
         parts.append(db_row["content"])
+
+    # 6. ENVIRONMENT — operator-supplied facts about the host, appended last
+    #    so they read as a standing description of the machine rather than
+    #    another behavioural policy.  Empty means no heading at all, so a
+    #    deployment that never sets the setting keeps a byte-identical
+    #    prompt (and prompt cache prefix).
+    notes = environment_notes.strip()
+    if notes:
+        parts.append(f"## Environment\n\n{notes}")
 
     return "\n\n".join(parts)

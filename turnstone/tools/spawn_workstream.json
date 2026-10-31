@@ -31,6 +31,10 @@
       "persona": {
         "type": "string",
         "description": "Optional persona name for the child (children are always interactive-kind, so the persona must apply to interactive workstreams). The persona is resolved and snapshotted at spawn time. Omit for the interactive default persona — the child never inherits this coordinator's persona."
+      },
+      "user_requested_count": {
+        "type": "boolean",
+        "description": "Set only when the user's latest message explicitly named a count of agents (for example \"one more agent\"). In a voice session it lets this call use coordinator.voice_max_requested_agents when that is larger than the normal per-turn cap; the claim is checked against the user's words and falls back to the normal cap when they did not name a number. Text coordinators ignore it."
       }
     },
     "required": []

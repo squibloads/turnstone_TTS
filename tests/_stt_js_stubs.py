@@ -1,12 +1,18 @@
-"""Node stubs shared by the dictation-mic harness suites (``stt_mic.js`` itself
-and the coordinator pane that mounts it).
+"""Node stubs shared by the dictation-family harness suites (``stt_mic.js``,
+the coordinator pane that mounts it, and ``stt_frames.js``).
 
-Layered on ``_tts_js_stubs.TREE_DOM`` (the tree DOM): it adds the few element
-features the mic touches (``style``, ``disabled``, ``classList.toggle``,
-``dispatchEvent``, ``focus``) and fakes for ``getUserMedia`` /
-``MediaRecorder`` / ``authFetch`` whose behaviour each test steers through
-``fake``.  The shipped ``stt_mic.js`` is evaluated against these (imports
-stripped by ``demodulize``), so the suites exercise the real controller.
+``MIC_DOM`` / ``MIC_STUBS`` layer on ``_tts_js_stubs.TREE_DOM`` (the tree DOM):
+they add the few element features the mic touches (``style``, ``disabled``,
+``classList.toggle``, ``dispatchEvent``, ``focus``) and fakes for
+``getUserMedia`` / ``MediaRecorder`` / ``authFetch`` whose behaviour each test
+steers through ``fake``.  The shipped ``stt_mic.js`` is evaluated against these
+(imports stripped by ``demodulize``), so the suites exercise the real
+controller.
+
+``FRAME_AUDIO_STUBS`` is the browser-audio half for frame capture: an
+``AudioContext`` whose worklet module load the caller can fail, an
+``AudioWorkletNode`` whose port the test can feed, and a Blob-URL registry so
+a suite can see the worklet source URL being revoked.  It needs no DOM.
 """
 
 from __future__ import annotations
@@ -112,4 +118,75 @@ function makeComposer(value) {
   row.appendChild(send);
   return { actionsRowEl: row, sendBtn: send, inputEl: input };
 }
+"""
+
+# `frameFake` steers the audio fakes: `worklet` false is a browser without
+# AudioWorklet; `failModule` is an error message `addModule` rejects with;
+# `sampleRate` is the context rate the capture must resample from.  `frameLog`
+# records the graph so a suite can assert the teardown (disconnected nodes,
+# closed context, revoked worklet URL) without a real browser.
+FRAME_AUDIO_STUBS = r"""
+const frameLog = { contexts: [], nodes: [], sources: [], modules: [], urls: [], revoked: [] };
+const frameFake = { worklet: true, failModule: null, sampleRate: 48000, moduleGate: null };
+const frameTick = async () => { for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r)); };
+let _frameUrlSeq = 0;
+// Subclass the real URL rather than replacing it, so a harness that also
+// parses URLs keeps working; only the Blob-URL pair is recorded.
+const _FrameURL = globalThis.URL;
+globalThis.URL = class extends _FrameURL {
+  static createObjectURL(blob) {
+    const url = "blob:frame-" + (++_frameUrlSeq);
+    frameLog.urls.push({ url, blob });
+    return url;
+  }
+  static revokeObjectURL(url) { frameLog.revoked.push(url); }
+};
+class FakeAudioWorkletNode {
+  constructor(context, name, options) {
+    this.context = context; this.name = name; this.options = options;
+    this.connected = []; this.disconnected = false; this.portOpen = true;
+    const self = this;
+    this.port = {
+      onmessage: null,
+      postMessage() {},
+      close() { self.portOpen = false; },
+      // The worklet posts mono chunks; a test stands in for the processor by
+      // handing the main-thread handler the samples it would have posted.
+      deliver(samples) { self.port.onmessage({ data: { type: "samples", samples } }); },
+    };
+    frameLog.nodes.push(this);
+  }
+  connect(target) { this.connected.push(target); }
+  disconnect() { this.disconnected = true; this.connected = []; }
+}
+globalThis.AudioWorkletNode = FakeAudioWorkletNode;
+class FakeAudioContext {
+  constructor() {
+    this.sampleRate = frameFake.sampleRate;
+    this.state = "suspended";
+    this.destination = { kind: "destination" };
+    this.audioWorklet = frameFake.worklet
+      ? {
+          addModule: async (url) => {
+            if (frameFake.moduleGate) await frameFake.moduleGate;
+            if (frameFake.failModule) throw new Error(frameFake.failModule);
+            frameLog.modules.push(url);
+          },
+        }
+      : undefined;
+    frameLog.contexts.push(this);
+  }
+  createMediaStreamSource(stream) {
+    const source = {
+      stream, disconnected: false,
+      connect(node) { this.node = node; },
+      disconnect() { this.disconnected = true; },
+    };
+    frameLog.sources.push(source);
+    return source;
+  }
+  async resume() { this.state = "running"; }
+  close() { this.state = "closed"; return Promise.resolve(); }
+}
+globalThis.AudioContext = FakeAudioContext;
 """
