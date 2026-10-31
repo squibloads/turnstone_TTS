@@ -39,6 +39,7 @@ import {
   formatAgentContextTokens,
   agentContextIsWarning,
   buildPreviewChip,
+  buildFileChip,
   clearConvVerdictPending,
   convBatchSummaryText,
   isConvVerdictCompactBlocker,
@@ -57,7 +58,7 @@ import {
 } from "./transcript_presentation.js";
 import { redactCredentials, tryPrettyJson } from "./redact_credentials.js";
 import { tryParseMcpError, buildMcpErrorEmbed } from "./mcp_error.js";
-import { authFetch, authGeneration } from "./auth.js";
+import { authFetch, authGeneration, hasScope, hasPermission } from "./auth.js";
 import { showToast } from "./toast.js";
 import { Composer } from "./composer.js";
 import {
@@ -210,6 +211,7 @@ const INTERACTIVE_DEFAULT_HOST = {
   // the preview pane beside this one; a bare pane keeps the transcript chip
   // as the only affordance.
   onPreview() {},
+  onFiles() {},
 };
 
 // The SSE overflow-recovery limiter (storm-guard threshold, cooldown-ladder
@@ -1215,10 +1217,11 @@ class Pane {
     // keys type; elsewhere y|Enter approve, n|Esc deny, a = approve-all.
     this.el.addEventListener("keydown", (e) => {
       if (!this.pendingApproval || !this.approvalBlockEl) return;
-      // The status-bar chip is a button inside this.el: Enter on it must
-      // reach its own click (reveal), never the approve arm below — and
-      // preventDefault here would swallow that click outright.
+      // Status-bar and content buttons keep their own keyboard activation;
+      // approval shortcuts must not swallow a click or approve another card.
       if (e.target === this._sbApproval) return;
+      if (e.target === this._sbFiles) return;
+      if (e.target.closest(".conv-content-chip")) return;
       // Keyboard acts on the OLDEST live cycle (the one approvalBlockEl
       // tracks); sibling cards from parallel task agents resolve by
       // their own buttons or become oldest in turn.  When the feedback
@@ -1340,7 +1343,7 @@ class Pane {
 
     // Per-workstream status bar (above input)
     this.statusBarEl = document.createElement("div");
-    this.statusBarEl.className = "ws-status-bar";
+    this.statusBarEl.className = "ws-status-bar ws-sb-has-files";
     this.statusBarEl.setAttribute("role", "status");
     this.statusBarEl.setAttribute("aria-live", "polite");
     this.statusBarEl.setAttribute("aria-atomic", "true");
@@ -1370,10 +1373,24 @@ class Pane {
       this.revealPendingApproval(),
     );
 
+    this._sbFiles = document.createElement("button");
+    this._sbFiles.type = "button";
+    this._sbFiles.className = "ws-sb-files";
+    this._sbFiles.textContent = "Files";
+    const filesOpen = document.createElement("span");
+    filesOpen.textContent = "↗";
+    filesOpen.setAttribute("aria-hidden", "true");
+    this._sbFiles.appendChild(filesOpen);
+    this._sbFiles.hidden = !(hasScope("write") && hasPermission("files.read"));
+    this._sbFiles.title = "Open Files pane";
+    this._sbFiles.setAttribute("aria-label", "Browse workspace files");
+    this._sbFiles.addEventListener("click", () => this._host.onFiles());
+
     this.statusBarEl.appendChild(this._sbTokens);
     this.statusBarEl.appendChild(this._sbTools);
     this.statusBarEl.appendChild(this._sbApproval);
     this.statusBarEl.appendChild(this._sbTurns);
+    this.statusBarEl.appendChild(this._sbFiles);
     this.el.appendChild(this.statusBarEl);
 
     // Input area — DOM + behavior comes from shared/composer.js.  The
@@ -4365,6 +4382,10 @@ class Pane {
               buildPreviewChip(msg.preview, (d) => this._host.onPreview(d)),
             );
           }
+          const fileChip = this._fileResultChip(
+            resultTarget, isToolError, isDenied, msg.effect_status,
+          );
+          if (fileChip) insertChained(fileChip);
           // A row naming a call_id this batch does not own is an ORPHAN
           // (a result for an earlier batch, or a second writer's append)
           // — it must not stamp THIS batch as failed.  The shared outcome
@@ -5296,12 +5317,29 @@ class Pane {
       const out = stripAnsi(String(step.output || "")).trim();
       if (out) {
         card.body.appendChild(renderCollapsibleOutput(out, !!step.is_error));
+        const denied = step.denied || /^(Denied by user|Blocked)/.test(out);
+        const fileChip = this._fileResultChip(
+          stepRow, step.is_error, denied, step.effect_status,
+        );
+        if (fileChip) card.body.appendChild(fileChip);
       }
     });
     card.wrap.dataset.state = "done";
     this._updateAgentLabel(card);
     row.appendChild(card.wrap);
     return card.wrap;
+  }
+
+  _fileResultChip(row, isError, denied, effectStatus) {
+    if (
+      !row || !row._filePath || isError || denied ||
+      (effectStatus && effectStatus !== "committed")
+    ) {
+      return null;
+    }
+    const chip = buildFileChip(row._filePath, (path) => this._host.onFiles(path));
+    chip.hidden = !(hasScope("write") && hasPermission("files.read"));
+    return chip;
   }
 
   appendToolOutput(callId, name, output, isError, preview, opts = {}) {
@@ -5491,6 +5529,11 @@ class Pane {
         this._host.onPreview(preview);
       }
     }
+    const fileChip =
+      !callId || target.dataset.callId === callId
+        ? this._fileResultChip(target, isError, isDenied, opts.effectStatus)
+        : null;
+    if (fileChip) insertResult(fileChip);
 
     if (callId) {
       this._toolResultNodes.set(callId, { row: target, nodes: resultNodes });
@@ -6138,6 +6181,13 @@ function buildToolDiv(item, indexLabel) {
   // as a label, not hidden calls (mirrors the coordinator).
   const row = buildConvRow(item, indexLabel ? { indexLabel } : {});
   row.dataset.funcName = item.func_name || "";
+  if (
+    ["write_file", "edit_file"].includes(item.func_name) &&
+    typeof item.file_path === "string" &&
+    item.file_path.length > 0 && item.file_path.length <= 4096
+  ) {
+    row._filePath = item.file_path;
+  }
   row.appendChild(buildConvCmd(item));
   return row;
 }
@@ -6150,8 +6200,10 @@ function buildToolDiv(item, indexLabel) {
 function synthToolItem(tc) {
   tc = tc || {};
   let header = "";
+  let filePath = tc.file_path;
   try {
     const args = JSON.parse(tc.arguments);
+    if (!filePath && args) filePath = args.path;
     if (tc.name === "bash") {
       header = String(Object.values(args)[0] || "");
     } else {
@@ -6168,7 +6220,7 @@ function synthToolItem(tc) {
   } catch (e) {
     header = String(tc.arguments || "").substring(0, 100);
   }
-  return { func_name: tc.name, call_id: tc.id || "", header };
+  return { func_name: tc.name, call_id: tc.id || "", header, file_path: filePath };
 }
 
 // Append an "✗ error" pill to an approval block as a sibling of the
@@ -6428,6 +6480,11 @@ function createInteractivePane(root, wsId, opts) {
         typeof window.TS_SHELL.openPreview === "function"
       ) {
         window.TS_SHELL.openPreview(descriptor, { base: base, wsId: wsId });
+      }
+    },
+    onFiles(path = null) {
+      if (window.TS_SHELL && typeof window.TS_SHELL.openFiles === "function") {
+        window.TS_SHELL.openFiles({ base: base, wsId: wsId }, path);
       }
     },
   };
