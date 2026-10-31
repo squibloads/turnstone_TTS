@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     from turnstone.core.storage._notify import Notify, NotifyStream
     from turnstone.core.storage._protocol import SavedWorkstreamPage
@@ -40,9 +40,12 @@ from turnstone.core.storage._lease import (
 )
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
+    MCP_SECRET_UNCHANGED,
+    OBO_AUTH_TYPES,
     USER_SCOPED_AUTH_TYPES,
     AttachmentWrite,
     ConversationCommitWorkstreamGoneError,
+    DelegatedTokenWrite,
     ForkCloneExpectation,
     ForkCloneSnapshot,
     LeaseFence,
@@ -53,6 +56,7 @@ from turnstone.core.storage._protocol import (
     OAuthTokenMetadataRow,
     OIDCIdentity,
     OIDCPendingState,
+    OIDCUnlinkResult,
     OIDCUserCredential,
     WorkstreamLeaseLostError,
 )
@@ -207,6 +211,12 @@ from turnstone.core.storage._utils import (
     build_attachments_by_msg as _build_attachments_by_msg,
 )
 from turnstone.core.storage._utils import (
+    consented_server_clause as _consented_server_clause,
+)
+from turnstone.core.storage._utils import (
+    delete_mcp_oauth_rows_on_connection as _delete_mcp_oauth_rows,
+)
+from turnstone.core.storage._utils import (
     delete_messages_after_core as _delete_messages_after_core,
 )
 from turnstone.core.storage._utils import (
@@ -226,6 +236,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     prune_workstreams_shared as _prune_workstreams_shared,
+)
+from turnstone.core.storage._utils import (
+    purge_mcp_oauth_rows_after_update as _purge_mcp_oauth_rows_after_update,
 )
 from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
@@ -4124,6 +4137,17 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             conn.commit()
             return result.rowcount > 0
 
+    def delete_prompt_template_if_enabled(self, template_id: str) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(prompt_templates).where(
+                    (prompt_templates.c.template_id == template_id)
+                    & (prompt_templates.c.enabled == 1)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
     def list_skills_filtered(
         self,
         *,
@@ -5741,6 +5765,10 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     "updated": now,
                 },
             )
+            if result.rowcount > 0:
+                # The name was free, so rows under it are left from a server deleted or renamed
+                # before: a new server never inherits them.
+                _delete_mcp_oauth_rows(conn, name)
             conn.commit()
             return result.rowcount > 0
 
@@ -5781,7 +5809,15 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             rows = conn.execute(q).fetchall()
             return [_row_to_dict(r, *_MCP_SERVER_BOOL_FIELDS) for r in rows]
 
-    def update_mcp_server(self, server_id: str, **fields: Any) -> bool:
+    def update_mcp_server(
+        self,
+        server_id: str,
+        *,
+        purge_oauth_rows: bool = False,
+        oauth_client_secret_ct: Any = MCP_SECRET_UNCHANGED,
+        expected: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> bool:
 
         fields = {k: v for k, v in fields.items() if k in _MCP_SERVER_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -5791,22 +5827,49 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         from turnstone.core.storage._protocol import StorageConflictError
 
         with self._conn() as conn:
+            current: Any = None
+            if purge_oauth_rows or "name" in fields:
+                # Serialize with other writers before reading the name the OAuth rows are keyed
+                # by, so the purge and the change commit together.
+                conn.execute(sa.text("BEGIN IMMEDIATE"))
+                current = conn.execute(
+                    sa.select(mcp_servers.c.name).where(mcp_servers.c.server_id == server_id)
+                ).fetchone()
+            values = dict(fields)
+            if oauth_client_secret_ct is not MCP_SECRET_UNCHANGED:
+                values["oauth_client_secret_ct"] = oauth_client_secret_ct
+            stmt = sa.update(mcp_servers).where(mcp_servers.c.server_id == server_id)
+            for column, value in (expected or {}).items():
+                # Conditional write: only while the row still holds what the caller decided from.
+                col = mcp_servers.c[column]
+                stmt = stmt.where(col.is_(None) if value is None else col == value)
             try:
-                result = conn.execute(
-                    sa.update(mcp_servers)
-                    .where(mcp_servers.c.server_id == server_id)
-                    .values(**fields)
-                )
+                result = conn.execute(stmt.values(**values))
             except sa.exc.IntegrityError as exc:
                 conn.rollback()
                 msg = str(exc.orig) if exc.orig is not None else str(exc)
                 raise StorageConflictError(f"mcp_server conflict ({server_id}): {msg}") from exc
+            if result.rowcount > 0 and current is not None:
+                old_name = current[0]
+                _purge_mcp_oauth_rows_after_update(
+                    conn, old_name, fields.get("name", old_name), purge=purge_oauth_rows
+                )
             conn.commit()
             return result.rowcount > 0
 
     def delete_mcp_server(self, server_id: str) -> bool:
 
         with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            row = conn.execute(
+                sa.select(mcp_servers.c.name).where(mcp_servers.c.server_id == server_id)
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            # The OAuth rows are keyed by the name, which a later server can take: they go in the
+            # same transaction as the row.
+            _delete_mcp_oauth_rows(conn, row[0])
             result = conn.execute(
                 sa.delete(mcp_servers).where(mcp_servers.c.server_id == server_id)
             )
@@ -5830,6 +5893,54 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             )
             conn.commit()
             return result.rowcount > 0
+
+    def replace_consented_oauth_token(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        access_token_ct: bytes,
+        refresh_token_ct: bytes | None,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        expected_server: Mapping[str, Any],
+        pins: Sequence[str | None],
+    ) -> bool:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            server = conn.execute(
+                sa.select(mcp_servers.c.server_id).where(
+                    _consented_server_clause(server_name, expected_server, pins)
+                )
+            ).fetchone()
+            if server is None:
+                conn.rollback()
+                return False
+            conn.execute(
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == server_name)
+                )
+            )
+            conn.execute(
+                sa.insert(oauth_tokens),
+                {
+                    "user_id": user_id,
+                    "token_key": server_name,
+                    "access_token_ct": access_token_ct,
+                    "refresh_token_ct": refresh_token_ct,
+                    "expires_at": expires_at,
+                    "scopes": scopes,
+                    "as_issuer": as_issuer,
+                    "audience": audience,
+                    "created": now,
+                    "last_refreshed": None,
+                },
+            )
+            conn.commit()
+            return True
 
     def create_oauth_token(
         self,
@@ -5862,6 +5973,64 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 },
             )
             conn.commit()
+
+    def replace_delegated_oauth_token(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        access_token_ct: bytes,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        obo_server: str | None = None,
+    ) -> DelegatedTokenWrite:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            credential = conn.execute(
+                sa.select(oidc_user_credentials.c.user_id).where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == as_issuer)
+                )
+            ).fetchone()
+            if credential is None:
+                conn.rollback()
+                return "credential_gone"
+            if obo_server is not None:
+                server = conn.execute(
+                    sa.select(mcp_servers.c.server_id).where(
+                        (mcp_servers.c.name == obo_server)
+                        & mcp_servers.c.auth_type.in_(sorted(OBO_AUTH_TYPES))
+                    )
+                ).fetchone()
+                if server is None:
+                    conn.rollback()
+                    return "binding_changed"
+            conn.execute(
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
+                )
+            )
+            result = conn.execute(
+                sa.insert(oauth_tokens).prefix_with("OR IGNORE"),
+                {
+                    "user_id": user_id,
+                    "token_key": token_key,
+                    "access_token_ct": access_token_ct,
+                    "refresh_token_ct": None,
+                    "expires_at": expires_at,
+                    "scopes": scopes,
+                    "as_issuer": as_issuer,
+                    "audience": audience,
+                    "created": now,
+                    "last_refreshed": None,
+                },
+            )
+            stored = result.rowcount > 0
+            conn.commit()
+            return "stored" if stored else "already_stored"
 
     def get_oauth_token(self, user_id: str, token_key: str) -> OAuthToken | None:
         """Return the per-(user, token key) token row or None."""
@@ -5897,19 +6066,20 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         access_token_ct: bytes,
         refresh_token_ct: bytes | None,
         expires_at: str | None,
+        expected_as_issuer: str,
+        expected_access_token_ct: bytes,
     ) -> bool:
-        """Rewrite token columns + ``last_refreshed`` after an AS refresh.
-
-        Preserves columns this method does not rewrite (``scopes``,
-        ``as_issuer``, ``audience``, ``created``). Returns True when a
-        row was updated.
-        """
+        """Rewrite token columns + ``last_refreshed`` after an AS refresh, while the row is still
+        the grant the refresh read (see the protocol). Returns True when a row was updated."""
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             result = conn.execute(
                 sa.update(oauth_tokens)
                 .where(
-                    (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
+                    (oauth_tokens.c.user_id == user_id)
+                    & (oauth_tokens.c.token_key == token_key)
+                    & (oauth_tokens.c.as_issuer == expected_as_issuer)
+                    & (oauth_tokens.c.access_token_ct == expected_access_token_ct)
                 )
                 .values(
                     access_token_ct=access_token_ct,
@@ -5927,6 +6097,26 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
             result = conn.execute(
                 sa.delete(oauth_tokens).where(
                     (oauth_tokens.c.user_id == user_id) & (oauth_tokens.c.token_key == token_key)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_oauth_token_if_unchanged(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        expected_as_issuer: str,
+        expected_access_token_ct: bytes,
+    ) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id)
+                    & (oauth_tokens.c.token_key == token_key)
+                    & (oauth_tokens.c.as_issuer == expected_as_issuer)
+                    & (oauth_tokens.c.access_token_ct == expected_access_token_ct)
                 )
             )
             conn.commit()
@@ -5986,8 +6176,9 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
 
         Unfiltered by expiry: an expired access token with a live refresh token
         is still a consented grant the sweep must keep hot. Joined to
-        ``mcp_servers`` so only ``oauth_user`` grants drive the sweep; synthetic
-        model mint-cache rows are excluded. No ciphertext is projected.
+        ``mcp_servers`` so only grants of enabled ``oauth_user`` servers drive the
+        sweep; synthetic model mint-cache rows are excluded. No ciphertext is
+        projected.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -6002,21 +6193,16 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                         mcp_servers.c.name == oauth_tokens.c.token_key,
                     )
                 )
-                .where(mcp_servers.c.auth_type == "oauth_user")
+                .where((mcp_servers.c.auth_type == "oauth_user") & (mcp_servers.c.enabled == 1))
             ).fetchall()
         return [(row[0], row[1], row[2]) for row in rows]
 
     def delete_mcp_oauth_rows_by_server_name(self, server_name: str) -> int:
         """Purge user tokens + pending OAuth state for *server_name*."""
         with self._conn() as conn:
-            tokens_result = conn.execute(
-                sa.delete(oauth_tokens).where(oauth_tokens.c.token_key == server_name)
-            )
-            pending_result = conn.execute(
-                sa.delete(mcp_oauth_pending).where(mcp_oauth_pending.c.server_name == server_name)
-            )
+            deleted = _delete_mcp_oauth_rows(conn, server_name)
             conn.commit()
-            return int(tokens_result.rowcount or 0) + int(pending_result.rowcount or 0)
+            return deleted
 
     def get_mcp_oauth_client_secret_ct(self, server_id: str) -> bytes | None:
         """Return the encrypted OAuth client secret column or None."""
@@ -6039,6 +6225,12 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         server_name: str,
         code_verifier: str,
         return_url: str,
+        *,
+        as_issuer: str,
+        iss_parameter_supported: bool,
+        server_id: str,
+        server_url: str,
+        audience: str,
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -6052,6 +6244,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     "code_verifier": code_verifier,
                     "return_url": return_url,
                     "created_at": now,
+                    "as_issuer": as_issuer,
+                    "iss_parameter_supported": 1 if iss_parameter_supported else 0,
+                    "server_id": server_id,
+                    "server_url": server_url,
+                    "audience": audience,
                 },
             )
             conn.commit()
@@ -6074,6 +6271,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     mcp_oauth_pending.c.code_verifier,
                     mcp_oauth_pending.c.return_url,
                     mcp_oauth_pending.c.created_at,
+                    mcp_oauth_pending.c.as_issuer,
+                    mcp_oauth_pending.c.iss_parameter_supported,
+                    mcp_oauth_pending.c.server_id,
+                    mcp_oauth_pending.c.server_url,
+                    mcp_oauth_pending.c.audience,
                 ).where(
                     (mcp_oauth_pending.c.state == state) & (mcp_oauth_pending.c.created_at > cutoff)
                 )
@@ -6090,6 +6292,11 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 code_verifier=row[3],
                 return_url=row[4],
                 created_at=row[5],
+                as_issuer=row[6],
+                iss_parameter_supported=bool(row[7]),
+                server_id=row[8],
+                server_url=row[9],
+                audience=row[10],
             )
 
     def cleanup_expired_mcp_oauth_pending_states(self, max_age_seconds: int = 600) -> int:
@@ -6744,16 +6951,54 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 for r in rows
             ]
 
-    def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
-
+    def unlink_oidc_identity(
+        self, issuer: str, subject: str, *, model_token_prefix: str
+    ) -> OIDCUnlinkResult | None:
         with self._conn() as conn:
-            result = conn.execute(
+            # The writer lock first, so the purge set and the identity are read and deleted
+            # together; a concurrent unlink waits, then finds nothing.
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            row = conn.execute(
+                sa.select(oidc_identities.c.user_id).where(
+                    (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return None
+            user_id = str(row[0])
+            # The credential goes first: a delegated mint that stores its token only while the
+            # credential exists then either lands before this transaction or is refused after it.
+            credential = conn.execute(
+                sa.delete(oidc_user_credentials).where(
+                    (oidc_user_credentials.c.user_id == user_id)
+                    & (oidc_user_credentials.c.issuer == issuer)
+                )
+            )
+            tokens = conn.execute(
+                sa.delete(oauth_tokens).where(
+                    (oauth_tokens.c.user_id == user_id)
+                    & (
+                        oauth_tokens.c.token_key.in_(
+                            sa.select(mcp_servers.c.name).where(
+                                mcp_servers.c.auth_type.in_(sorted(OBO_AUTH_TYPES))
+                            )
+                        )
+                        | oauth_tokens.c.token_key.startswith(model_token_prefix, autoescape=True)
+                    )
+                )
+            )
+            conn.execute(
                 sa.delete(oidc_identities).where(
                     (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
                 )
             )
             conn.commit()
-            return result.rowcount > 0
+            return OIDCUnlinkResult(
+                user_id=user_id,
+                credential_deleted=credential.rowcount > 0,
+                delegated_token_rows_deleted=int(tokens.rowcount or 0),
+            )
 
     # -- OIDC user credential (single-credential MCP minting, #551) -------------
 
@@ -6779,6 +7024,38 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 )
             )
             conn.commit()
+
+    def upsert_oidc_user_credential_for_identity(
+        self, user_id: str, issuer: str, subject: str, *, refresh_token_ct: bytes
+    ) -> bool:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            identity = conn.execute(
+                sa.select(oidc_identities.c.user_id).where(
+                    (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+            ).fetchone()
+            if identity is None or identity[0] != user_id:
+                conn.rollback()
+                return False
+            from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+            stmt = sqlite_insert(oidc_user_credentials).values(
+                user_id=user_id,
+                issuer=issuer,
+                refresh_token_ct=refresh_token_ct,
+                created=now,
+                last_refreshed=now,
+            )
+            conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["user_id", "issuer"],
+                    set_={"refresh_token_ct": refresh_token_ct, "last_refreshed": now},
+                )
+            )
+            conn.commit()
+            return True
 
     def get_oidc_user_credential(self, user_id: str, issuer: str) -> OIDCUserCredential | None:
         """Return the captured credential row or None."""
@@ -6813,18 +7090,6 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                     & (oidc_user_credentials.c.issuer == issuer)
                 )
                 .values(refresh_token_ct=refresh_token_ct, last_refreshed=now)
-            )
-            conn.commit()
-            return result.rowcount > 0
-
-    def delete_oidc_user_credential(self, user_id: str, issuer: str) -> bool:
-        """Remove the captured credential. Returns True if existed."""
-        with self._conn() as conn:
-            result = conn.execute(
-                sa.delete(oidc_user_credentials).where(
-                    (oidc_user_credentials.c.user_id == user_id)
-                    & (oidc_user_credentials.c.issuer == issuer)
-                )
             )
             conn.commit()
             return result.rowcount > 0

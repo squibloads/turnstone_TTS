@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from turnstone.core.workstream import SAVED_PAGE_DEFAULT_LIMIT
 
+# Sentinel for ``update_mcp_server``'s client-secret write: distinguishes "leave the stored
+# secret" (every ordinary caller) from "clear it" (``None``).
+MCP_SECRET_UNCHANGED: object = object()
+
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
     from contextlib import AbstractContextManager
 
     from turnstone.core.storage._notify import NotifyStream
@@ -24,6 +28,9 @@ if TYPE_CHECKING:
 #: application layer (via :mod:`turnstone.core.mcp_crypto`, which re-exports
 #: it) agree on ONE set that cannot drift.
 USER_SCOPED_AUTH_TYPES: frozenset[str] = frozenset({"oauth_user", "oauth_obo"})
+# The sign-in passthrough auth types: their token rows are mint caches of the user's captured
+# credential, which an OIDC unlink purges with the identity.
+OBO_AUTH_TYPES: frozenset[str] = frozenset({"oauth_obo"})
 
 # Internal durable-incarnation fence. New manager rows receive it at
 # registration; legacy rows receive one atomically when an exact delete/fork
@@ -257,6 +264,19 @@ class OIDCUserCredential(TypedDict):
     last_refreshed: str
 
 
+# How a guarded write of a delegated mint-cache row ended: written; left to a row a concurrent
+# writer stored after this one's delete; or not written, because the user's credential is gone.
+DelegatedTokenWrite = Literal["stored", "already_stored", "credential_gone", "binding_changed"]
+
+
+class OIDCUnlinkResult(TypedDict):
+    """What :meth:`StorageBackend.unlink_oidc_identity` removed with the identity."""
+
+    user_id: str
+    credential_deleted: bool
+    delegated_token_rows_deleted: int
+
+
 class OIDCPendingState(TypedDict):
     """Row shape returned when popping a pending OIDC authorization-flow state."""
 
@@ -308,7 +328,14 @@ class OAuthTokenMetadataRow(TypedDict):
 
 
 class MCPOAuthPendingState(TypedDict):
-    """Row shape returned when popping a pending MCP OAuth flow state."""
+    """Row shape returned when popping a pending MCP OAuth flow state.
+
+    ``as_issuer`` is the authorization server the user was sent to and
+    ``iss_parameter_supported`` whether it promised ``iss`` in its responses (RFC 9207);
+    ``server_id``, ``server_url`` (canonical) and ``audience`` (the configured
+    ``oauth_audience``, empty when unset) are the server's binding when the flow started. A row
+    written before migration 085 has ``as_issuer == ""``.
+    """
 
     state: str
     user_id: str
@@ -316,6 +343,11 @@ class MCPOAuthPendingState(TypedDict):
     code_verifier: str
     return_url: str
     created_at: str
+    as_issuer: str
+    iss_parameter_supported: bool
+    server_id: str
+    server_url: str
+    audience: str
 
 
 class MCPPendingConsentRow(TypedDict):
@@ -1739,8 +1771,17 @@ class StorageBackend(Protocol):
         """List all OIDC identities linked to a turnstone user."""
         ...
 
-    def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
-        """Remove an OIDC identity link. Returns True if existed."""
+    def unlink_oidc_identity(
+        self, issuer: str, subject: str, *, model_token_prefix: str
+    ) -> OIDCUnlinkResult | None:
+        """Delete an OIDC identity and the delegated access it carried, in one transaction.
+
+        Under a lock on the identity row: the user's captured credential for *issuer*, then the
+        user's token rows for every ``oauth_obo`` MCP server and every key starting with
+        *model_token_prefix* (the delegated model caches), then the identity. Returns ``None``,
+        changing nothing, when the identity does not exist. ``oauth_user`` grants and every other
+        user's rows stay.
+        """
         ...
 
     # -- OIDC user credential (single-credential MCP minting, #551) -------------
@@ -1753,6 +1794,18 @@ class StorageBackend(Protocol):
         Replace-on-conflict: a fresh login must overwrite a stale or
         revoked credential.  ``created`` is preserved on replace;
         ``last_refreshed`` is reset to now either way.
+        """
+        ...
+
+    def upsert_oidc_user_credential_for_identity(
+        self, user_id: str, issuer: str, subject: str, *, refresh_token_ct: bytes
+    ) -> bool:
+        """Create or replace the captured credential only while the identity still links to it.
+
+        In one transaction with the identity ``(issuer, subject)`` locked against deletion: when it
+        no longer exists, or links another user, nothing is written and ``False`` is returned. A
+        sign-in that read the identity before an unlink can then never write the credential back
+        after it.
         """
         ...
 
@@ -1770,10 +1823,6 @@ class StorageBackend(Protocol):
         path MUST persist the newest token every time.  Returns True when
         a row was updated.
         """
-        ...
-
-    def delete_oidc_user_credential(self, user_id: str, issuer: str) -> bool:
-        """Remove the captured credential (logout-all / admin revoke). Returns True if existed."""
         ...
 
     # -- OIDC pending state ----------------------------------------------------
@@ -2369,6 +2418,13 @@ class StorageBackend(Protocol):
         """Delete a prompt template. Returns True if found."""
         ...
 
+    def delete_prompt_template_if_enabled(self, template_id: str) -> bool:
+        """Delete a prompt template only while it is enabled. Returns True if deleted.
+
+        One statement, so an admin's disable that commits first always keeps the row.
+        """
+        ...
+
     def count_prompt_templates(self, org_id: str = "") -> int:
         """Count prompt templates, optionally filtered by org_id."""
         ...
@@ -2893,7 +2949,11 @@ class StorageBackend(Protocol):
         oauth_as_issuer_cached: str | None = None,
     ) -> bool:
         """Create an MCP server definition. Return whether inserted: a taken server_id, name or
-        registry_name inserts nothing."""
+        registry_name inserts nothing.
+
+        When it inserts, the same transaction deletes the user tokens and pending OAuth flows
+        keyed by *name*: the name was free, so they were left by a server deleted or renamed
+        before, and a new server never inherits them."""
         ...
 
     def get_mcp_server(self, server_id: str) -> dict[str, Any] | None:
@@ -2908,8 +2968,27 @@ class StorageBackend(Protocol):
         """Return MCP servers ordered by name."""
         ...
 
-    def update_mcp_server(self, server_id: str, **fields: Any) -> bool:
-        """Update specified fields on an MCP server. Returns True if found.
+    def update_mcp_server(
+        self,
+        server_id: str,
+        *,
+        purge_oauth_rows: bool = False,
+        oauth_client_secret_ct: Any = MCP_SECRET_UNCHANGED,
+        expected: Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> bool:
+        """Update specified fields on an MCP server. Returns True if a row was updated.
+
+        *purge_oauth_rows* deletes the user tokens and pending OAuth flows keyed by the row's
+        current name in the same transaction as the update, read under a lock, so the change and
+        the purge commit together or not at all. A rename always does so, and also deletes the
+        rows keyed by the new name, which were left by a server deleted or renamed before.
+
+        *oauth_client_secret_ct* writes the client secret's ciphertext (``None`` clears it) in
+        the same statement: the one place besides ``set_mcp_oauth_client_secret_ct`` that takes
+        ciphertext, kept out of the generic *fields*. *expected* maps columns to the values the
+        caller decided from; the update applies only while the row still holds them (``None``
+        compares as NULL), so False means the row is gone or was changed meanwhile.
 
         Raises :class:`StorageConflictError` when a new name or registry_name is taken.
         """
@@ -2920,25 +2999,55 @@ class StorageBackend(Protocol):
         ...
 
     def delete_mcp_server(self, server_id: str) -> bool:
-        """Delete an MCP server definition. Returns True if existed."""
+        """Delete an MCP server definition. Returns True if existed.
+
+        The user tokens and pending OAuth flows keyed by its name are deleted in the same
+        transaction: a later server can take the name."""
         ...
 
     # -- MCP OAuth client secret ---------------------------------------------
     #
-    # ``oauth_client_secret_ct`` is intentionally absent from
-    # ``MCP_SERVER_MUTABLE`` (see ``_utils.py``).  It has its own dedicated
-    # writer so the encrypt/None-to-clear semantics live in one place — see
-    # ``set_mcp_oauth_client_secret_ct`` below.
+    # ``oauth_client_secret_ct`` is intentionally absent from ``MCP_SERVER_MUTABLE`` (see
+    # ``_utils.py``): creates and updates take it through their own keyword, and the writer below
+    # sets it alone.
 
     def set_mcp_oauth_client_secret_ct(self, server_id: str, secret_ct: bytes | None) -> bool:
         """Update only the encrypted OAuth client-secret column.
 
-        Returns True when a row was updated. ``None`` clears the column.
-        Bypasses ``MCP_SERVER_MUTABLE`` deliberately.
+        Returns True when a row was updated. ``None`` clears the column. Bypasses
+        ``MCP_SERVER_MUTABLE`` deliberately. A secret that comes with a server change or a client
+        registration goes in that write instead (``update_mcp_server``'s
+        ``oauth_client_secret_ct``), so it never pairs with another change's client id.
         """
         ...
 
     # -- Shared OAuth tokens -------------------------------------------------
+
+    def replace_consented_oauth_token(
+        self,
+        user_id: str,
+        server_name: str,
+        *,
+        access_token_ct: bytes,
+        refresh_token_ct: bytes | None,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        expected_server: Mapping[str, Any],
+        pins: Sequence[str | None],
+    ) -> bool:
+        """Replace the user's grant for *server_name* while that server is the one consented to.
+
+        In one transaction with the ``mcp_servers`` row under *server_name* locked against change
+        (a shared row lock; SQLite's write transaction), the row must hold each of
+        *expected_server*'s column values (``None`` matching ``NULL``, a boolean its stored 0/1)
+        and have its ``oauth_as_issuer_cached`` among *pins*; then the user's grant under the name
+        is replaced, one a concurrent consent stored included. Returns False, writing nothing,
+        when the server changed or is gone: a change that commits first leaves no grant, and one
+        that commits after this finds the grant to purge.
+        """
+        ...
 
     def create_oauth_token(
         self,
@@ -2955,6 +3064,32 @@ class StorageBackend(Protocol):
         """Insert a new per-(user, token key) token row. No-op on conflict."""
         ...
 
+    def replace_delegated_oauth_token(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        access_token_ct: bytes,
+        expires_at: str | None,
+        scopes: str | None,
+        as_issuer: str,
+        audience: str,
+        obo_server: str | None = None,
+    ) -> DelegatedTokenWrite:
+        """Replace a delegated mint-cache row, only while the credential that minted it exists.
+
+        In one transaction with the user's captured credential for *as_issuer* locked against
+        deletion: delete the user's row under *token_key*, then insert the new one (no refresh
+        token). With the credential gone, nothing is written (``credential_gone``): a mint that
+        was in flight when the credential was deleted never outlives it. *obo_server* names the
+        MCP server an MCP mint was for; the write also requires it to still be a sign-in
+        passthrough server (``OBO_AUTH_TYPES``), locked the same way, or answers
+        ``binding_changed``, so a mint in flight when the server's auth type changed never
+        outlives the purge. ``delete_user`` and ``unlink_oidc_identity`` delete the credential
+        before the delegated rows, which is what lets them see a row this wrote.
+        """
+        ...
+
     def get_oauth_token(self, user_id: str, token_key: str) -> OAuthToken | None:
         """Return the per-(user, token key) token row or None."""
         ...
@@ -2967,17 +3102,35 @@ class StorageBackend(Protocol):
         access_token_ct: bytes,
         refresh_token_ct: bytes | None,
         expires_at: str | None,
+        expected_as_issuer: str,
+        expected_access_token_ct: bytes,
     ) -> bool:
         """Rewrite token columns + ``last_refreshed`` after an AS refresh.
 
-        Preserves columns this method does not rewrite (``scopes``,
-        ``as_issuer``, ``audience``, ``created``). Returns True when a
-        row was updated.
+        Writes only while the row is still the grant the refresh read: its ``as_issuer`` and its
+        ``access_token_ct`` (fresh ciphertext on every write, so it identifies one version of the
+        row) still equal the expected values. A grant replaced meanwhile, by a consent that
+        completed or a revocation, is left alone. Preserves columns this method does not rewrite
+        (``scopes``, ``as_issuer``, ``audience``, ``created``). Returns True when a row was
+        updated.
         """
         ...
 
     def delete_oauth_token(self, user_id: str, token_key: str) -> bool:
         """Delete the per-(user, token key) token row. Returns True if existed."""
+        ...
+
+    def delete_oauth_token_if_unchanged(
+        self,
+        user_id: str,
+        token_key: str,
+        *,
+        expected_as_issuer: str,
+        expected_access_token_ct: bytes,
+    ) -> bool:
+        """Delete the token row only while it is the grant the caller read, compared as
+        :meth:`update_oauth_token_after_refresh` compares it. Returns True when a row was
+        deleted."""
         ...
 
     def list_oauth_token_metadata_by_user(self, user_id: str) -> list[OAuthTokenMetadataRow]:
@@ -3007,17 +3160,16 @@ class StorageBackend(Protocol):
         """Return ``(user_id, server_name, last_exercised_iso)`` for every MCP
         user-token row — the drive set for the background freshness sweep.
 
-        ``last_exercised = COALESCE(last_refreshed, created)`` is the last time
-        the grant's refresh token was exercised; the sweep force-refreshes once
-        it exceeds the configured keepalive window, so a provider that ages out
-        an *idle* refresh token can't expire one between a user's real sessions.
-        Deliberately UNFILTERED by ``expires_at``: an expired access token backed
-        by a live refresh token is still a consented, reconcilable grant. Only
-        The storage query joins ``mcp_servers`` and keeps only
-        ``auth_type='oauth_user'`` rows. Other auth paths also use the token
-        table as a mint cache, but they are not refresh-grant sweep targets.
-        Ciphertext columns are never touched — only identity + timestamp cross
-        the wire.
+        ``last_exercised = COALESCE(last_refreshed, created)`` is the last time the grant's refresh
+        token was exercised; the sweep force-refreshes once it exceeds the configured keepalive
+        window, so a provider that ages out an *idle* refresh token can't expire one between a
+        user's real sessions. Deliberately UNFILTERED by ``expires_at``: an expired access token
+        backed by a live refresh token is still a consented, reconcilable grant. The storage query
+        joins ``mcp_servers`` and keeps only rows of enabled ``auth_type='oauth_user'`` servers, so
+        the sweep stops refreshing a disabled server's grants on every host without waiting for its
+        reload. Other auth paths also use the token table as a mint cache, but they are not
+        refresh-grant sweep targets. Ciphertext columns are never touched — only identity +
+        timestamp cross the wire.
         """
         ...
 
@@ -3053,6 +3205,12 @@ class StorageBackend(Protocol):
         server_name: str,
         code_verifier: str,
         return_url: str,
+        *,
+        as_issuer: str,
+        iss_parameter_supported: bool,
+        server_id: str,
+        server_url: str,
+        audience: str,
     ) -> None:
         """Insert a pending MCP OAuth flow row for callback validation."""
         ...
