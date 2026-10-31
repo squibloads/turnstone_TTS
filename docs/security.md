@@ -78,26 +78,35 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 |-------|--------|---------|
 | `read` | View workstreams, saved workstreams, history | — |
 | `write` | Send messages, create/close workstreams | `read` |
-| `approve` | Approve tool calls, admin endpoints | `read`, `write` |
+| `approve` | Approve tool calls, trust a coordinator's sends, admin endpoints | `read`, `write` |
 
 ### Path-to-scope mapping
 
 | Method | Path pattern | Required scope | Additional RBAC gate |
 |--------|-------------|----------------|----------------------|
 | GET | Any protected path | `read` | Endpoint-specific where documented |
+| GET, HEAD | `/api/workstreams/{ws_id}/files`, `/files/preview`, `/files/content`, `/files/resolve` | `write` | `files.read`, active local interactive session and project tenancy; also enforced through the node proxy |
 | GET | `/api/workstreams/saved` | `read` | Creator/project visibility; console coordinator rows additionally require `admin.coordinator` |
 | GET | `/api/workstreams/{ws_id}` (detail) | `read`; also `write` to reopen a cold session | Project tenancy and kind-specific permission |
 | POST | `/api/command` | `write` | Project tenancy on the target workstream |
 | POST | `/api/workstreams/new`, `/api/cluster/workstreams/new` | `write` | `workstreams.create` or `admin.coordinator` |
 | POST | `/api/workstreams/{ws_id}/close` | `write` | `workstreams.close` or `admin.coordinator` |
 | POST | `/api/workstreams/{ws_id}/approve` | `approve` | `tools.approve` or `admin.coordinator` |
+| POST | `/api/workstreams/{ws_id}/trust` | `approve` | `admin.coordinator` and `coordinator.trust.send` |
+| POST | `/api/workstreams/{ws_id}/restrict`, `/close_all_children` | `write` | `admin.coordinator` |
 | POST | `/api/workstreams/{ws_id}/{rewind,retry}` | `write` | `conversation.modify` |
 | POST | `/api/workstreams/{ws_id}/delete` | `write` | Project tenancy; coordinator rows also require `admin.coordinator` |
-| POST | Other `/api/workstreams/{ws_id}/...` mutation endpoints | `write` | Project tenancy and endpoint-specific gates |
+| POST | `/api/workstreams/{ws_id}/speech-to-text`, `/speech-to-text/stream` | `write` | Project tenancy on the target workstream; also enforced through the node proxy |
 | DELETE | `/api/workstreams/{ws_id}/send` (dequeue), `/api/workstreams/{ws_id}/attachments/{attachment_id}` | `write` | Project tenancy on the target workstream |
+| Any but GET, HEAD | Other paths under `/api/workstreams/` | `write` | Project tenancy and endpoint-specific gates |
 | PUT | `/api/users/{user_id}/avatar`, `/api/users/{user_id}/avatar/picture` | `write` | The caller's own account only |
 | DELETE | `/api/users/{user_id}/avatar/picture` | `write` | The caller's own account only |
 | Any | `/api/admin/*` | `approve` | Matching `admin.*` permission |
+
+Under `/api/workstreams/` the method sets the floor: every request other than GET or HEAD
+needs at least `write`, so a route added there cannot fall through to `read`. `trust` needs
+`approve` because it lets a coordinator's sends to its own subtree skip approval. Through the
+console's `/node/{node_id}/...` proxy, these paths need the same scope as on the node.
 
 Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,
 `/static/*`, `/shared/*`, `/docs`, `/openapi.json`, `/api/auth/login`,
@@ -110,6 +119,17 @@ reopening existing history. Read-only callers can inspect saved metadata and use
 reopening a saved session and deleting history require write scope. The browser uses the effective
 `scopes` returned by login, refresh, and whoami separately from named RBAC permissions when showing
 these actions.
+
+The Files pane exposes node-shared files under the configured workspace (server working
+directory when unset), `/data`, and `/tmp`. It requires `files.read` permission in addition
+to write scope. The permission gates directory listings, previews, downloads, and the
+browser controls. It is included in the built-in admin and operator roles and can be
+revoked through role overrides or granted to custom roles. It controls direct file
+browsing; tool access to the filesystem remains governed by tool policies. Project
+tenancy gates the selected conversation, but does not make the shared disk private to that
+project. Requests are confined to one selected root, do not follow symlinks, reject special
+files, and do not reopen or reroute an inactive session. HTML uses the existing sandboxed
+preview policy; downloads carry attachment disposition and preserve original bytes.
 
 ### RBAC (Granular Permissions)
 
@@ -130,7 +150,7 @@ Three built-in roles are seeded by migration 008:
 | Role | Permissions |
 |------|-------------|
 | admin | Admin-default baseline (all ordinary admin and lifecycle permissions; explicitly opt-in capabilities remain ungranted) |
-| operator | read, write, workstreams.create, workstreams.close, conversation.modify |
+| operator | read, write, workstreams.create, workstreams.close, conversation.modify, files.read |
 | viewer | read |
 
 Custom roles can be created with any subset of the valid permissions.

@@ -87,16 +87,28 @@ does not add a cache-cleanup sweep.
   mints share the captured credential and persist refresh-token rotation.
 - **MCP disconnect:** the user's connections page deletes the local `oauth_user`
   grant and attempts upstream revocation. Sign-in passthrough and model mint
-  caches are excluded from that page. MCP admin purges delete token rows and
-  pending browser authorization states in one transaction; that purge does not
-  delete pending-consent rows or captured OIDC credentials.
+  caches are excluded from that page. An MCP server edit that changes what its
+  tokens are bound to, and every server deletion, purges its token rows and
+  pending browser authorization states in the same transaction as the change,
+  so neither lands without the other; creating or renaming a server also purges
+  rows left under its new name. That purge does not delete pending-consent rows
+  or captured OIDC credentials.
 - **Model edits and deletion:** changes to alias, audience, scopes, or auth mode
   purge the affected alias's delegated and app token caches. Model purges delete
   only token rows; they leave MCP authorization states and captured credentials
   alone. Other aliases' tokens survive.
-- **Identity unlink:** unlinking an OIDC identity deletes its captured credential,
-  purges the user's delegated MCP/model token caches, and requests model-memo
-  eviction on the console and registered nodes. Independent `oauth_user` grants
+- **Identity unlink:** unlinking an OIDC identity deletes its captured credential
+  and purges the user's delegated MCP/model token caches in the same transaction
+  as the identity, then evicts model-memo entries on the console and the nodes
+  registered within the last hour (no memo entry lives longer); the reply and
+  the audit name any host that could not confirm it.
+  Deleting a user evicts the same way. A delegated token is stored only while
+  the credential that minted it exists (and, for an MCP server, while the
+  server is still sign-in passthrough), checked in the same transaction, so a
+  mint that finishes after the unlink stores nothing; a row stored just before
+  it is purged with it, and a request that already holds the token can finish
+  with it. A sign-in stores its credential only while its identity still links
+  the user. Independent `oauth_user` grants
   and shared app-identity caches survive. Existing upstream access tokens may
   remain valid until expiry; the identity provider governs downstream access.
 - **User deletion:** deletes that user's database token rows and captured
