@@ -1747,7 +1747,8 @@ async def _run_dictation[T](
 
     The body is shared with the console (:func:`turnstone.core.web_helpers.run_dictation`);
     the node's budget and thread count are read here at call time, so they stay
-    the node's own names.
+    the node's own names.  The handlers pass the call its ``deadline`` from
+    arrival (``_STT_REQUEST_TIMEOUT_S``, also read at call time) in *kwargs*.
     """
     from turnstone.core.web_helpers import run_dictation
 
@@ -1775,6 +1776,7 @@ async def speech_to_text(request: Request) -> JSONResponse:
         authorize=_authorize_ws_access,
         run=_run_dictation,
         poll_s=_AUDIO_DISCONNECT_POLL_S,
+        request_timeout_s=_STT_REQUEST_TIMEOUT_S,
     )
 
 
@@ -1791,6 +1793,7 @@ async def speech_to_text_stream(request: Request) -> Response:
         authorize=_authorize_ws_access,
         run=_run_dictation,
         poll_s=_AUDIO_DISCONNECT_POLL_S,
+        request_timeout_s=_STT_REQUEST_TIMEOUT_S,
     )
 
 
