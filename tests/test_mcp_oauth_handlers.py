@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import socket
 import urllib.parse
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,12 +28,14 @@ from tests.conftest import make_mcp_token_cipher
 from turnstone.core.auth import AuthResult
 from turnstone.core.mcp_crypto import MCPTokenStore
 from turnstone.core.mcp_oauth import (
+    OAUTH_REGISTRATION_MODES,
     MCPOAuthExchangeError,
     _validate_return_url,
     exchange_code,
     handle_mcp_oauth_authorize,
     handle_mcp_oauth_callback,
     register_dynamic_client,
+    registers_a_client,
 )
 from turnstone.core.oauth.context import TokenCoordination, oauth_context
 from turnstone.core.oauth.http import ASMetadata, OAuthError
@@ -136,6 +139,35 @@ def _seed_oauth_user_server(
     return server_id
 
 
+def _seed_pending(
+    backend: SQLiteBackend,
+    *,
+    state: str = "valid-state",
+    user_id: str = "user-1",
+    server_name: str = "srv-oauth",
+    verifier: str = "verifier-blob",
+    return_url: str = "/admin/mcp-servers",
+    as_issuer: str = "https://as.example.com",
+    iss_parameter_supported: bool = False,
+    server_id: str = "srv-id-1",
+    server_url: str = "https://mcp.example.com/sse",
+    audience: str = "https://mcp.example.com",
+) -> None:
+    """A pending row as /start writes it for the server ``_seed_oauth_user_server`` seeds."""
+    backend.create_mcp_oauth_pending_state(
+        state,
+        user_id,
+        server_name,
+        verifier,
+        return_url,
+        as_issuer=as_issuer,
+        iss_parameter_supported=iss_parameter_supported,
+        server_id=server_id,
+        server_url=server_url,
+        audience=audience,
+    )
+
+
 def _good_as_metadata_doc() -> dict[str, Any]:
     return {
         "issuer": "https://as.example.com",
@@ -229,6 +261,22 @@ class TestAuthorize:
         resp = client.get("/v1/api/mcp/oauth/start?server=nope")
         assert resp.status_code == 404
 
+    def test_a_disabled_server_takes_no_consent(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        storage.update_mcp_server("srv-id-1", enabled=False)
+        token_store = _make_token_store(storage)
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth")
+
+        assert resp.status_code == 404
+        assert resp.json() == {"error": "Unknown MCP server"}
+        http_client_mock.get.assert_not_called()
+        http_client_mock.post.assert_not_called()
+
     def test_wrong_auth_type_400(self, storage: SQLiteBackend, http_client_mock: MagicMock) -> None:
         storage.create_mcp_server(
             server_id="static-1",
@@ -271,6 +319,29 @@ class TestAuthorize:
         assert resp.status_code == 502
         assert "S256" in resp.json()["error"]
 
+    def test_a_pin_whose_host_does_not_resolve_answers_502_and_keeps_the_pin(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        token_store = _make_token_store(storage)
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        def _getaddrinfo(host: str, *args: Any, **kwargs: Any) -> list[Any]:
+            if host == "as.example.com":
+                raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+            return [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+        with patch("socket.getaddrinfo", side_effect=_getaddrinfo):
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 502
+        assert "did not resolve" in resp.json()["error"]
+        http_client_mock.get.assert_not_called()
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None
+        assert row["oauth_as_issuer_cached"] == "https://as.example.com"
+
     def test_pending_state_persisted(
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
@@ -291,6 +362,66 @@ class TestAuthorize:
         assert pending is not None
         assert pending["user_id"] == "user-1"
         assert pending["server_name"] == "srv-oauth"
+        assert pending["as_issuer"] == "https://as.example.com"
+        assert pending["iss_parameter_supported"] is False
+        assert pending["server_id"] == "srv-id-1"
+        assert pending["server_url"] == "https://mcp.example.com/sse"
+        assert pending["audience"] == "https://mcp.example.com"
+
+    @pytest.mark.parametrize(
+        "stored_url", ["https://MCP.example.com/sse", "https://mcp.example.com:443/sse"]
+    )
+    def test_pending_state_records_the_canonical_url_and_the_configured_audience(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, stored_url: str
+    ) -> None:
+        storage.create_mcp_server(
+            server_id="srv-id-1",
+            name="srv-oauth",
+            transport="streamable-http",
+            url=stored_url,
+            auth_type="oauth_user",
+            oauth_client_id="client-abc",
+            oauth_scopes="openid profile",
+            oauth_audience=None,
+        )
+        storage.update_mcp_server("srv-id-1", oauth_as_issuer_cached="https://as.example.com")
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        state = urllib.parse.parse_qs(urllib.parse.urlparse(resp.headers["location"]).query)[
+            "state"
+        ][0]
+        pending = storage.pop_mcp_oauth_pending_state(state)
+        assert pending is not None
+        assert pending["server_url"] == "https://mcp.example.com/sse"
+        assert pending["audience"] == ""
+
+    def test_pending_state_records_an_advertised_iss_promise(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        token_store = _make_token_store(storage)
+        doc = _good_as_metadata_doc()
+        doc["authorization_response_iss_parameter_supported"] = True
+        http_client_mock.get.return_value = _mk_response(200, doc)
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        state = urllib.parse.parse_qs(urllib.parse.urlparse(resp.headers["location"]).query)[
+            "state"
+        ][0]
+        pending = storage.pop_mcp_oauth_pending_state(state)
+        assert pending is not None
+        assert pending["iss_parameter_supported"] is True
 
     @pytest.mark.parametrize(
         "return_url",
@@ -446,23 +577,11 @@ class TestAuthorize:
 
 
 class TestCallback:
-    def _seed_pending(
-        self,
-        storage: SQLiteBackend,
-        *,
-        state: str = "valid-state",
-        user_id: str = "user-1",
-        server_name: str = "srv-oauth",
-        verifier: str = "verifier-blob",
-        return_url: str = "/admin/mcp-servers",
-    ) -> None:
-        storage.create_mcp_oauth_pending_state(state, user_id, server_name, verifier, return_url)
-
     def test_happy_path_persists_token_and_redirects(
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
 
         http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
@@ -504,7 +623,7 @@ class TestCallback:
         through a real client: the catch has to match the client's library, or the error
         escapes as a 500."""
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
 
         def respond(request: httpx2.Request) -> httpx2.Response:
@@ -534,7 +653,7 @@ class TestCallback:
         """A document naming a token endpoint that ends in a line feed is refused at discovery,
         so the consent fails with OAuth's own error and nothing is posted (not a 500)."""
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
         document = _good_as_metadata_doc()
         document["token_endpoint"] = "https://as.example.com/token" + chr(10)
@@ -580,7 +699,7 @@ class TestCallback:
     ) -> None:
         _seed_oauth_user_server(storage)
         # Pending row attributes the flow to a different user.
-        self._seed_pending(storage, user_id="other-user")
+        _seed_pending(storage, user_id="other-user")
         token_store = _make_token_store(storage)
         app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
         client = TestClient(app, raise_server_exceptions=False)
@@ -592,25 +711,29 @@ class TestCallback:
         assert resp.status_code == 302
         assert "user+mismatch" in resp.headers["location"]
 
-    def test_as_error_redirects_with_message(
-        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    @pytest.mark.parametrize("state_query", ["", "&state=never-issued"], ids=["none", "unknown"])
+    def test_an_error_response_for_no_flow_shows_no_server_text(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, state_query: str
     ) -> None:
+        """Text from an authorization server is shown only for a flow this user started."""
         token_store = _make_token_store(storage)
         app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
         client = TestClient(app, raise_server_exceptions=False)
 
         resp = client.get(
-            "/v1/api/mcp/oauth/callback?error=access_denied&error_description=user+cancelled",
+            "/v1/api/mcp/oauth/callback?error=access_denied&error_description=chosen+text"
+            + state_query,
             follow_redirects=False,
         )
         assert resp.status_code == 302
-        assert "mcp_oauth_error" in resp.headers["location"]
+        assert resp.headers["location"] == "/?mcp_oauth_error=session+expired"
+        assert storage.list_audit_events(action="mcp_server.oauth.consent_failed") == []
 
     def test_jwt_audience_mismatch_redirects(
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
 
         # Build a JWT with a wrong audience.
@@ -646,7 +769,7 @@ class TestCallback:
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
 
         http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
@@ -674,7 +797,7 @@ class TestCallback:
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
 
         http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
@@ -704,7 +827,7 @@ class TestCallback:
         consent invariant.
         """
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         # Seed a deferred-consent record that a prior non-interactive run
         # would have left behind.  Plus a cross-tenant record that must
         # NOT be touched.
@@ -752,7 +875,7 @@ class TestCallback:
         stale badge is preferred over a broken consent flow.
         """
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
         http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
         http_client_mock.post.return_value = _mk_response(
@@ -864,6 +987,170 @@ class TestDCR:
         # Client secret was encrypted + stored.
         secret = token_store.get_oauth_client_secret(row["server_id"])
         assert secret == "dcr-secret"
+
+    @staticmethod
+    def _registering(client_secret: str | None) -> Any:
+        async def _post(url: str, *args: Any, **kwargs: Any) -> Any:
+            if url.endswith("/register"):
+                body: dict[str, Any] = {"client_id": "dcr-client-new"}
+                if client_secret is not None:
+                    body["client_secret"] = client_secret
+                return _mk_response(201, body)
+            raise AssertionError(f"unexpected POST {url}")
+
+        return _post
+
+    def test_a_registration_without_a_secret_clears_the_old_one(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """A public client gets no secret: one a previous registration left behind must not go
+        out with the new client id."""
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+        token_store.set_oauth_client_secret(server_id, "secret-from-the-old-server")
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+        http_client_mock.post.side_effect = self._registering(None)
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 302
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and row["oauth_client_id"] == "dcr-client-new"
+        assert token_store.get_oauth_client_secret(server_id) is None
+
+    @pytest.mark.parametrize("failing", ["secret", "client_id"])
+    def test_a_registered_client_that_cannot_be_saved_fails_the_start(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, failing: str
+    ) -> None:
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+        token_store.set_oauth_client_secret(server_id, "secret-from-the-old-server")
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+        http_client_mock.post.side_effect = self._registering("dcr-secret-new")
+
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        target = (
+            patch.object(
+                token_store, "encrypt_oauth_client_secret", side_effect=RuntimeError("down")
+            )
+            if failing == "secret"
+            else patch.object(storage, "update_mcp_server", side_effect=RuntimeError("down"))
+        )
+        with _public_addr_patch(), target:
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 502
+        assert "could not be saved" in resp.json()["error"]
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and not row["oauth_client_id"]
+
+    def test_a_registration_that_loses_to_another_host_uses_its_client(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """Two hosts register at once: the first to save wins, and the row never pairs one
+        registration's client id with the other's secret."""
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+
+        async def _post(url: str, *args: Any, **kwargs: Any) -> Any:
+            if url.endswith("/register"):
+                # Another host registers and saves its client while this one is at the AS.
+                storage.update_mcp_server(server_id, oauth_client_id="client-from-another-host")
+                token_store.set_oauth_client_secret(server_id, "secret-from-another-host")
+                return _mk_response(
+                    201, {"client_id": "dcr-client-new", "client_secret": "dcr-secret-new"}
+                )
+            raise AssertionError(f"unexpected POST {url}")
+
+        http_client_mock.post.side_effect = _post
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 302, resp.text
+        params = urllib.parse.parse_qs(urllib.parse.urlsplit(resp.headers["location"]).query)
+        assert params["client_id"] == ["client-from-another-host"]
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and row["oauth_client_id"] == "client-from-another-host"
+        assert token_store.get_oauth_client_secret(server_id) == "secret-from-another-host"
+
+    @pytest.mark.parametrize(
+        "move",
+        [
+            {"oauth_authorization_server_url": "https://new-as.example.net"},
+            {"url": "https://mcp2.example.com/sse"},
+        ],
+        ids=["authorization-server", "server-url"],
+    )
+    @pytest.mark.parametrize(
+        "registered_meanwhile", [None, "client-of-the-new-server"], ids=["cleared", "re-registered"]
+    )
+    def test_a_registration_overtaken_by_a_move_is_not_saved(
+        self,
+        storage: SQLiteBackend,
+        http_client_mock: MagicMock,
+        move: dict[str, Any],
+        registered_meanwhile: str | None,
+    ) -> None:
+        """While the registration is at the authorization server discovery found, an admin
+        points the server elsewhere and the console drops the client: the old server's client
+        never lands next to the new settings, and a client another host registered at the new
+        server is not taken for this flow, which discovery sent to the old one."""
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+        http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
+
+        async def _post(url: str, *args: Any, **kwargs: Any) -> Any:
+            assert url.endswith("/register"), url
+            assert storage.update_mcp_server(
+                server_id,
+                purge_oauth_rows=True,
+                oauth_client_secret_ct=None,
+                oauth_as_issuer_cached=None,
+                oauth_client_id=registered_meanwhile,
+                **move,
+            )
+            return _mk_response(201, {"client_id": "client-of-the-old-as", "client_secret": "s"})
+
+        http_client_mock.post.side_effect = _post
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 502, resp.text
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and row["oauth_client_id"] == registered_meanwhile
+        assert token_store.get_oauth_client_secret(server_id) is None
+
+    def test_a_server_moved_before_its_registration_registers_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """Discovery read the server, then an admin moved it before the registration lock: no
+        client is registered at the authorization server discovery found."""
+        server_id = _seed_oauth_user_server(storage, client_id=None, registration_mode="dcr")
+        token_store = _make_token_store(storage)
+
+        async def _get(url: str, *args: Any, **kwargs: Any) -> Any:
+            storage.update_mcp_server(server_id, url="https://mcp2.example.com/sse")
+            return _mk_response(200, _good_as_metadata_doc())
+
+        http_client_mock.get.side_effect = _get
+        app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            resp = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+
+        assert resp.status_code == 502, resp.text
+        http_client_mock.post.assert_not_called()
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and row["oauth_client_id"] is None
 
     def test_registration_transport_error_answers_502(self, storage: SQLiteBackend) -> None:
         """A transport failure at the registration endpoint is a 502 that names DCR, through a
@@ -1033,17 +1320,6 @@ class TestJWTAudienceHandling:
     so legitimate Auth0 tokens were rejected.
     """
 
-    def _seed_pending(
-        self,
-        storage: SQLiteBackend,
-        *,
-        state: str = "valid-state",
-        verifier: str = "verifier-blob",
-    ) -> None:
-        storage.create_mcp_oauth_pending_state(
-            state, "user-1", "srv-oauth", verifier, "/admin/mcp-servers"
-        )
-
     @staticmethod
     def _make_jwt(aud: Any) -> str:
         header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
@@ -1059,7 +1335,7 @@ class TestJWTAudienceHandling:
         # ``server_url`` is ``https://mcp.example.com/sse``.  A JWT whose
         # aud matches the configured oauth_audience must be accepted
         # even though it differs from the canonical resource URL.
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
         good_jwt = self._make_jwt("https://mcp.example.com")
         http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
@@ -1087,7 +1363,7 @@ class TestJWTAudienceHandling:
     ) -> None:
         """JWT ``aud=server_url`` is also accepted (RFC 8707 form)."""
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
         good_jwt = self._make_jwt("https://mcp.example.com/sse")
         http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
@@ -1112,7 +1388,7 @@ class TestJWTAudienceHandling:
     ) -> None:
         """JWT ``aud`` may be a list — accepted when ANY entry matches."""
         _seed_oauth_user_server(storage)
-        self._seed_pending(storage)
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
         good_jwt = self._make_jwt(["https://other.example.com", "https://mcp.example.com"])
         http_client_mock.get.return_value = _mk_response(200, _good_as_metadata_doc())
@@ -1196,9 +1472,7 @@ class TestCallbackErrorPopsPendingState:
         self, storage: SQLiteBackend, http_client_mock: MagicMock
     ) -> None:
         _seed_oauth_user_server(storage)
-        storage.create_mcp_oauth_pending_state(
-            "valid-state", "user-1", "srv-oauth", "verifier-blob", "/admin/mcp-servers"
-        )
+        _seed_pending(storage)
         token_store = _make_token_store(storage)
 
         app = _build_app(storage=storage, http_client=http_client_mock, token_store=token_store)
@@ -1218,6 +1492,519 @@ class TestCallbackErrorPopsPendingState:
         )
         assert replay.status_code == 302
         assert "session+expired" in replay.headers["location"]
+
+
+# ---------------------------------------------------------------------------
+# #1408: the response's iss (RFC 9207) and the server binding
+# ---------------------------------------------------------------------------
+
+
+def _consent_failed_reasons(storage: SQLiteBackend) -> list[str]:
+    events = storage.list_audit_events(action="mcp_server.oauth.consent_failed")
+    details = [
+        json.loads(ev["detail"]) if isinstance(ev["detail"], str) else ev["detail"] for ev in events
+    ]
+    return [detail.get("reason") for detail in details]
+
+
+class TestAuthorizationResponseChecks:
+    """Before the code goes anywhere, the callback checks the response's ``iss`` against the
+    issuer the user was sent to, and that the server is the one the flow started for; the token
+    is stored only while the server is still that one. An error response's text is shown once
+    the state, the user and ``iss`` check out."""
+
+    _ISS = "&iss=https%3A%2F%2Fas.example.com"
+
+    @staticmethod
+    def _ready(http_client: MagicMock) -> None:
+        http_client.get.return_value = _mk_response(200, _good_as_metadata_doc())
+        http_client.post.return_value = _mk_response(
+            200, {"access_token": "opaque-access-aaa", "token_type": "Bearer", "expires_in": 3600}
+        )
+
+    @staticmethod
+    def _callback(storage: SQLiteBackend, http_client: MagicMock, query: str) -> Any:
+        token_store = _make_token_store(storage)
+        app = _build_app(storage=storage, http_client=http_client, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            resp = client.get(f"/v1/api/mcp/oauth/callback?{query}", follow_redirects=False)
+        return resp, token_store
+
+    @pytest.mark.parametrize(
+        ("promised", "iss_query", "reason"),
+        [
+            (True, _ISS, None),
+            (True, "", "issuer_missing"),
+            (False, _ISS, None),
+            (False, "&iss=https%3A%2F%2Fother.example.com", "issuer_mismatch"),
+            (False, "", None),
+        ],
+        ids=[
+            "promised-and-sent",
+            "promised-not-sent",
+            "sent-unpromised",
+            "another-issuer",
+            "neither",
+        ],
+    )
+    def test_the_rfc_9207_table(
+        self,
+        storage: SQLiteBackend,
+        http_client_mock: MagicMock,
+        promised: bool,
+        iss_query: str,
+        reason: str | None,
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage, iss_parameter_supported=promised)
+        self._ready(http_client_mock)
+
+        resp, token_store = self._callback(
+            storage, http_client_mock, "code=auth-code&state=valid-state" + iss_query
+        )
+
+        assert resp.status_code == 302
+        if reason is None:
+            assert resp.headers["location"] == "/admin/mcp-servers"
+            assert token_store.get_user_token("user-1", "srv-oauth") is not None
+        else:
+            assert resp.headers["location"] == "/?mcp_oauth_error=authorization+server+mismatch"
+            http_client_mock.get.assert_not_called()
+            http_client_mock.post.assert_not_called()
+            assert _consent_failed_reasons(storage) == [reason]
+
+    @pytest.mark.parametrize(
+        "iss",
+        [
+            "",
+            "https%3A%2F%2Fas.example.com%2F",
+            "https%3A%2F%2FAS.example.com",
+            "https%3A%2F%2Fas.example.com%3A443",
+        ],
+        ids=["empty", "trailing-slash", "host-case", "default-port"],
+    )
+    def test_iss_is_compared_as_received(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, iss: str
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        self._ready(http_client_mock)
+
+        resp, _ = self._callback(
+            storage, http_client_mock, f"code=auth-code&state=valid-state&iss={iss}"
+        )
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=authorization+server+mismatch"
+        http_client_mock.post.assert_not_called()
+
+    def test_another_issuer_on_an_error_response_shows_none_of_its_text(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+
+        resp, _ = self._callback(
+            storage,
+            http_client_mock,
+            "error=access_denied&error_description=chosen+text&state=valid-state"
+            "&iss=https%3A%2F%2Fother.example.com",
+        )
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=authorization+server+mismatch"
+        assert _consent_failed_reasons(storage) == ["issuer_mismatch"]
+
+    def test_an_error_response_that_checks_out_is_shown_and_names_the_server(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+
+        resp, _ = self._callback(
+            storage,
+            http_client_mock,
+            "error=access_denied&error_description=user+cancelled&state=valid-state" + self._ISS,
+        )
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=user%20cancelled"
+        events = storage.list_audit_events(action="mcp_server.oauth.consent_failed")
+        assert len(events) == 1
+        assert events[0]["resource_id"] == "srv-id-1"
+        assert _consent_failed_reasons(storage) == ["authorization_error"]
+
+    def test_another_users_state_on_an_error_response_shows_none_of_its_text(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage, user_id="other-user")
+
+        resp, _ = self._callback(
+            storage,
+            http_client_mock,
+            "error=access_denied&error_description=chosen+text&state=valid-state",
+        )
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=user+mismatch"
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"oauth_as_issuer_cached": "https://other-as.example.com"},
+            {"oauth_authorization_server_url": "https://other-as.example.com"},
+        ],
+        ids=["pin", "override"],
+    )
+    def test_an_issuer_change_since_start_sends_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, change: dict[str, Any]
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        storage.update_mcp_server("srv-id-1", **change)
+        self._ready(http_client_mock)
+
+        resp, token_store = self._callback(
+            storage, http_client_mock, "code=auth-code&state=valid-state"
+        )
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=authorization+server+changed"
+        http_client_mock.get.assert_not_called()
+        http_client_mock.post.assert_not_called()
+        assert token_store.get_user_token("user-1", "srv-oauth") is None
+        assert _consent_failed_reasons(storage) == ["issuer_changed"]
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"url": "https://mcp2.example.com/sse"},
+            {"oauth_audience": "https://another-audience.example.com"},
+            {"auth_type": "oauth_obo"},
+            {"url": "not a url"},
+        ],
+        ids=["url", "audience", "auth-type", "url-no-longer-canonical"],
+    )
+    def test_a_server_changed_since_start_sends_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, change: dict[str, Any]
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        storage.update_mcp_server("srv-id-1", **change)
+        self._ready(http_client_mock)
+
+        resp, _ = self._callback(storage, http_client_mock, "code=auth-code&state=valid-state")
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=server+changed"
+        http_client_mock.post.assert_not_called()
+        assert _consent_failed_reasons(storage) == ["server_changed"]
+        (event,) = storage.list_audit_events(action="mcp_server.oauth.consent_failed")
+        detail = (
+            json.loads(event["detail"]) if isinstance(event["detail"], str) else event["detail"]
+        )
+        expected = {
+            "url": ["server_url"],
+            "oauth_audience": ["audience"],
+            "auth_type": ["auth_type"],
+        }[next(iter(change))]
+        assert detail["changed"] == expected
+        assert event["resource_id"] == "srv-id-1"
+
+    def test_a_server_created_again_under_the_name_sends_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        storage.delete_mcp_server("srv-id-1")
+        _seed_oauth_user_server(storage, server_id="srv-id-2")
+        # A /start that read the deleted server and wrote its row after the purges.
+        _seed_pending(storage)
+        self._ready(http_client_mock)
+
+        resp, _ = self._callback(storage, http_client_mock, "code=auth-code&state=valid-state")
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=server+changed"
+        http_client_mock.post.assert_not_called()
+        # Filed under the server the flow was started for, naming what changed.
+        (event,) = storage.list_audit_events(action="mcp_server.oauth.consent_failed")
+        detail = (
+            json.loads(event["detail"]) if isinstance(event["detail"], str) else event["detail"]
+        )
+        assert event["resource_id"] == "srv-id-1"
+        assert detail["changed"] == ["server_id"]
+        assert detail["current_server_id"] == "srv-id-2"
+
+    @staticmethod
+    def _start_then_callback(
+        storage: SQLiteBackend, http_client: MagicMock, callback_query: str, between: Any = None
+    ) -> tuple[Any, MCPTokenStore]:
+        """Run /start for ``srv-oauth``, then the callback with the state it issued."""
+        token_store = _make_token_store(storage)
+        app = _build_app(storage=storage, http_client=http_client, token_store=token_store)
+        client = TestClient(app, raise_server_exceptions=False)
+        with _public_addr_patch():
+            started = client.get("/v1/api/mcp/oauth/start?server=srv-oauth", follow_redirects=False)
+            assert started.status_code == 302, started.text
+            query = urllib.parse.urlparse(started.headers["location"]).query
+            state = urllib.parse.parse_qs(query)["state"][0]
+            if between is not None:
+                between()
+            resp = client.get(
+                f"/v1/api/mcp/oauth/callback?{callback_query}&state={state}",
+                follow_redirects=False,
+            )
+        return resp, token_store
+
+    def test_a_promised_iss_that_does_not_come_sends_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        self._ready(http_client_mock)
+        doc = _good_as_metadata_doc()
+        doc["authorization_response_iss_parameter_supported"] = True
+        http_client_mock.get.return_value = _mk_response(200, doc)
+
+        resp, token_store = self._start_then_callback(storage, http_client_mock, "code=auth-code")
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=authorization+server+mismatch"
+        http_client_mock.post.assert_not_called()
+        assert token_store.get_user_token("user-1", "srv-oauth") is None
+        assert _consent_failed_reasons(storage) == ["issuer_missing"]
+
+    @pytest.mark.parametrize(
+        "stored_url", ["https://MCP.example.com/sse", "https://mcp.example.com:443/sse"]
+    )
+    @pytest.mark.parametrize("healed_meanwhile", [False, True], ids=["as-stored", "healed"])
+    def test_a_row_stored_before_urls_were_canonical_completes_its_consent(
+        self,
+        storage: SQLiteBackend,
+        http_client_mock: MagicMock,
+        stored_url: str,
+        healed_meanwhile: bool,
+    ) -> None:
+        """A row from before v1.8.2 without an audience: /start records the canonical URL, and
+        an unrelated console save that rewrites the URL's spelling does not cancel the flow."""
+        storage.create_mcp_server(
+            server_id="srv-id-1",
+            name="srv-oauth",
+            transport="streamable-http",
+            url=stored_url,
+            auth_type="oauth_user",
+            oauth_client_id="client-abc",
+            oauth_scopes="openid profile",
+            oauth_audience=None,
+        )
+        storage.update_mcp_server("srv-id-1", oauth_as_issuer_cached="https://as.example.com")
+        self._ready(http_client_mock)
+
+        def _heal() -> None:
+            storage.update_mcp_server("srv-id-1", url="https://mcp.example.com/sse")
+
+        resp, token_store = self._start_then_callback(
+            storage,
+            http_client_mock,
+            "code=auth-code" + self._ISS,
+            between=_heal if healed_meanwhile else None,
+        )
+
+        assert resp.status_code == 302
+        assert "mcp_oauth_error" not in resp.headers["location"], resp.headers["location"]
+        assert token_store.get_user_token("user-1", "srv-oauth") is not None
+
+    @pytest.mark.parametrize(
+        ("edit", "location", "reason"),
+        [
+            (
+                {"url": "https://mcp2.example.com/sse"},
+                "/?mcp_oauth_error=server+changed",
+                "server_changed",
+            ),
+            (
+                {
+                    "oauth_authorization_server_url": "https://other-as.example.com",
+                    "oauth_as_issuer_cached": None,
+                },
+                "/?mcp_oauth_error=authorization+server+changed",
+                "issuer_changed",
+            ),
+        ],
+        ids=["re-pointed", "authorization-server-moved"],
+    )
+    def test_an_edit_during_the_code_exchange_leaves_no_token(
+        self,
+        storage: SQLiteBackend,
+        http_client_mock: MagicMock,
+        edit: dict[str, Any],
+        location: str,
+        reason: str,
+    ) -> None:
+        """The console's edit commits while the code is at the token endpoint, so its purge
+        finds no token yet; the grant write then finds the server changed and stores nothing."""
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        self._ready(http_client_mock)
+        answer = http_client_mock.post.return_value
+
+        async def _post(*_args: Any, **_kwargs: Any) -> Any:
+            storage.update_mcp_server("srv-id-1", **edit)
+            return answer
+
+        http_client_mock.post = AsyncMock(side_effect=_post)
+
+        resp, token_store = self._callback(
+            storage, http_client_mock, "code=auth-code&state=valid-state" + self._ISS
+        )
+
+        assert resp.headers["location"] == location
+        assert token_store.get_user_token("user-1", "srv-oauth") is None
+        assert _consent_failed_reasons(storage) == [reason]
+
+    def test_a_grant_that_cannot_be_stored_completes_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        self._ready(http_client_mock)
+
+        with patch.object(
+            storage, "replace_consented_oauth_token", side_effect=RuntimeError("database is locked")
+        ):
+            resp, token_store = self._callback(
+                storage, http_client_mock, "code=auth-code&state=valid-state" + self._ISS
+            )
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=storage+failure"
+        assert token_store.get_user_token("user-1", "srv-oauth") is None
+        assert storage.list_audit_events(action="mcp_server.oauth.consent_completed") == []
+
+    def test_a_server_that_cannot_be_read_sends_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        self._ready(http_client_mock)
+
+        with patch.object(
+            storage, "get_mcp_server_by_name", side_effect=RuntimeError("database is locked")
+        ):
+            resp, _ = self._callback(
+                storage, http_client_mock, "code=auth-code&state=valid-state" + self._ISS
+            )
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=storage+unavailable"
+        http_client_mock.post.assert_not_called()
+
+    def test_the_pin_this_callback_wrote_is_not_a_change(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        """With no pin at the start, the callback's own discovery pins the issuer; the grant
+        write accepts that."""
+        _seed_oauth_user_server(storage, cached_issuer=None)
+        _seed_pending(storage)
+        self._ready(http_client_mock)
+        http_client_mock.get.side_effect = lambda url, *a, **kw: (
+            _mk_response(
+                200,
+                {
+                    "resource": "https://mcp.example.com/sse",
+                    "authorization_servers": ["https://as.example.com"],
+                },
+            )
+            if "oauth-protected-resource" in url
+            else _mk_response(200, _good_as_metadata_doc())
+        )
+
+        resp, token_store = self._callback(
+            storage, http_client_mock, "code=auth-code&state=valid-state" + self._ISS
+        )
+
+        assert "mcp_oauth_error" not in resp.headers["location"], resp.headers["location"]
+        assert token_store.get_user_token("user-1", "srv-oauth") is not None
+        row = storage.get_mcp_server_by_name("srv-oauth")
+        assert row is not None and row["oauth_as_issuer_cached"] == "https://as.example.com"
+
+    def test_a_server_disabled_since_start_sends_nothing(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        storage.update_mcp_server("srv-id-1", enabled=False)
+        self._ready(http_client_mock)
+
+        resp, _ = self._callback(storage, http_client_mock, "code=auth-code&state=valid-state")
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=server+missing"
+        http_client_mock.post.assert_not_called()
+        assert storage.get_oauth_token("user-1", "srv-oauth") is None
+
+    def test_a_server_disabled_during_the_code_exchange_gets_no_grant(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        self._ready(http_client_mock)
+        answer = http_client_mock.post.return_value
+
+        async def _post(*_args: Any, **_kwargs: Any) -> Any:
+            storage.update_mcp_server("srv-id-1", enabled=False)
+            return answer
+
+        http_client_mock.post = AsyncMock(side_effect=_post)
+
+        resp, token_store = self._callback(
+            storage, http_client_mock, "code=auth-code&state=valid-state" + self._ISS
+        )
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=server+missing"
+        assert token_store.get_user_token("user-1", "srv-oauth") is None
+        assert _consent_failed_reasons(storage) == ["server_disabled"]
+
+    def test_a_flow_started_before_flows_recorded_their_issuer_reads_as_expired(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage, as_issuer="")
+        self._ready(http_client_mock)
+
+        resp, _ = self._callback(storage, http_client_mock, "code=auth-code&state=valid-state")
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=session+expired"
+        http_client_mock.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "code=a&code=b&state=valid-state",
+            "code=a&state=valid-state&iss=x&iss=y",
+            "code=a&state=valid-state&state=other",
+            "error=e&error=f&state=valid-state",
+            "error=e&error_description=one&error_description=two&state=valid-state",
+            "code=a&state=valid-state&session_state=s1&session_state=s2",
+        ],
+        ids=["code", "iss", "state", "error", "error-description", "an-ignored-parameter"],
+    )
+    def test_a_repeated_parameter_is_refused_and_the_flow_kept(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock, query: str
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+        self._ready(http_client_mock)
+
+        resp, _ = self._callback(storage, http_client_mock, query)
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=invalid+response"
+        http_client_mock.post.assert_not_called()
+        assert storage.pop_mcp_oauth_pending_state("valid-state") is not None
+
+    def test_a_storage_failure_on_the_pop_redirects_with_a_fixed_message(
+        self, storage: SQLiteBackend, http_client_mock: MagicMock
+    ) -> None:
+        _seed_oauth_user_server(storage)
+        _seed_pending(storage)
+
+        with patch.object(
+            storage, "pop_mcp_oauth_pending_state", side_effect=RuntimeError("database is locked")
+        ):
+            resp, _ = self._callback(storage, http_client_mock, "code=auth-code&state=valid-state")
+
+        assert resp.headers["location"] == "/?mcp_oauth_error=storage+unavailable"
+        http_client_mock.post.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1353,3 +2140,47 @@ class TestValidateReturnUrl:
         assert (
             _validate_return_url("https://app.example.com:8443/admin", self.REDIRECT_BASE) is None
         )
+
+
+@pytest.mark.parametrize("mode", [*OAUTH_REGISTRATION_MODES, None])
+def test_every_registration_mode_either_registers_a_client_or_uses_the_operators(
+    storage: SQLiteBackend, http_client_mock: MagicMock, mode: str | None
+) -> None:
+    """A mode the console accepts but no flow acts on would repeat the old ``dynamic`` drift."""
+    from turnstone.core.mcp_oauth import _register_dynamic_client_if_needed
+
+    _seed_oauth_user_server(storage, client_id=None, registration_mode=mode)
+    row = storage.get_mcp_server_by_name("srv-oauth")
+    assert row is not None
+    register = AsyncMock(return_value=("registered-client", None))
+    app = _build_app(
+        storage=storage, http_client=http_client_mock, token_store=_make_token_store(storage)
+    )
+    request = MagicMock()
+    request.app = app
+
+    async def _run() -> Any:
+        with patch("turnstone.core.mcp_oauth.register_dynamic_client", new=register):
+            return await _register_dynamic_client_if_needed(
+                request=request,
+                storage=storage,
+                token_store=_make_token_store(storage),
+                http_client=http_client_mock,
+                as_metadata=MagicMock(),
+                server_row=row,
+                server_id="srv-id-1",
+                server_name="srv-oauth",
+                user_id="user-1",
+                redirect_uri="https://console.example.com/v1/api/mcp/oauth/callback",
+                registration_mode=mode or "",
+            )
+
+    client_id, error = asyncio.run(_run())
+
+    assert error is None
+    if registers_a_client(mode):
+        register.assert_awaited_once()
+        assert client_id == "registered-client"
+    else:
+        register.assert_not_awaited()
+        assert client_id == ""
