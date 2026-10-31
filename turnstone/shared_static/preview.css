@@ -179,6 +179,22 @@
   word-break: break-word;
 }
 
+/* Source files retain indentation and scroll horizontally. The shared
+   highlight.js token theme in chat.css colors the safe code element. */
+.preview-source {
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
+  min-width: min-content;
+}
+.preview-source code {
+  display: block;
+  padding: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+}
+
 .preview-markdown {
   max-width: 86ch;
   margin: 0 auto;
@@ -321,45 +337,4 @@
   line-height: 1.5;
   color: var(--ink-3);
   border-top: 1px solid var(--hair);
-}
-
-/* ----- transcript chip (conversation.js buildPreviewChip) ----- */
-.conv-preview-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 100%;
-  margin-top: 6px;
-  padding: 3px 10px;
-  font-size: 11px;
-  color: var(--ink-2);
-  background: color-mix(in srgb, var(--accent) 15%, transparent);
-  border: 1px solid var(--hair);
-  border-radius: 3px;
-  cursor: pointer;
-}
-.conv-preview-chip:hover {
-  color: var(--ink);
-  border-color: var(--ink-4);
-}
-.conv-preview-glyph {
-  flex: none;
-  color: var(--ink-3);
-}
-.conv-preview-title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.conv-preview-kind {
-  flex: none;
-  padding: 0 5px;
-  font-size: 9px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-  border: 1px solid var(--hair);
-  border-radius: 3px;
 }

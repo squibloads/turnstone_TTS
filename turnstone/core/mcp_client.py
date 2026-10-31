@@ -91,6 +91,7 @@ from turnstone.core.mcp_oauth import (
     get_obo_access_token_classified,
     get_user_access_token_classified,
     is_user_scoped_auth,
+    server_row_disabled,
 )
 from turnstone.core.oauth.context import oauth_context
 from turnstone.core.sse_limits import MAX_SSE_EVENT_SIZE
@@ -483,6 +484,14 @@ class _PoolDispatchRetryRequested(BaseException):  # noqa: N818
     """
 
 
+class _PoolServerDisabledError(Exception):
+    """Module-private signal: a call that holds its pool entry found the server disabled or removed.
+
+    Raised by ``_dispatch_pool_with_entry_call`` after it re-reads the server's row; each pool
+    dispatcher turns it into the ``mcp_server_disabled`` refusal.
+    """
+
+
 class _CapturedHTTPError(ConnectionError):
     """A snapshot of the failed connection's status, safe to carry across the sync bridge."""
 
@@ -648,6 +657,15 @@ def _is_followed_post_redirect(response: httpx2.Response) -> bool:
     if target.userinfo and target.userinfo != sent_url.userinfo:
         return False
     return _within_origin(sent_url, target)
+
+
+def _connects_over_http(cfg: dict[str, Any]) -> bool:
+    """Whether a server entry connects over Streamable HTTP.
+
+    An entry with a ``url`` connects over HTTP even when it names no ``type`` (or names ``stdio``),
+    so the connect paths and the status report decide by this one rule.
+    """
+    return cfg.get("type", "stdio") in ("http", "streamable-http") or "url" in cfg
 
 
 def _tls_skip_verify(cfg: dict[str, Any]) -> bool:
@@ -3854,8 +3872,7 @@ class MCPClientManager:
         state.relisten_requested = relisten_requested
         try:
             async with AsyncExitStack() as stack:
-                transport = cfg.get("type", "stdio")
-                if transport in ("http", "streamable-http") or "url" in cfg:
+                if _connects_over_http(cfg):
                     async with asyncio.timeout(self._CONNECT_TIMEOUT):
                         http_client = await stack.enter_async_context(
                             _make_capturing_http_client(
@@ -3998,8 +4015,7 @@ class MCPClientManager:
         # pre-flight's) is worded with none, never with the last connection's.
         state.http_capture = None
 
-        transport = cfg.get("type", "stdio")
-        is_http = transport in ("http", "streamable-http") or "url" in cfg
+        is_http = _connects_over_http(cfg)
         if is_http:
             # Pre-flight TCP check: fail fast before spawning an owner and
             # entering the SDK's anyio task group at all (an ECONNREFUSED
@@ -4867,11 +4883,17 @@ class MCPClientManager:
         established the session. MUST run on the mcp-loop; takes
         ``entry.open_lock`` exactly like dispatch so it can't race a
         concurrent connect/eviction. Returns the discovered tool count.
+
+        Like a dispatch, it re-reads the server's row once it holds the lock and connects nothing
+        to a server disabled or removed meanwhile, such as during the consent's code exchange or
+        the mint that produced *access_token*.
         """
         entry = await self._ensure_pool_entry(key)
         async with entry.open_lock:
             if entry.session is not None:
                 return len(entry.tools or [])
+            if await self._server_disabled_or_removed(key[1]):
+                return 0
             fresh = await self._connect_one_pool(
                 key,
                 cfg,
@@ -4893,13 +4915,13 @@ class MCPClientManager:
         OAuth consent — so the user's tool catalog populates immediately WITHOUT
         holding the consent redirect on a slow/unreachable MCP server.
 
-        No-op for non-``oauth_user`` servers, before the mcp-loop is running,
-        with no token, or once shutdown closes work admission. Schedules the
-        connect onto the mcp-loop and returns at once; the per-user tool
-        listeners deliver the catalog to live sessions when the prime
-        completes, and lazy dispatch remains the backstop.
+        No-op for non-``oauth_user`` or disabled servers, before the mcp-loop
+        is running, with no token, or once shutdown closes work admission.
+        Schedules the connect onto the mcp-loop and returns at once; the
+        per-user tool listeners deliver the catalog to live sessions when the
+        prime completes, and lazy dispatch remains the backstop.
         """
-        if server_name not in self._oauth_user_server_names:
+        if server_name not in self._oauth_user_server_names or server_row_disabled(server_row):
             return
         if self._loop is None or not access_token:
             return
@@ -5020,25 +5042,25 @@ class MCPClientManager:
             try:
                 async with sem:
                     try:
-                        # Branch on the in-memory obo registry (no SQL) to pick the
-                        # lookup path. For oauth_obo we need the row up front (mint
-                        # takes server_row + it feeds cfg); for oauth_user we defer
-                        # the row fetch until AFTER a successful lookup so a user
-                        # with no token pays no SELECT (the pre-obo behaviour).
-                        # Resolve via the same guarded state machine lazy dispatch
-                        # uses. For oauth_obo this MINTS from the captured credential
-                        # (missing credential → kind="missing", skipped — the
+                        # The row is read before any token work: a disabled server's grant is
+                        # neither refreshed nor minted for, and it is not primed (a process's
+                        # registry can list it until its reload). A missing row stops the obo branch
+                        # before the mint, but the oauth_user lookup still runs, so a deleted server
+                        # whose grant is gone has its catalog dropped below. Branch on the in-memory
+                        # obo registry to pick the lookup path, and resolve via the same guarded
+                        # state machine lazy dispatch uses. For oauth_obo this MINTS from the
+                        # captured credential (missing credential → kind="missing", skipped — the
                         # re-login rail handles it on real dispatch). For oauth_user,
-                        # revoke_ambiguous_escalation=False: a genuinely-dead grant is
-                        # still revoked so the catalog isn't left cold behind a
-                        # phantom "consented" token, but a sustained-UNCLASSIFIABLE
-                        # rejection is deferred to lazy dispatch. Only kind=="token"
-                        # warms the pool.
-                        server_row: dict[str, Any] | None = None
+                        # revoke_ambiguous_escalation=False: a genuinely-dead grant is still revoked
+                        # so the catalog isn't left cold behind a phantom "consented" token, but a
+                        # sustained-UNCLASSIFIABLE rejection is deferred to lazy dispatch. Only
+                        # kind=="token" warms the pool.
+                        server_row = await asyncio.to_thread(
+                            self._storage.get_mcp_server_by_name, server_name
+                        )
+                        if server_row_disabled(server_row):
+                            return
                         if server_name in self._obo_server_names:
-                            server_row = await asyncio.to_thread(
-                                self._storage.get_mcp_server_by_name, server_name
-                            )
                             if not server_row:
                                 return
                             lookup = await get_obo_access_token_classified(
@@ -5076,12 +5098,8 @@ class MCPClientManager:
                             )
                             # Not consented, no credential or refresh failed: lazy paths handle it.
                             return
-                        if server_row is None:
-                            server_row = await asyncio.to_thread(
-                                self._storage.get_mcp_server_by_name, server_name
-                            )
-                            if not server_row:
-                                return
+                        if not server_row:
+                            return
                         cfg = _pool_cfg_from_row(server_row)
                         await self._prime_user_server(key, cfg, lookup.token)
                         log.info(
@@ -6491,17 +6509,17 @@ class MCPClientManager:
         pill) so they render consistently off ONE source of truth.
 
         Each server's refresh runs with ``sync_unchanged=False``: a server
-        whose prompt catalog changed syncs the governance templates at
-        once, and the pass syncs them once more after its last server,
-        whether each server succeeded, failed or was skipped, so a pass
-        that changes nothing syncs once. That final sync is the pass's
-        repair step: it retries a save that failed after a catalog changed,
-        removes rows no catalog lists (such as those of a catalog withdrawn
-        without a save, or another writer's), resets promoted defaults and
-        refreshes timestamps. A pass that is cancelled or abandoned skips
-        only that: every catalog it changed was saved when it changed, and
-        a gap left before the pass waits for the next save. A server
-        reconnected here syncs on its own, as every connect does.
+        whose prompt catalog changed syncs the governance templates at once,
+        and the pass syncs them once more after its last server, whether each
+        server succeeded, failed or was skipped, so a pass that changes
+        nothing syncs once. That final sync is the pass's repair step: it
+        retries a save that failed after a catalog changed, removes enabled
+        rows no catalog lists (such as those of a catalog withdrawn without a
+        save, or another writer's), resets promoted defaults and refreshes
+        timestamps. A pass that is cancelled or abandoned skips only that:
+        every catalog it changed was saved when it changed, and a gap left
+        before the pass waits for the next save. A server reconnected here
+        syncs on its own, as every connect does.
 
         When garbage collection closes a pass that a stopped loop abandoned,
         on whatever thread collects, the pass must refresh no further server
@@ -7282,7 +7300,7 @@ class MCPClientManager:
         between ``set_storage()`` (main thread) and MCP background thread.
 
         Does nothing once :meth:`shutdown` has begun clearing state: it
-        empties the catalog, and syncing that would delete every MCP
+        empties the catalog, and syncing that would delete every enabled MCP
         template. Shutdown closes syncs before it empties the catalog,
         without this lock, so the check comes after the catalog is
         copied: a copy taken after the catalog was emptied always sees
@@ -7366,11 +7384,20 @@ class MCPClientManager:
                 )
                 added.append(name)
 
-        # Remove MCP templates whose prompts no longer exist
+        # Remove MCP templates whose prompts no longer exist here. A row an admin disabled stays,
+        # and the prompt listed again under that name returns to it, still disabled and with the
+        # admin's settings, never as a new, enabled row. The delete is conditional on the row
+        # still being enabled, so a disable that commits after this listing also keeps it.
         existing_mcp = storage.list_prompt_templates_by_origin("mcp")
         for tpl in existing_mcp:
-            if tpl["name"] not in current_names:
-                storage.delete_prompt_template(tpl["template_id"])
+            if (
+                tpl["name"] not in current_names
+                # A row this listing already shows disabled is not even tried, so a kept row
+                # costs no write on every sync; one listed enabled goes through the conditional
+                # delete, which spares it if a disable commits meanwhile.
+                and tpl.get("enabled", True)
+                and storage.delete_prompt_template_if_enabled(tpl["template_id"])
+            ):
                 removed.append(tpl["name"])
 
         if added or removed:
@@ -8058,8 +8085,8 @@ class MCPClientManager:
         breaker to stop them, calls to its tools, resources and prompts (each a model tool) would
         otherwise rerun the whole connect every time. Withdrawn prompts are synced to the
         governance templates at once, like any other catalog change: the sync is global, so the
-        next one anywhere would delete the server's rows anyway, at a time set by unrelated events.
-        The rows come back when the server does.
+        next one anywhere would delete the server's enabled rows anyway, at a time set by unrelated
+        events. A row an admin disabled stays. The rows come back when the server does.
         """
         text = self._connect_failure_text(name, exc)
         self._set_error(name, text)
@@ -8142,6 +8169,9 @@ class MCPClientManager:
         connected = state is not None and state.session is not None
         cfg = self._server_configs.get(name, {})
         transport = cfg.get("type", "stdio")
+        if _connects_over_http(cfg) and transport not in ("http", "streamable-http"):
+            # An untyped entry with a url connects over HTTP; report what it connects with.
+            transport = "streamable-http"
         cb_deadline = self._circuit_open_until.get(name)
         cb_open = cb_deadline is not None and time.monotonic() < cb_deadline
         last_refresh = self._last_refresh.get(name)
@@ -9618,6 +9648,21 @@ class MCPClientManager:
             return None
         return row
 
+    async def _server_disabled_or_removed(self, server_name: str) -> bool:
+        """Does the server's row, read again now, say an administrator disabled or removed it?
+
+        Only a read that worked decides: with no storage, or when the read fails, this answers
+        False and the caller keeps to the row it already holds.
+        """
+        if self._storage is None:
+            return False
+        try:
+            row = await asyncio.to_thread(self._storage.get_mcp_server_by_name, server_name)
+        except Exception:
+            log.debug("mcp_pool.server_reread_failed", server_name=server_name, exc_info=True)
+            return False
+        return row is None or server_row_disabled(row)
+
     def _resolve_pool_target_resource(
         self, uri: str, user_id: str
     ) -> tuple[str, str, dict[str, Any]] | None:
@@ -10146,6 +10191,12 @@ class MCPClientManager:
         """
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
+        # A retry reads the row again: the 401 that asked for it may come from a server disabled
+        # since the call was resolved, and the retry refreshes or mints before it takes the lock.
+        if server_row_disabled(server_row) or (
+            retry_count > 0 and await self._server_disabled_or_removed(server_name)
+        ):
+            return self._refuse_disabled_pool_server(user_id, server_name, "tool")
 
         # Token-side errors (missing / decrypt / refresh-failed) bypass
         # the breaker entirely — the server itself is healthy. The breaker
@@ -10206,6 +10257,8 @@ class MCPClientManager:
             # A cancelled lock waiter has not owned this carrier; it may
             # describe the active caller's auth failure. Never retry or evict.
             raise
+        except _PoolServerDisabledError:
+            return self._refuse_disabled_pool_server(user_id, server_name, "tool")
         except BaseException as exc:
             classification = self._classify_failure(exc, capture=capture)
             if classification == "auth_401":
@@ -10302,6 +10355,10 @@ class MCPClientManager:
         """
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
+        if server_row_disabled(server_row) or (
+            retry_count > 0 and await self._server_disabled_or_removed(server_name)
+        ):
+            return self._refuse_disabled_pool_server(user_id, server_name, "resource")
 
         lookup, lookup_error = await self._pool_lookup_checked(
             server_row, user_id, server_name, force_refresh=retry_count > 0
@@ -10344,6 +10401,8 @@ class MCPClientManager:
         except asyncio.CancelledError:
             # Cancellation precedes shared-carrier auth handling; see _dispatch_pool.
             raise
+        except _PoolServerDisabledError:
+            return self._refuse_disabled_pool_server(user_id, server_name, "resource")
         except BaseException as exc:
             classification = self._classify_failure(exc, capture=capture)
             if classification == "auth_401":
@@ -10430,6 +10489,10 @@ class MCPClientManager:
         """
         if self._app_state is None:
             raise RuntimeError("Pool dispatch requires set_app_state() to have been called")
+        if server_row_disabled(server_row) or (
+            retry_count > 0 and await self._server_disabled_or_removed(server_name)
+        ):
+            return self._refuse_disabled_pool_server(user_id, server_name, "prompt")
 
         lookup, lookup_error = await self._pool_lookup_checked(
             server_row, user_id, server_name, force_refresh=retry_count > 0
@@ -10470,6 +10533,8 @@ class MCPClientManager:
         except asyncio.CancelledError:
             # Cancellation precedes shared-carrier auth handling; see _dispatch_pool.
             raise
+        except _PoolServerDisabledError:
+            return self._refuse_disabled_pool_server(user_id, server_name, "prompt")
         except BaseException as exc:
             classification = self._classify_failure(exc, capture=capture)
             if classification == "auth_401":
@@ -10841,6 +10906,70 @@ class MCPClientManager:
                 return
             self._evict_session_drop_catalog(key)
 
+    def _refuse_disabled_pool_server(
+        self,
+        user_id: str,
+        server_name: str,
+        kind: Literal["tool", "resource", "prompt"],
+    ) -> str:
+        """Refuse a pool call to a server an administrator has disabled or removed.
+
+        The pool dispatchers check the row the resolver read for the call, before the token lookup,
+        and a retry reads it again before its forced refresh, so a disabled server's grant is
+        neither refreshed nor minted for it, on every host from the commit without waiting for its
+        reload. Each call reads the row again once it holds its pool entry, which also refuses a
+        server removed meanwhile. Each refusal is logged at INFO, so an operator can see a disabled
+        server still being called, and takes the server out of the user's live sessions
+        (:meth:`_schedule_disabled_server_drop`).
+        """
+        log.info(
+            "mcp_pool.server_disabled_refused",
+            server_name=server_name,
+            user_id=user_id,
+            kind=kind,
+        )
+        self._schedule_disabled_server_drop((user_id, server_name))
+        return _structured_error(
+            code="mcp_server_disabled", server=server_name, detail=_SERVER_DISABLED_DETAIL
+        )
+
+    def _schedule_disabled_server_drop(self, key: tuple[str, str]) -> None:
+        """Take a disabled server's tools, resources and prompts out of the user's sessions.
+
+        The session goes at once, without the entry's lock, so list-change refreshes parked on
+        the lock return at their session check instead of making list calls with the user's
+        bearer ahead of the drop. The catalog is cleared under the lock by
+        :meth:`_drop_disabled_server_catalog`, which is scheduled rather than awaited because a
+        same-key call can hold the lock for its whole SDK call. An entry with nothing to clear
+        is skipped.
+        """
+        entry = self._user_pool_entries.get(key)
+        if entry is None or (entry.session is None and not self._entry_has_catalog(entry)):
+            return
+        self._evict_session(key)
+        self._spawn_background(
+            self._drop_disabled_server_catalog(key),
+            f"disabled-server catalog drop for '{key[1]}'",
+        )
+
+    async def _drop_disabled_server_catalog(self, key: tuple[str, str]) -> None:
+        """Clear a disabled or removed server's catalog for one user, unless it was enabled again.
+
+        The row is read again under the lock: a server enabled while this waited may have been
+        primed again meanwhile, and clearing its catalog then would strand its tools until a
+        new session. A read that fails keeps the catalog, and an entry an earlier drop already
+        cleared is skipped before the read.
+        """
+        entry = self._user_pool_entries.get(key)
+        if entry is None:
+            return
+        async with entry.open_lock:
+            if entry.session is None and not self._entry_has_catalog(entry):
+                return
+            if not await self._server_disabled_or_removed(key[1]):
+                return
+            self._evict_session_drop_catalog(key)
+
     async def _handle_auth_403(
         self,
         *,
@@ -10949,8 +11078,16 @@ class MCPClientManager:
         already signals "do not evict", but the in-flight counter
         remains the source of truth for
         :meth:`_close_pool_entry_if_idle`.
+
+        Every call re-reads the server's row once it holds the lock: the row it was resolved with
+        predates the token lookup and any wait for the lock, and an administrator may have
+        disabled or removed the server meanwhile (:class:`_PoolServerDisabledError`). A read
+        that fails leaves the call to the row it was resolved with. The read runs inside the
+        lock, so same-entry calls queued behind each other each pay one in turn.
         """
         async with entry.open_lock:
+            if await self._server_disabled_or_removed(key[1]):
+                raise _PoolServerDisabledError
             entry.last_used = time.monotonic()
             self._user_pool_last_used[key] = entry.last_used
             entry.auth_capture.reset(negotiated=entry.auth_capture.negotiated)
@@ -11522,6 +11659,12 @@ def _build_consent_url(
         qs += "&scopes=" + urllib.parse.quote(scopes_str, safe="")
     return f"/v1/api/mcp/oauth/start?{qs}"
 
+
+# The refusal of a call to a disabled or removed pool server: the same for every auth model, and
+# not retryable by the model.
+_SERVER_DISABLED_DETAIL = (
+    "This MCP server has been disabled or removed by an administrator. Operator action required."
+)
 
 # User-facing remediation copy for every (auth model, failure situation) a
 # pool-backed dispatch can surface. Consolidated into ONE table so the
