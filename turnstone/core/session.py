@@ -251,6 +251,7 @@ from turnstone.core.session_worker import WorkerClaim, current_worker_claim
 from turnstone.core.settings_registry import (
     DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     DEFAULT_AUTO_COMPACT_PCT,
+    SETTINGS,
     TOOL_TRUNCATION_MAX_CHARS,
 )
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS, read_allowed_tools
@@ -290,6 +291,7 @@ from turnstone.core.tools import (
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
     TOOLS,
+    VOICE_COORDINATOR_TOOLS,
     apply_cwd_context,
     merge_mcp_tools,
     nested_deeper_than,
@@ -323,6 +325,7 @@ from turnstone.core.truncation import (
     source_chars,
     truncate_text,
 )
+from turnstone.core.voice_config import VOICE_MEMORY_SCOPE, is_voice_persona
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
 from turnstone.core.web import (
     UrlBlockedError,
@@ -2273,14 +2276,16 @@ def _format_search_results(
 # Memory scopes accepted by the ``memory`` tool's preparer + executor.
 # Single source of truth — every action validator imports this rather
 # than literal-listing the values, so adding a scope is a one-site
-# change.  ``coordinator`` is COORDINATOR-only and ``project`` needs the
-# workstream attached to an accessible project (see
+# change.  ``coordinator`` and ``voice`` are both COORDINATOR-only, and a
+# coordinator accepts exactly one of them according to its persona; ``project``
+# needs the workstream attached to an accessible project (see
 # :meth:`ChatSession._validate_scope`); the others are kind-agnostic.
 _VALID_MEMORY_SCOPES: tuple[str, ...] = (
     "global",
     "workstream",
     "user",
     "coordinator",
+    VOICE_MEMORY_SCOPE,
     "project",
 )
 
@@ -3160,6 +3165,15 @@ class ChatSession:
         self._trust_send: bool = False
         self._revoked_tools: frozenset[str] = frozenset()
         self._governance_lock = threading.Lock()
+        # Voice sessions hear spoken asides that can sound like requests, so
+        # their child spawns are budgeted per genuine USER turn.  The count is
+        # reset only where such a turn is admitted
+        # (``_append_genuine_user_turn``) — nudges, wakes and tool results are
+        # not user turns and must not reopen the budget.  Sibling tool calls in
+        # one assistant message execute on a thread pool, so a slot is reserved
+        # before its spawn attempt and released if the child never starts.
+        self._voice_spawns_this_turn: int = 0
+        self._voice_spawn_lock = threading.Lock()
         # The session owns ONE immutable binding snapshot.  Registry-backed
         # construction resolves provider/client/model/config/generation under
         # one lock hold; direct no-registry callers get the same lane shape
@@ -4958,8 +4972,10 @@ class ChatSession:
         construction rather than by remembering a guard:
 
         * coordinator — ``merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools)``;
-          no cwd notes (no cwd-dependent tool in the base, and MCP tools
-          never carry one) and no task-agent lane.
+          a voice-persona coordinator uses ``VOICE_COORDINATOR_TOOLS``
+          instead, whose ``memory`` schema offers only the voice and project
+          scopes; no cwd notes (no cwd-dependent tool in the base, and MCP
+          tools never carry one) and no task-agent lane.
         * interactive — both lanes route through ``_apply_cwd_notes`` so a
           rebuild cannot silently drop the working-dir/workspace notes by
           assigning from the module constants directly.
@@ -4977,7 +4993,15 @@ class ChatSession:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Derive both MCP-merged lanes without publishing either one."""
         if self._kind == WorkstreamKind.COORDINATOR:
-            return merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools), []
+            # The voice persona narrows ONE coordinator tool (memory) and must
+            # win over the coordinator variant; every other coordinator tool is
+            # the same object either way.
+            base = (
+                VOICE_COORDINATOR_TOOLS
+                if is_voice_persona(self._persona_name)
+                else COORDINATOR_TOOLS
+            )
+            return merge_mcp_tools(base, mcp_tools), []
         return (
             self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)),
             self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)),
@@ -7910,6 +7934,13 @@ class ChatSession:
                     snapshot = acquire_memory_index_snapshot(
                         self._ws_id,
                         principal_id,
+                        # The durable row records kind only; the persona is a
+                        # construction-time stamp, so the capturing session says
+                        # which private namespace a coordinator row binds.
+                        voice=(
+                            self._kind == WorkstreamKind.COORDINATOR
+                            and is_voice_persona(self._persona_name)
+                        ),
                         commit_context=functools.partial(
                             self._memory_index_commit_context,
                             my_generation,
@@ -20960,6 +20991,8 @@ class ChatSession:
             return resolved.principal_id
         if scope == "coordinator":
             return self._coordinator_scope_id(resolved)
+        if scope == VOICE_MEMORY_SCOPE:
+            return self._voice_scope_id(resolved)
         if scope == "project":
             return resolved.project_id
         return ""
@@ -20967,6 +21000,18 @@ class ChatSession:
     def _coordinator_scope_id(self, access: _MemoryAccess | None = None) -> str:
         """Return this coordinator actor's private memory namespace."""
         if self._kind != WorkstreamKind.COORDINATOR:
+            return ""
+        return (access or self._memory_access()).principal_id
+
+    def _voice_scope_id(self, access: _MemoryAccess | None = None) -> str:
+        """Return this voice coordinator's private memory namespace.
+
+        Keyed by the acting user exactly like ``coordinator``, but reachable
+        only from a coordinator under the voice persona.  The empty key fails
+        closed: a non-voice session must never alias the voice namespace even
+        if a caller skips the scope validator.
+        """
+        if self._kind != WorkstreamKind.COORDINATOR or not is_voice_persona(self._persona_name):
             return ""
         return (access or self._memory_access()).principal_id
 
@@ -20989,25 +21034,33 @@ class ChatSession:
         access: _MemoryAccess | None = None,
         write: bool = False,
     ) -> dict[str, Any] | None:
-        """Validate one exact scope against kind, actor identity, and live ACL."""
+        """Validate one exact scope against kind, persona, actor identity, and live ACL.
+
+        A voice session is still COORDINATOR kind, so the persona decides which
+        private namespace it may name: ``voice`` for a voice session,
+        ``coordinator`` for every other coordinator.  The two sets are disjoint
+        on purpose — a spoken aside must not inherit, or pollute, the text
+        coordinator's orchestration memory.
+        """
         resolved = access or self._memory_access()
-        allowed = (
-            {"coordinator", "project"}
-            if self._kind == WorkstreamKind.COORDINATOR
-            else {"global", "workstream", "user", "project"}
-        )
-        if scope not in allowed:
+        voice = self._kind == WorkstreamKind.COORDINATOR and is_voice_persona(self._persona_name)
+        if self._kind == WorkstreamKind.COORDINATOR:
+            allowed = {"voice", "project"} if voice else {"coordinator", "project"}
             guidance = (
-                "Use coordinator, project, or omit scope to inherit the active target."
-                if self._kind == WorkstreamKind.COORDINATOR
-                else "Use global, workstream, user, or an accessible attached project."
+                "Use voice, project, or omit scope to inherit the active target."
+                if voice
+                else "Use coordinator, project, or omit scope to inherit the active target."
             )
+        else:
+            allowed = {"global", "workstream", "user", "project"}
+            guidance = "Use global, workstream, user, or an accessible attached project."
+        if scope not in allowed:
             return self._memory_prepare_error(
                 call_id,
                 f"✗ memory: scope '{scope}' unavailable",
                 f"Error: scope '{scope}' is unavailable to this workstream kind. {guidance}",
             )
-        if scope in {"user", "coordinator"} and not resolved.principal_id:
+        if scope in {"user", "coordinator", VOICE_MEMORY_SCOPE} and not resolved.principal_id:
             return self._memory_prepare_error(
                 call_id,
                 f"✗ memory: {scope} scope requires authentication",
@@ -21032,11 +21085,18 @@ class ChatSession:
         return None
 
     def _inherited_memory_scope(self, access: _MemoryAccess | None = None) -> str:
-        """Return the single target inherited by unscoped save/get/delete."""
+        """Return the single target inherited by unscoped save/get/delete.
+
+        A voice coordinator inherits its own namespace rather than the text
+        coordinator's, so an unscoped save during a spoken turn is filed where
+        the next voice session will find it.
+        """
         resolved = access or self._memory_access()
         if resolved.attached_project_id:
             return "project"
         if self._kind == WorkstreamKind.COORDINATOR:
+            if is_voice_persona(self._persona_name):
+                return VOICE_MEMORY_SCOPE
             return "coordinator"
         return "global"
 
@@ -21089,25 +21149,32 @@ class ChatSession:
     def _visible_scopes(self, access: _MemoryAccess | None = None) -> list[tuple[str, str]]:
         """Return the (scope, scope_id) pairs visible to this session.
 
-        Coord sessions see their coord-scope; interactive sessions see global +
-        their workstream + their user (when uid present).  Either kind also sees
-        its attached ``project`` scope when the acting principal currently has
-        read access. Drives the single-query visibility helpers.
+        Coord sessions see their coord-scope, except a voice coordinator:
+        it sees the separate ``voice`` namespace instead, so neither kind
+        can read the other's memories.  Interactive sessions see global +
+        their workstream + their user (when uid present).  Every kind also
+        sees its attached ``project`` scope when the acting principal
+        currently has read access.  Drives the single-query visibility
+        helpers.
         """
         resolved = access or self._memory_access()
         if self._kind == WorkstreamKind.COORDINATOR:
-            scope_id = self._coordinator_scope_id(resolved)
+            voice = is_voice_persona(self._persona_name)
+            scope = VOICE_MEMORY_SCOPE if voice else "coordinator"
+            scope_id = (
+                self._voice_scope_id(resolved) if voice else self._coordinator_scope_id(resolved)
+            )
             # Fail closed on an empty scope id (unreachable through real hosts,
             # because __init__ refuses anonymous coordinators): no anonymous
-            # coordinator namespace exists.
-            coord_scopes: list[tuple[str, str]] = []
+            # coordinator or voice namespace exists.
+            private_scopes: list[tuple[str, str]] = []
             if scope_id:
-                coord_scopes.append(("coordinator", scope_id))
+                private_scopes.append((scope, scope_id))
             # A coordinator attached to a project also recalls the shared project
-            # bucket (read + write), alongside its isolated coordinator scope.
+            # bucket (read + write), alongside its isolated private scope.
             if resolved.project_id:
-                coord_scopes.append(("project", resolved.project_id))
-            return coord_scopes
+                private_scopes.append(("project", resolved.project_id))
+            return private_scopes
         scopes: list[tuple[str, str]] = [("global", ""), ("workstream", self._ws_id)]
         if resolved.principal_id:
             scopes.append(("user", resolved.principal_id))
@@ -21189,6 +21256,12 @@ class ChatSession:
         after_user: Callable[[], None] | None = None,
     ) -> None:
         """Publish a human USER row and its derived turns in ledger order."""
+        # This is the one admission funnel for genuine USER turns (direct
+        # sends and queued flushes alike), so it is also where a voice
+        # coordinator's per-turn spawn budget reopens.  Placing the reset
+        # here, not in ``_plan_genuine_user_turn``, means a plan that loses
+        # generation admission never spends the budget it did not open.
+        self._voice_reset_spawn_budget()
         self._append_user_turn(
             plan.content,
             attachments,
@@ -21728,6 +21801,131 @@ class ChatSession:
         the sanitized value."""
         return " ".join((value or "").split())[:cap]
 
+    def _voice_spawn_guard_active(self) -> bool:
+        """Whether this session is a voice coordinator.
+
+        Voice sessions hear spoken asides that look like requests, so their
+        spawns carry a per-turn budget and a default child model.  Keying off
+        the persona stamp instead of a caller-supplied flag keeps every
+        surface agreeing; the kind check keeps a session that merely happens
+        to carry the stamp from growing orchestration behavior it has no
+        tools for.
+        """
+        return self._kind == WorkstreamKind.COORDINATOR and is_voice_persona(self._persona_name)
+
+    def _voice_max_agents_per_turn(self) -> int:
+        """Live per-turn child cap for a voice coordinator.
+
+        Read through the config store so an operator's change applies to the
+        next spawn.  A store-less session (CLI, tests) uses the registry
+        default.  Coerce defensively: a hand-built store or an old row can
+        bypass the write path's typing, and a negative cap would otherwise
+        make every spawn look allowed.
+        """
+        cs = self._config_store
+        raw = (
+            cs.get("coordinator.voice_max_agents_per_turn")
+            if cs is not None
+            else SETTINGS["coordinator.voice_max_agents_per_turn"].default
+        )
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return int(SETTINGS["coordinator.voice_max_agents_per_turn"].default)
+
+    def _voice_child_model_alias(self) -> str:
+        """Model alias an unnamed child of a voice coordinator gets.
+
+        Empty means "leave the field unset" so the child falls back to the
+        normal default model, matching the setting's documented meaning.  A
+        store-less session (CLI, tests) uses the registry default, the same
+        way the per-turn cap does.
+        """
+        cs = self._config_store
+        value = (
+            cs.get("coordinator.voice_child_model")
+            if cs is not None
+            else SETTINGS["coordinator.voice_child_model"].default
+        )
+        return value.strip() if isinstance(value, str) else ""
+
+    @staticmethod
+    def _voice_spawn_denial(cap: int) -> str:
+        """Model-readable refusal for a voice spawn over the turn budget."""
+        if cap <= 0:
+            return "Voice mode is set to start no agents."
+        noun = "agent" if cap == 1 else "agents"
+        return (
+            f"Voice mode starts at most {cap} {noun} per turn. "
+            "Ask the user before starting another."
+        )
+
+    @staticmethod
+    def _voice_batch_spawn_denial(count: int, cap: int) -> str:
+        """Refusal for a whole batch — partial spawns would split one request
+        into children the user never got to approve as a set."""
+        if cap <= 0:
+            return "Voice mode is set to start no agents; this batch was not started."
+        noun = "agent" if cap == 1 else "agents"
+        return (
+            f"Voice mode starts at most {cap} {noun} per turn; this batch would "
+            f"start {count}, so the whole batch was not started. Ask the user "
+            "before starting another."
+        )
+
+    def _voice_spawn_denial_locked(self, count: int, *, batch: bool) -> str:
+        """Denial text for *count* spawns; caller holds ``_voice_spawn_lock``."""
+        cap = self._voice_max_agents_per_turn()
+        if self._voice_spawns_this_turn + count <= cap:
+            return ""
+        if batch:
+            return self._voice_batch_spawn_denial(count, cap)
+        return self._voice_spawn_denial(cap)
+
+    def _voice_spawn_peek(self, count: int, *, batch: bool = False) -> str:
+        """Prepare-time check: would *count* spawns exceed the budget now?
+
+        Deliberately non-reserving.  A prepared call may still be denied at
+        approval or cancelled, and a reservation taken here would then be
+        spent on a child that never existed.  The binding check is
+        :meth:`_voice_reserve_spawns` at exec time.
+        """
+        with self._voice_spawn_lock:
+            return self._voice_spawn_denial_locked(count, batch=batch)
+
+    def _voice_reserve_spawns(self, count: int, *, batch: bool = False) -> str:
+        """Reserve *count* per-turn spawn slots, or return the denial text.
+
+        The reservation happens before the spawn attempt so two sibling tool
+        calls cannot both pass the same check on the parallel executor; the
+        caller releases a slot when its child never starts, so the count ends
+        up reflecting children that actually exist.
+        """
+        with self._voice_spawn_lock:
+            denial = self._voice_spawn_denial_locked(count, batch=batch)
+            if not denial:
+                self._voice_spawns_this_turn += count
+            return denial
+
+    def _voice_reset_spawn_budget(self) -> None:
+        """Reopen the per-turn budget at the start of a genuine USER turn."""
+        with self._voice_spawn_lock:
+            self._voice_spawns_this_turn = 0
+
+    def _voice_release_spawns(self, count: int) -> None:
+        """Give back reserved slots whose children never started."""
+        with self._voice_spawn_lock:
+            self._voice_spawns_this_turn = max(0, self._voice_spawns_this_turn - count)
+
+    def _voice_spawn_failure(self, call_id: str, func_name: str, denial: str) -> tuple[str, str]:
+        """Exec-time refusal: report it as a tool error and return nothing.
+
+        The caller already failed to reserve, so no slot is held here.
+        """
+        msg = f"Error: {denial}"
+        self._report_tool_result(call_id, func_name, msg, is_error=True)
+        return call_id, msg
+
     def _prepare_spawn_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
             return self._coord_tool_error(
@@ -21739,6 +21937,18 @@ class ChatSession:
         initial_message = (args.get("initial_message") or "").strip()
         model = (args.get("model") or "").strip()
         project = (args.get("project") or "").strip()
+        # A voice coordinator's budget is checked before any other gate runs a
+        # storage lookup: a spawn over the cap must cost the model one clear
+        # refusal, not a persona round trip and an approval card first.
+        if self._voice_spawn_guard_active():
+            denial = self._voice_spawn_peek(1)
+            if denial:
+                return self._coord_tool_error(call_id, "spawn_workstream", denial)
+            if not model:
+                # An unnamed child of a voice coordinator takes the configured
+                # alias so it never waits on a model the fleet hasn't loaded.
+                # An explicit model is the caller's call and is never replaced.
+                model = self._voice_child_model_alias()
         # Flatten whitespace + cap the fields that reach the trusted approval-
         # header chrome (skill/persona/target_node) or the child's stored
         # metadata (name) before they get there — all model-authored and, when
@@ -21901,6 +22111,15 @@ class ChatSession:
                 msg = f"Error: {denial}"
                 self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
                 return call_id, msg
+        # Voice sessions spend one budget slot per started child.  The reserve
+        # (not a peek) is what holds when sibling calls in one assistant
+        # message run concurrently; a slot whose child never starts goes back
+        # below, so a failed spawn does not cost the turn an agent.
+        voice = self._voice_spawn_guard_active()
+        if voice:
+            denial = self._voice_reserve_spawns(1)
+            if denial:
+                return self._voice_spawn_failure(call_id, "spawn_workstream", denial)
         stopped = self._tool_stop_check(item)
         try:
             result = self._coord_client.spawn(
@@ -21916,10 +22135,14 @@ class ChatSession:
                 resend_unless=stopped,
             )
         except Exception as e:
+            if voice:
+                self._voice_release_spawns(1)
             msg = f"Error: spawn_workstream failed: {e}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
         if result.get("error"):
+            if voice:
+                self._voice_release_spawns(1)
             msg = f"Error: {self._spawn_error(result)}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
@@ -21931,12 +22154,18 @@ class ChatSession:
         # ``_exec_spawn_batch`` (denied row on empty ws_id).
         child_ws_id = str(result.get("ws_id") or "")
         if not child_ws_id:
+            if voice:
+                self._voice_release_spawns(1)
             msg = (
                 "Error: spawn's reply carried no ws_id, so whether the child was created "
                 "is unknown; check with list_workstreams before retrying"
             )
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
+        if voice and result.get("initial_message_status") == "refused_closed":
+            # Closed before it took its first message, so it never started any
+            # work, and the reply tells the model to spawn it again.
+            self._voice_release_spawns(1)
         if stopped():
             # Audited as the console's cascade records its own cancels, as spawn_batch does.
             cancelled = self._cancel_child_created_after_stop(child_ws_id)
@@ -22004,6 +22233,10 @@ class ChatSession:
         # exec time rather than failing the whole batch — we want
         # partial-success semantics so a single malformed row doesn't
         # poison the other approved spawns.
+        voice = self._voice_spawn_guard_active()
+        # Resolved once per prepare call, like the persona verdicts below: a
+        # fan-out usually leaves the model unset on every row.
+        voice_child_model = self._voice_child_model_alias() if voice else ""
         normalised: list[dict[str, Any]] = []
         preview_rows: list[str] = []
         # Persona prechecks hit storage; a fan-out batch usually repeats one
@@ -22019,6 +22252,10 @@ class ChatSession:
                 continue
             initial_message = self._coord_str_arg(raw, "initial_message").strip()
             model = self._coord_str_arg(raw, "model").strip()
+            if voice and not model:
+                # Same rule as spawn_workstream: an unnamed child of a voice
+                # coordinator takes the configured alias, an explicit model wins.
+                model = voice_child_model
             # Flatten + cap the fields that reach the per-child preview chrome
             # (skill/persona/target_node) or stored metadata (name) — the same
             # one-pass treatment spawn_workstream applies.
@@ -22086,6 +22323,16 @@ class ChatSession:
             )
             return self._coord_tool_error(call_id, "spawn_batch", first_err or "batch rejected")
 
+        # A voice coordinator's budget is checked as one whole-batch request:
+        # refusing a batch part-way would hand the user a partial fan-out they
+        # never approved.  Only rows that can actually start count — a row
+        # already denied at normalisation is reported as such and never
+        # reaches the spawn call.
+        if voice:
+            denial = self._voice_spawn_peek(valid_count, batch=True)
+            if denial:
+                return self._coord_tool_error(call_id, "spawn_batch", denial)
+
         header = f"\u2699 spawn_batch: {len(normalised)} children"
         preview_body = f"{DIM}{chr(10).join(preview_rows)}{RESET}"
         item: dict[str, Any] = {
@@ -22106,6 +22353,22 @@ class ChatSession:
         call_id = item["call_id"]
         children: list[dict[str, Any]] = item["children"]
         total = len(children)
+
+        # Voice budget is reserved for the whole batch up front: a batch that
+        # does not fit is refused whole rather than starting a partial set the
+        # user never approved.  Only rows that can start hold a slot; each one
+        # that ends up not starting releases it immediately, so a later call in
+        # this turn sees the true count instead of the reservation.
+        voice = self._voice_spawn_guard_active()
+        planned = sum(1 for spec in children if "_error" not in spec)
+        if voice:
+            denial = self._voice_reserve_spawns(planned, batch=True)
+            if denial:
+                return self._voice_spawn_failure(call_id, "spawn_batch", denial)
+
+        def _child_not_started() -> None:
+            if voice:
+                self._voice_release_spawns(1)
 
         # Emit ``batch_started`` so the coordinator sidebar can show a
         # "spawning N children" indicator.  Mirrors wait_for_workstream's
@@ -22237,8 +22500,15 @@ class ChatSession:
             row, reason = outcomes[idx]
             if row is None:
                 denied.append({"idx": idx, "reason": reason})
+                # Released here, after every create has returned, rather than
+                # in _spawn_child: one thread, so the count is never touched
+                # from the batch's worker threads.
+                _child_not_started()
             else:
                 results[str(idx)] = row
+                if row.get("initial_message_status") == "refused_closed":
+                    # Closed before its first message; the row says spawn it again.
+                    _child_not_started()
 
         # ``truncated`` intentionally omitted — the prepare step
         # hard-errors on >10 children rather than silent truncation,

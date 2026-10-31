@@ -1208,6 +1208,33 @@ def _build_registry() -> dict[str, SettingDef]:
             "semantics) or returns 429 if every slot is non-idle.",
         ),
         SettingDef(
+            "coordinator.voice_max_agents_per_turn",
+            "int",
+            1,
+            "Agents a voice coordinator may start per user turn",
+            "coordinator",
+            min_value=0,
+            max_value=10,
+            help="Applies only to coordinators created with the voice persona. Each "
+            "spoken turn may start at most this many child agents; further spawn calls "
+            "are refused with a note telling the model to ask you first. Spoken asides "
+            "are easy to mistake for requests, so the default is 1. Set 0 to stop voice "
+            "sessions starting agents at all.",
+            reference_url=VOICE_DOCS_URL + "#voice-persona",
+        ),
+        SettingDef(
+            "coordinator.voice_child_model",
+            "str",
+            "deepseek-flash-high",
+            "Model alias for agents a voice coordinator starts",
+            "coordinator",
+            help="Applies only to coordinators created with the voice persona. When the "
+            "coordinator starts an agent without naming a model, the agent uses this "
+            "alias instead of the default model, so it never waits on a model that is "
+            "not loaded. Empty falls back to the normal default model.",
+            reference_url=VOICE_DOCS_URL + "#voice-persona",
+        ),
+        SettingDef(
             "coordinator.session_jwt_ttl_seconds",
             "int",
             300,

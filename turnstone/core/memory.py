@@ -1168,6 +1168,7 @@ def acquire_memory_index_snapshot(
     ws_id: str,
     principal_id: str,
     *,
+    voice: bool = False,
     commit_context: Callable[[dict[str, Any]], AbstractContextManager[None]] | None = None,
 ) -> dict[str, Any]:
     """Atomically bind or load one workstream's immutable memory index.
@@ -1176,6 +1177,9 @@ def acquire_memory_index_snapshot(
     admission rather than publish an empty block falsely described as complete.
     The backend resolves the live visibility envelope inside the same database
     transaction as its metadata read and first-writer insert.
+
+    ``voice`` tells the backend that a COORDINATOR-kind row belongs to a voice
+    session, whose private namespace is ``voice`` rather than ``coordinator``.
 
     When supplied, ``commit_context`` runs only for a concrete candidate. Its
     pre-yield phase may reject, rolling back any newly inserted candidate; the
@@ -1187,6 +1191,7 @@ def acquire_memory_index_snapshot(
     snapshot = storage.acquire_memory_index_snapshot(
         ws_id,
         principal_id,
+        voice=voice,
         commit_context=commit_context,
     )
     if snapshot is None:

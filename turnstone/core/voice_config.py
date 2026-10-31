@@ -861,3 +861,19 @@ class PreviewSpan:
 class SpeechPreview:
     text: str  # identical to what normalize_for_speech returns for the same input
     spans: tuple[PreviewSpan, ...]
+
+
+# ---------------------------------------------------------------------------
+# Voice persona.  A voice session is a coordinator created with this persona;
+# its memory scope, spawn cap and child-model default all key off the name, so
+# a voice conversation never inherits the text coordinator's work habits.
+# ---------------------------------------------------------------------------
+
+VOICE_PERSONA = "voice"
+VOICE_MEMORY_SCOPE = "voice"
+
+
+def is_voice_persona(name: str | None) -> bool:
+    """Persona names arrive from session config, API bodies and tool args with
+    inconsistent case and padding; one forgiving check keeps them agreeing."""
+    return (name or "").strip().lower() == VOICE_PERSONA

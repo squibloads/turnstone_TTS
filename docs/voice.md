@@ -722,3 +722,83 @@ Use it to even out a model that speaks noticeably slowly or quickly. It is not
 a substitute for a pacing profile: the profile controls the silence between
 clips, while playback speed changes the rate inside a clip. Tuning one does not
 change the other.
+
+## Voice persona
+
+A voice session is a coordinator created with the `voice` persona. Use it when
+the conversation is spoken rather than typed: you talk to it, its replies are
+read aloud, and it is expected to answer briefly instead of producing a
+document. It is a coordinator persona, so start it from the console's
+**Coordinator** launcher with **Voice** selected in the persona picker, or
+pass `persona` on `POST /v1/api/workstreams/new`:
+
+```json
+{"persona": "voice", "initial_message": "What needs my attention today?"}
+```
+
+The persona changes the session's instructions and its memory namespace, not
+the speech pipeline. Dictation, read-aloud, cleanup and pacing behave exactly
+as described above.
+
+### Spoken replies
+
+The persona asks for replies that make sense out loud: lead with the answer,
+keep the whole reply short, and prefer plain prose. A spoken reply has no
+scrollback, and the player cannot read back the parts that carry meaning only
+on screen — a fenced code block and a diagram become a short marker, images
+and video are skipped, and each table row becomes its own clip. Ask for a code
+sample or a table when you need one and the player will handle it; the persona
+just does not volunteer one.
+
+It also starts background agents only when you ask for work, not when you
+think out loud. A voice session is easy to talk to in asides, and an aside
+like "I wonder whether the tests pass" should not turn into a fan-out.
+
+### Voice memories
+
+A voice session keeps its memories in the `voice` scope, keyed by the acting
+user. Every voice session that user opens shares the namespace; text
+coordinators keep using `coordinator`, and the two do not mix. The split is
+deliberate: a coordinator's memory accumulates working habits — "always
+research first", "read the whole file before editing", "run the narrowed test
+file" — that make text work reliable and a spoken conversation exhausting. A
+voice session should remember how you like to be talked to and what you asked
+it to keep, not a playbook for changing a repository. Separating the scopes
+also means a terse correction spoken out loud cannot silently reprogram the
+coordinator you use for code review.
+
+The scope is durable and per user, not per session: closing and reopening the
+voice session does not lose it. It uses the same body-free metadata index and
+`memory(action='get', ...)` read path as any other scope; see
+[Structured Memory](memory.md#memory-scopes) for the mechanics.
+
+### Starting agents
+
+Two settings bound the background work a voice session can start. Both apply
+only to coordinators created with the voice persona; text coordinators ignore
+them.
+
+| Setting | Default | Range | Effect |
+|---------|---------|-------|--------|
+| `coordinator.voice_max_agents_per_turn` | `1` | 0–10 | Child agents one spoken turn may start. A further spawn call is refused with a note telling the model to ask you first. `0` stops voice sessions starting agents at all. |
+| `coordinator.voice_child_model` | `deepseek-flash-high` | any model alias; empty means the normal default | Model an agent starts on when the voice coordinator names none. |
+
+The default cap is one because spoken asides are easy to mistake for
+requests: an agent-minded coordinator that researches first will act on "I
+wonder whether the tests pass". One agent per turn is enough for a real
+request and small enough that a misheard aside does not fan out. Raise it when
+you routinely ask the voice session for several agents at once ("start one
+researcher and one engineer"); set it to `0` for a conversation-only session,
+such as while driving.
+
+`coordinator.voice_child_model` keeps a spoken spawn from waiting on a model
+that is not loaded. The default is a fast model suited to background work.
+Change it when your deployment uses a different alias or when that work should
+run on a stronger model; leave it empty to fall back to the normal default.
+An alias the registry does not know fails the spawn the same way it would for
+a text coordinator.
+
+Edit both in Admin › Settings, section **Coordinator**. They are read when a
+spawn is prepared, so a saved change applies to the next spawn without
+reopening the session.
+

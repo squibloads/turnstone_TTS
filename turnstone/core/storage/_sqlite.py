@@ -5548,6 +5548,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
         ws_id: str,
         principal_id: str,
         *,
+        voice: bool = False,
         commit_context: Callable[[dict[str, Any]], contextlib.AbstractContextManager[None]]
         | None = None,
     ) -> dict[str, Any] | None:
@@ -5557,6 +5558,7 @@ class SQLiteBackend(_KeyedAttachmentSaveWrappers):
                 conn,
                 ws_id=ws_id,
                 principal_id=principal_id,
+                voice=voice,
             )
             context = (
                 commit_context(row)
