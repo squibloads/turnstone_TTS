@@ -10,59 +10,30 @@ All development now integrates on `main`. Supported release lines are maintained
 on `stable/X.Y` branches; `stable/1.8` preserves the former stable branch.
 The separate `dev` branch is retired. See [the release process](docs/releasing.md).
 
-## [2026-10-30]
+## [1.9.2]
 
-### Fixed
-
-- HTTP dictation makes one backend attempt with a 25-second budget shared by
-  preparation, credential minting, DNS, connection setup, upload and response
-  I/O, so a silent backend no longer holds speech capacity through long SDK
-  retries. In-turn transcription keeps its existing timeout and retry behavior
-  (#1509).
-- **A coordinator no longer reads a child it just messaged as finished.** A
-  child shows a dispatched message only once its turn starts, a few seconds
-  later, so a `wait_for_workstream` right after `spawn_workstream`,
-  `spawn_batch` or `send_to_workstream` returned at once with an empty result
-  or the child's previous answer, and a fast model resent the brief. Wait and
-  inspect now report such a child as `starting`, and as `stalled` after 120
-  seconds, with `dispatch_age_s`; the first wait that sees a stall returns
-  early and lists it in `stalled`. Spawn results say when the node didn't take
-  the first message (`initial_message_status`).
-- **A `since` wait no longer reports `complete` before it is.** A
-  `wait_for_workstream` given `since` returned `complete: true` as soon as a
-  listed child changed, even when it had only started working. `complete` now
-  means the any/all condition held; the new `changed` field lists the children
-  whose change ended the wait.
-
-### Security
-
-- **Streamed dictation needs write scope.** `POST
-  /api/workstreams/{ws_id}/speech-to-text/stream`, the route the browser's
-  microphone uses, accepted a read-only token, directly and through the console
-  proxy, while the JSON `speech-to-text` route required write. Both now require
-  write, so a read-only caller can no longer spend the speech-to-text model's
-  capacity or have a backend credential minted for it.
-- **Coordinator governance routes check token scope (#1517).** `POST
-  /api/workstreams/{ws_id}/trust`, `/restrict` and `/close_all_children`
-  accepted a read-only token held by a user with the coordinator permissions,
-  directly and through the console proxy. `trust` now requires `approve` scope,
-  since it lets a coordinator's sends to its own subtree skip approval;
-  `restrict` and `close_all_children` require `write`. Password and SSO
-  sessions are unaffected, since the permissions these routes check already give
-  them `approve`. An API token limited to `read,write`, or a session exchanged
-  from one, can no longer turn trust on or off.
-- **Workstream routes take their scope from the HTTP method.** Every request
-  under `/api/workstreams/` other than GET or HEAD now requires at least
-  `write`, so a route added there can no longer fall through to `read` the way
-  the streamed dictation route and the coordinator routes did.
-
-## [2026-10-29]
-
-> **Before upgrading:** the database advances from migration 084 to 085, which
-> records what each pending MCP sign-in was started against. A sign-in begun
-> before the upgrade fails as expired; connecting again works. A user whose MCP
-> grant was recorded before 1.8.2 with a templated (`{tenantid}`) issuer is
-> asked to connect again at its next refresh.
+> **Before upgrading:** the database advances from migration 084 to 086.
+> Migrations run automatically; upgrade every process that shares the database
+> together.
+>
+> - 085 records what each pending MCP sign-in was started against. A sign-in
+>   begun before the upgrade fails as expired; connecting again works.
+> - 086 gives the built-in admin and operator roles the `files.read` permission.
+>   Holders can read and download any file the node's process can read under its
+>   workspace (its working directory when none is set), `/data` and `/tmp`, with
+>   no model turn or tool approval. Revoke it with a role override where that is
+>   too broad; viewer and custom roles are unchanged.
+> - A user whose MCP grant was recorded before 1.8.2 with a templated
+>   (`{tenantid}`) issuer is asked to connect again at its next refresh.
+> - The consent callback compares `iss` exactly. A server whose Authorization
+>   Server URL names a multi-tenant alias (such as `.../organizations/v2.0`)
+>   can't complete a new consent with an authorization server that sends `iss`
+>   naming the tenant. Set the tenant's own issuer; changing that URL asks the
+>   server's users to connect again.
+> - A caller holding only `read` scope (a read-only API token, a session
+>   exchanged from one, or a viewer) can no longer make a request under
+>   `/api/workstreams/` other than GET or HEAD, and a coordinator's `trust` route
+>   now needs `approve` scope. See **Security** below.
 >
 > Custom storage backends must:
 > - accept and return the new pending-flow fields (`as_issuer`,
@@ -70,8 +41,9 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 > - purge an MCP server's name-keyed OAuth rows inside the transaction that
 >   creates, updates or deletes it, and take `purge_oauth_rows`,
 >   `oauth_client_secret_ct` (written in the same statement; the
->   `MCP_SECRET_UNCHANGED` default leaves it) and `expected` (write only while
->   those columns hold those values) on `update_mcp_server`;
+>   `MCP_SECRET_UNCHANGED` default leaves it and `None` clears it) and `expected`
+>   (write only while those columns hold those values) on `update_mcp_server`; a
+>   rename purges the old and new names' rows whatever `purge_oauth_rows` says;
 > - take `expected_as_issuer` and `expected_access_token_ct` on
 >   `update_oauth_token_after_refresh`, writing only while the row still holds
 >   them, and provide `delete_oauth_token_if_unchanged`;
@@ -81,120 +53,158 @@ The separate `dev` branch is retired. See [the release process](docs/releasing.m
 >   `upsert_oidc_user_credential_for_identity` and
 >   `delete_prompt_template_if_enabled`, each as one transaction;
 >   `delete_oidc_identity` and `delete_oidc_user_credential` are gone (an
->   identity and its credential go only through `unlink_oidc_identity`);
+>   identity and its credential now go through `unlink_oidc_identity`, or with
+>   the account in `delete_user`, which deletes the credential before the
+>   delegated rows);
 > - return only enabled servers' grants from
->   `list_mcp_user_token_reconcile_targets`.
+>   `list_mcp_user_token_reconcile_targets`;
+> - raise `StorageUnavailableError` or SQLAlchemy's `DBAPIError` when a write
+>   fails, which is what the console answers as `503`.
 
-### Security
+### Added
 
-- **MCP sign-ins check the authorization server's `iss` (#1408).** The consent
-  callback compares the response's `iss` with the issuer the user was sent to,
-  and refuses a missing one when the authorization server advertises it
-  (RFC 9207); one that neither sends nor advertises `iss` is not checked this
-  way. The callback also refuses when the server's URL, audience, auth type or
-  authorization server changed since Connect was clicked, checked before the
-  code exchange and again in the transaction that stores the token, so the
-  code goes only to the token endpoint of the authorization server the user was
-  sent to and no token is stored for a server changed meanwhile. A consent
-  replaces the user's earlier grant in that one step, and of two at once the
-  later one stands. An error from the authorization server is shown once the
-  state, the user and `iss` check out, and a response that repeats any
-  parameter is refused.
-- **An MCP server's authorization server stays pinned.** Once discovered, it
-  moves only when an operator changes the server's URL or Authorization Server
-  URL, or when a value stored by an earlier version is refused on its text
-  alone (an IP-literal host, or a bare `localhost` host for a remote server),
-  which is discovered again. A lookup of its host that fails, or that answers
-  with a refused address, now fails the connect or refresh instead of
-  discovering it again. A refresh or a disconnect sends a stored refresh token
-  only to the authorization server that issued it, compared exactly; a grant
-  from any other, including one recorded before 1.8.2 with a templated issuer,
-  is removed, and the user is asked to connect again. A refresh that finishes
-  or fails after the user consented again no longer overwrites or removes the
-  new grant.
-- **An MCP server change and the purge of its sign-ins land together.** A change
-  that rebinds a server's tokens (its name, auth type, URL, authorization server
-  or audience, or an on-behalf-of server's scopes) and every deletion purge its
-  per-user tokens and pending sign-ins in the same transaction; when that fails,
-  the change answers `503` and nothing is changed. A create, update or deletion
-  whose commit was cut off reads the server again: one that landed is audited
-  and reloaded as usual, and when that can't be told the reply says the change
-  may have been saved. Creating or renaming a server also clears tokens left
-  under its new name.
-- **A dynamically registered client never keeps an earlier secret.**
-  Registration saves the client id together with the secret the authorization
-  server returned (or clears the secret when there is none), in one write that
-  applies only while no other registration has saved a client and the server
-  still points where discovery found it; a connect that loses that race uses the
-  winner's client, and one whose write fails, or whose server moved, is refused.
-  A change of the Server URL or the Authorization Server URL of a server that
-  registers dynamically (before or after the save) drops the registered client's
-  id and secret, so that secret never reaches another authorization server. A
-  client secret now commits with the server change it comes with.
-- **Unlinking an OIDC identity takes its delegated access with it, in one
-  step.** The captured credential and the user's minted on-behalf-of MCP and
-  delegated model tokens are deleted in the same transaction as the identity;
-  when storage fails, the unlink answers `503`, changes nothing, and can be
-  retried. The console and every node registered within the last hour then
-  drop the user's cached model tokens from memory, where none is kept longer
-  than that hour, and a host that can't confirm it is named in the reply
-  (`status: "incomplete"`), the audit and the admin page, which also warns when
-  the reply can't be read. Deleting a user evicts the same way. An admin can no
-  longer unlink their own identity.
-- **A delegated token minted while its user is unlinked is never used.**
-  On-behalf-of MCP and model tokens are stored only while the credential that
-  minted them still exists (and an MCP server is still sign-in passthrough),
-  checked in the same transaction, and a token read or minted across a memory
-  eviction is not kept in memory. A token whose store fails is discarded too,
-  and that user's next mint for the server or model waits 30 seconds. A
-  sign-in in progress when its identity is unlinked no longer stores the
-  credential again; it fails instead.
-- **A disabled MCP prompt stays disabled.** When its server stops listing a
-  prompt an admin has disabled, the skill is kept, still disabled, and the
-  prompt returns to it if the server lists it again. An update to a skill
-  deleted meanwhile answers `404` in the admin API, and the `skills` tool
-  reports it to the model; neither records the change as done.
-- **A disabled per-user MCP server is no longer called.** Every tool call,
-  resource read and prompt get for an `oauth_user` or `oauth_obo` server
-  checks that the server is still enabled, before any token refresh or mint
-  (the retry after a `401` included), and a disabled one answers
-  `mcp_server_disabled` on every host without waiting for the reload. Each
-  call checks again once it holds the user's connection to the server, which
-  also refuses a call to a server deleted meanwhile. The first refused call
-  takes the server out of the user's live sessions, and each refusal is
-  logged. Connect for a disabled server answers `404`, the admin tab no
-  longer offers it, the dashboard no longer lists it as waiting for consent,
-  and a consent in progress when it is disabled stores no grant. Session
-  starts neither refresh nor connect it, and the token sweep no longer
-  refreshes its grants.
+- **Files pane.** Browse and retrieve files on a conversation's node without a
+  model turn: select **Files** above an interactive conversation's composer to
+  open its workspace, `/data` or `/tmp`, preview HTML, images, PDFs, Markdown,
+  tables and text, copy source, and download. Successful `write_file` and
+  `edit_file` cards link to the file. The pane is read-only, stays inside the
+  selected location and does not follow symlinks. It requires `files.read`,
+  `write` scope and an active session. These locations are shared by the node's
+  workstreams, so project access does not make them private. See
+  [Files pane](docs/console.md#files-pane) and
+  [its API](docs/api-reference.md#workspace-files).
 
 ### Changed
 
 - **`oauth_registration_mode` accepts only `preregistered` and `dcr`.** The
-  documented `dynamic` never registered a client; setting it is now refused
-  with `400`, while a row that stores it keeps it until changed.
-- **An MCP server update answers `409` when another request changed the
-  server meanwhile.** The update decides its purge and its client changes from
-  the server as it read it, and now applies only while the server still holds
-  those values; otherwise nothing is written.
+  documented `dynamic` never registered a client; setting it now answers `400`,
+  while a row that stores it keeps it until changed.
+- **An MCP server update answers `409` when another request changed the server's
+  name, auth type, URL, Authorization Server URL, audience, scopes or
+  registration mode meanwhile.** Nothing is written in that case.
 - **The OIDC unlink reply reports memory eviction per host.**
   `model_memo_nodes_invalidated` and `model_memo_nodes_failed` give way to
   `model_memo` (the console's result and the nodes evicted, failed and not
   reached) and `model_memo_unconfirmed`; deleting a user replies the same way.
-  The unlink and the user deletion are audited as soon as they commit
+  The unlink and the deletion are audited as soon as they commit
   (`oidc_identity.delete`, `user.delete`), and the eviction's outcome follows as
   `oidc_identity.delete.memo_eviction` or `user.delete.memo_eviction`. A write
-  whose commit was cut off but which took effect answers `incomplete` with the
-  unlink's counts `null`; when that can't be told, the reply is a `503` saying
-  the change may have been saved. The unlink confirmation now says that the
-  next OIDC sign-in creates a new user.
-- **Skills mirrored from an MCP server cannot be unlocked or renamed.**
-  Unlocking one answers `400`, and the skill editor no longer offers it. A
-  locked skill's update applies only its runtime config and ignores every other
-  field; renaming a mirrored skill unlocked before this release answers `400`.
-- **A skill update leaves an optional field sent as `null` unchanged.** It used
-  to store the text `None` in fields such as the name or content, clear the
-  tags, or reset the priority.
+  whose commit was cut off but took effect answers `incomplete` with the unlink's
+  counts `null`; when that can't be told, the reply is a `503` saying the change
+  may have been saved.
+- **Skills mirrored from an MCP server cannot be unlocked or renamed.** Unlocking
+  one answers `400`. A locked skill's update applies only its runtime config and
+  ignores every other field, and renaming a mirrored skill unlocked before this
+  release answers `400`.
+- **A skill update treats `null` as "leave unchanged" for optional fields such as
+  the name, content, tags and priority.** It used to store the text `None` in the
+  name or content, clear the tags, or reset the priority. `description`, `kind`,
+  `enabled`, `auto_approve` and `allowed_tools` answer `400` to `null`.
+
+### Fixed
+
+- **A coordinator no longer reads a child it just messaged as finished.** A
+  `wait_for_workstream` right after `spawn_workstream`, `spawn_batch` or
+  `send_to_workstream` could return at once with an empty result or the child's
+  previous answer, and a fast model resent the brief. Wait and inspect now report
+  a child that hasn't started a spawn's first message, or a send to it while
+  idle, as `starting`, and as `stalled` after 120 seconds, with `dispatch_age_s`;
+  the first wait that sees a stall returns early and lists it in `stalled`. The
+  report lapses after 10 minutes, and a console restart or a send from elsewhere
+  shows none. Spawn results say when the node didn't take the first message
+  (`initial_message_status`). A response that includes a wait now runs its tool
+  calls one at a time, in order.
+- **A `wait_for_workstream` given `since` no longer reports `complete` early.**
+  It returned `complete: true` as soon as a listed child changed, even one that
+  had only started working. `complete` now means the any/all condition held; the
+  new `changed` field lists the children whose change ended the wait.
+- **Dictation can't hold speech capacity through long retries (#1509).** HTTP
+  dictation makes one backend attempt with a 25-second budget shared by
+  preparation, credential minting, DNS, connection setup, upload and response
+  I/O. A backend error or timeout answers `502`, or ends a streamed transcript
+  that has already begun, and a long clip may now fail where it used to succeed
+  late. In-turn transcription keeps its timeout and retries.
+- **A configuration-file MCP server with a `url` and no `type` shows its real
+  transport (#1494).** It connects over Streamable HTTP, but the console showed
+  it as stdio with an empty command and no URL.
+
+### Security
+
+- **MCP sign-ins check the authorization server's `iss` (#1408).** The consent
+  callback compares `iss` with the issuer the user was sent to, and refuses a
+  missing one when the authorization server advertises it (RFC 9207); one that
+  neither sends nor advertises `iss` gets no protection from this check. The
+  callback also refuses when the server's URL, audience, auth type or
+  authorization server changed since Connect was clicked, before the code
+  exchange and again when storing the token. A response that repeats any
+  parameter is refused.
+- **An MCP server's authorization server stays pinned.** Once discovered, it
+  moves only when an operator changes the server's URL or Authorization Server
+  URL or takes it off `oauth_user`, or when a value stored by an earlier version
+  is refused on its text alone (an IP-literal host, or a bare `localhost` host
+  for a remote server). A lookup of its host that fails or answers with a refused
+  address now fails the connect or refresh. A refresh or disconnect sends a
+  stored refresh token only to the authorization server that issued it; a grant
+  from any other is removed, and the user is asked to connect again. A refresh
+  that finishes or fails after the user consented again no longer overwrites or
+  removes the new grant.
+- **An MCP server change and the purge of its sign-ins land together.** A change
+  that rebinds a server's tokens (its name, auth type, URL, authorization server
+  or audience, or an on-behalf-of server's scopes), and every deletion, purge its
+  per-user tokens and pending sign-ins in one transaction; when that fails, the
+  change answers `503` and nothing is changed. A write whose commit was cut off
+  reads the server again, and when that can't tell, the reply says the change may
+  have been saved. Creating or renaming a server also clears tokens left under
+  its new name.
+- **A dynamically registered client never keeps an earlier secret.** Registration
+  saves the client id and secret in one write that applies only while no other
+  registration has saved a client and the server still points where discovery
+  found it. Changing the Server URL or Authorization Server URL of a server that
+  registers dynamically drops both, so that secret never reaches another
+  authorization server.
+- **Unlinking an OIDC identity takes its delegated access with it, in one step.**
+  The captured credential and the user's on-behalf-of MCP and delegated model
+  tokens are deleted in the identity's transaction; when storage fails, the
+  unlink answers `503` and changes nothing. The console and every node registered
+  within the last hour then drop the user's cached model tokens, which no host
+  keeps in memory longer than that hour, and a host that can't confirm it is
+  named in the reply (`status: "incomplete"`), the audit and the admin page.
+  Deleting a user evicts the same way. An admin can no longer unlink their own
+  identity.
+- **A delegated token minted while its user is unlinked is never used.**
+  On-behalf-of MCP and model tokens are stored only while the credential that
+  minted them still exists (and an MCP server is still sign-in passthrough),
+  checked in the same transaction. A token whose store fails is discarded, and
+  that user's next mint for the server or model waits 30 seconds. A sign-in in
+  progress when its identity is unlinked now fails instead of storing the
+  credential again.
+- **A disabled per-user MCP server is no longer called.** Every tool call,
+  resource read and prompt get for an `oauth_user` or `oauth_obo` server checks
+  that the server is still enabled, before any token refresh or mint, and a
+  disabled one answers `mcp_server_disabled` on every host without waiting for
+  the reload. The first refused call takes the server out of the user's live
+  sessions, and each refusal is logged. Connect for a disabled server answers
+  `404`, a consent in progress when it is disabled stores no grant, and session
+  starts and the token sweep no longer refresh its grants.
+- **A disabled MCP prompt stays disabled.** When its server stops listing a prompt
+  an admin has disabled, the skill is kept, still disabled, and the prompt returns
+  to it if the server lists it again. An update to a skill deleted meanwhile
+  answers `404` in the admin API, and the `skills` tool reports it to the model.
+- **Streamed dictation needs write scope.** `POST
+  /api/workstreams/{ws_id}/speech-to-text/stream`, the route the browser's
+  microphone uses, accepted a read-only token, directly and through the console
+  proxy. A read-only caller can no longer spend the speech-to-text model's
+  capacity or have a backend credential minted for it.
+- **Coordinator governance routes check token scope (#1517).** `POST
+  /api/workstreams/{ws_id}/trust`, `/restrict` and `/close_all_children` accepted
+  a read-only token held by a user with the coordinator permissions. `trust` now
+  requires `approve` scope, and the other two `write`. Password and SSO sessions
+  of users with these permissions are unaffected, since those permissions give
+  them `approve`; an API token limited to `read,write`, or a session exchanged
+  from one, can no longer turn trust on or off.
+- **Workstream routes take their scope from the HTTP method.** Every request under
+  `/api/workstreams/` other than GET or HEAD now requires at least `write`, so a
+  route added there can no longer fall through to `read`.
 
 ## [1.9.1]
 
