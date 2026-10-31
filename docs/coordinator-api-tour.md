@@ -145,7 +145,7 @@ with a `type` field.  The recurring shapes a UI has to handle:
 | `child_ws_state`    | A direct child transitioned state                                                          | `child_ws_id`, `state` |
 | `child_ws_closed`   | A direct child closed                                                                      | `child_ws_id` |
 | `child_ws_rename`   | A direct child's name changed                                                              | `child_ws_id`, `name` |
-| `wait_started` / `wait_progress` / `wait_ended` | `wait_for_workstream` tool lifecycle (see §6)                  | `call_id`, `ws_ids`, `elapsed`, `results`, `complete`, `interrupted` |
+| `wait_started` / `wait_progress` / `wait_ended` | `wait_for_workstream` tool lifecycle (see §6)                  | `call_id`, `ws_ids`, `elapsed`, `results`, `complete`, `interrupted`, `changed` |
 | `batch_started` / `batch_ended` | `spawn_batch` / `close_all_children` tool lifecycle                            | `call_id`, `op`, `total`/`succeeded`/`denied`/`closed`/`failed`/`skipped` |
 | `info` / `error`    | Operational messages                                                                       | `message` |
 | `history_resync`    | The rendered history token no longer names the accepted row prefix                         | `ws_id`, `reason` |
@@ -279,6 +279,36 @@ Key properties:
   read, `complete=false`) — the LLM should fix the id and re-issue,
   not conclude the child died.  Foreign and missing collapse into one
   shape, so the wait can't be used as an existence oracle.
+- **Dispatched messages that haven't started** — a child just spawned
+  with an initial message, or an idle child sent a message that started
+  a fresh turn, stays `idle` in storage until the turn reports
+  `thinking`, a few seconds later.  Until the child's stored state or
+  token count changes, the wait reports it as `state="starting"`, which
+  isn't terminal; after 120 s it reports `stalled`, and after 600 s it
+  reads its stored state again.  Both carry `dispatch_age_s`, the whole
+  seconds since the coordinator dispatched the message.  A batch that
+  holds a `wait_for_workstream` runs its calls one at a time in order,
+  so a send listed before the wait is recorded when the wait starts, and
+  a read taken before the send read the child (an inspect beside it)
+  can't end the report.  The first wait that sees a child stalled
+  returns early with `complete=false` and lists it in a top-level
+  `stalled` field; later waits neither end early on it nor list it.  A
+  `since` entry compares such a child by its stored state and token
+  count, so entering `starting` or `stalled` isn't a change.
+  `inspect_workstream` reports the same states.  Neither is written to
+  storage or the child's state events; the `wait_progress` /
+  `wait_ended` events carry them only as part of the wait's results.
+  The console's coordinator client keeps the record in memory, so a
+  console restart drops it, and a send from elsewhere, a send the node
+  defers behind a slash command, or a send to a child in `error` shows
+  no `starting`.  The 600 s lapse bounds a report storage never shows
+  ending: a turn that reports no token usage and whose `thinking` no
+  wait reads, or a message cancelled from elsewhere before it started.
+  A pre-send compaction (a resumed child already over its context
+  window) runs after the message lands in the child's history but before
+  its turn shows, so a long one can read `stalled`, and the tokens its
+  summary spends can end `starting` a moment before the turn's
+  `thinking` is stored.
 - **Messages come with a completed wait** — `message` carries each
   finished child's last assistant text only when the wait completes
   (or aborts on `not_found`).  A wait that times out or is
@@ -287,6 +317,15 @@ Key properties:
   output twice.  A child that closed before the completing wait
   shows only the `closed` sentinel there; `inspect_workstream` still
   reads what it produced.
+- **`since` adds a trigger, not a completion** — given an earlier
+  result's `results` as `since`, the wait also returns as soon as a
+  listed child differs from its snapshot, naming those children in
+  `changed` (`[]` when something else ended the wait; absent without
+  `since`).  `complete` stays false unless the mode condition held,
+  and a return the change alone caused carries `message` only for the
+  changed children that finished.  An unchanged child already in a
+  real terminal state still meets the mode condition.  `wait_ended`
+  carries the same `changed` field.
 - **A user message ends the wait** — when the user sends the
   coordinator a message while it waits, the wait returns at once with
   `complete=false`, `interrupted="user_message"` and states only, and
@@ -311,7 +350,9 @@ rounds to a 10× token-efficiency win.
 These three endpoints let an operator steer a live coordinator session
 mid-flight.  All three emit an audit event tagged
 `coordinator.<action>` via the dedicated audit executor so a cascade
-burst can't starve audit writes.
+burst can't starve audit writes.  `/trust` needs a token with `approve`
+scope, since it waives approvals; `/restrict` and
+`/close_all_children` need `write`.
 
 ### `POST /trust` — auto-approve own-subtree sends
 
