@@ -715,6 +715,19 @@ def _build_registry() -> dict[str, SettingDef]:
             reference_url=VOICE_DOCS_URL + "#voice-mode",
         ),
         SettingDef(
+            "audio.voice_announce_reports",
+            "bool",
+            False,
+            "Announce finished agents in an idle voice session",
+            "audio",
+            help="Applies only to voice sessions. When an agent you started finishes and "
+            "nobody is talking to the session, the session speaks up on its own: one "
+            "sentence saying which agent finished and asking whether you want to hear "
+            "it. It plays even with the mic switched off. Off, the report waits and is "
+            "offered the next time you speak.",
+            reference_url=VOICE_DOCS_URL + "#announcing-finished-agents",
+        ),
+        SettingDef(
             "audio.tts_model_alias",
             "str",
             "",
