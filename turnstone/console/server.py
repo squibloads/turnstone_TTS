@@ -32,7 +32,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx2
 from sse_starlette import EventSourceResponse
@@ -79,10 +79,14 @@ from turnstone.core.http_failures import (
     may_have_reached_server,
 )
 from turnstone.core.http_headers import HEADER_VALUE_RE, HeaderValueError
-from turnstone.core.mcp_oauth import is_user_scoped_auth
+from turnstone.core.mcp_oauth import (
+    OAUTH_REGISTRATION_MODES,
+    is_user_scoped_auth,
+    registers_a_client,
+)
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
-from turnstone.core.model_oauth import get_model_token_client
+from turnstone.core.model_oauth import MEMO_EVICTION_WINDOW_S, get_model_token_client
 from turnstone.core.model_registry import (
     APP_IDENTITY_MODEL_AUTH_MODES,
     DYNAMIC_MODEL_AUTH_MODES,
@@ -144,7 +148,9 @@ from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 from turnstone.core.storage import (
     WorkstreamLeaseHeldError,
     WorkstreamLeaseLostError,
+    storage_errors,
 )
+from turnstone.core.storage._protocol import MCP_SECRET_UNCHANGED
 from turnstone.core.token_store.crypto import STARTUP_KEY_REQUIRED_HINT
 from turnstone.core.web_helpers import (
     WORKSTREAM_UNREADABLE_CODE,
@@ -305,8 +311,9 @@ _GENERATED_WS_ID_COLLISION_RETRY_CAP = 3
 # responses size their backstops strictly UNDER this bound — e.g. the
 # quick-command ``running`` answer (turnstone/core/session_routes.py
 # _COMMAND_RESPONSE_BACKSTOP_S) and a dictation's wait for its model's
-# admission slot (turnstone/server.py _STT_ADMISSION_WAIT_S); tests pin
-# both.  The SSE proxy client's granular Timeout is a separate contract.
+# admission slot and its backend I/O budget (turnstone/server.py
+# _STT_ADMISSION_WAIT_S / _STT_REQUEST_TIMEOUT_S); tests pin these bounds.
+# The SSE proxy client's granular Timeout is a separate contract.
 _PROXY_CLIENT_TIMEOUT_S = 30
 
 # How long the console waits for a node's ``tts`` answer, and only for that
@@ -6670,22 +6677,62 @@ async def admin_delete_user(request: Request) -> JSONResponse:
     if auth_result and auth_result.user_id == user_id:
         return JSONResponse({"error": "Cannot delete your own account"}, status_code=400)
     # Look up username for the audit trail before deleting
-    target_user = storage.get_user(user_id)
-    if storage.delete_user(user_id):
-        from turnstone.core.audit import record_audit
+    try:
+        target_user = await asyncio.to_thread(storage.get_user, user_id)
+    except storage_errors():
+        log.warning("admin.user.delete_read_failed user=%s", user_id, exc_info=True)
+        return _admin_change_not_saved()
+    if target_user is None:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    in_doubt = False
+    try:
+        deleted = await asyncio.to_thread(storage.delete_user, user_id)
+    except storage_errors():
+        log.warning("admin.user.delete_failed user=%s", user_id, exc_info=True)
+        # A failure as the commit was acknowledged may still have committed: read again.
+        try:
+            still_there = await asyncio.to_thread(storage.get_user, user_id) is not None
+        except storage_errors():
+            return JSONResponse({"error": _ADMIN_CHANGE_MAYBE_SAVED}, status_code=503)
+        if still_there:
+            return _admin_change_not_saved()
+        deleted = in_doubt = True
+    if not deleted:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+    from turnstone.core.audit import record_audit
 
-        audit_uid, ip = _audit_context(request)
-        record_audit(
-            storage,
-            audit_uid,
-            "user.delete",
-            "user",
-            user_id,
-            {"username": target_user.get("username", "") if target_user else ""},
-            ip,
-        )
-        return JSONResponse({"status": "ok"})
-    return JSONResponse({"error": "User not found"}, status_code=404)
+    # The deletion is audited as soon as it commits, so it is on record even if the process
+    # stops during the eviction below.
+    audit_uid, ip = _audit_context(request)
+    await asyncio.to_thread(
+        record_audit,
+        storage,
+        audit_uid,
+        "user.delete",
+        "user",
+        user_id,
+        {"username": target_user.get("username", "")},
+        ip,
+    )
+    # The user's token rows went with the account; tokens a process memoized go now.
+    eviction = await _evict_delegated_model_memos(request, storage, user_id)
+    await asyncio.to_thread(
+        record_audit,
+        storage,
+        audit_uid,
+        "user.delete.memo_eviction",
+        "user",
+        user_id,
+        {"model_memo_unconfirmed": eviction.unconfirmed(), "model_memo": eviction.report()},
+        ip,
+    )
+    return JSONResponse(
+        {
+            "status": "ok" if eviction.complete and not in_doubt else "incomplete",
+            "model_memo_unconfirmed": eviction.unconfirmed(),
+            "model_memo": eviction.report(),
+        }
+    )
 
 
 async def admin_delete_user_avatar_picture(request: Request) -> JSONResponse:
@@ -6998,23 +7045,119 @@ async def admin_list_oidc_identities(request: Request) -> JSONResponse:
     return JSONResponse({"oidc_identities": identities})
 
 
-async def _invalidate_model_auth_memos_cluster(request: Request, user_id: str) -> tuple[int, int]:
-    """Best-effort eviction of one user's delegated model memo on every node."""
+@dataclass(frozen=True)
+class _MemoEviction:
+    """Where one user's delegated model tokens were confirmed dropped from memory.
+
+    Each process memoizes the tokens it minted, outside any database transaction, so eviction
+    runs after the database change commits. A process that did not confirm it keeps serving the
+    user's cached tokens until they expire.
+    """
+
+    console_evicted: bool
+    node_list_read: bool = True
+    nodes_evicted: tuple[str, ...] = ()
+    nodes_failed: tuple[str, ...] = ()
+    nodes_not_reached: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.unconfirmed()
+
+    def unconfirmed(self) -> list[str]:
+        """The processes that may still hold the tokens, named for the admin."""
+        names = [] if self.console_evicted else ["console"]
+        names += [*self.nodes_failed, *self.nodes_not_reached]
+        if not self.node_list_read:
+            names.append("nodes (the node list could not be read)")
+        return names
+
+    def report(self) -> dict[str, Any]:
+        return {
+            "console": "evicted" if self.console_evicted else "failed",
+            "node_list_read": self.node_list_read,
+            "nodes_evicted": list(self.nodes_evicted),
+            "nodes_failed": list(self.nodes_failed),
+            "nodes_not_reached": list(self.nodes_not_reached),
+        }
+
+
+# The eviction asks every node registered within this window, not only those the collector lists
+# now, and names any that do not confirm. No memo entry outlives it (``MEMO_EVICTION_WINDOW_S``),
+# so a node outside it that still serves holds an evicted token at most that long.
+_MEMO_EVICTION_NODE_WINDOW_S = MEMO_EVICTION_WINDOW_S
+
+
+async def _evict_delegated_model_memos(
+    request: Request, storage: Any, user_id: str
+) -> _MemoEviction:
+    """Drop one user's delegated model tokens from the console's memo and every node's.
+
+    The nodes asked are the collector's and every node registered within
+    ``_MEMO_EVICTION_NODE_WINDOW_S``: one whose heartbeat writes fail keeps serving, and the
+    collector's list lags a new registration. Never raises: what it could not confirm is
+    reported, for the caller to answer and audit.
+    """
+    from turnstone.core.token_store.store import MODEL_OBO_CACHE_PREFIX
+
+    # Off the event loop: the eviction waits on the OAuth runtime's loop.
+    try:
+        await asyncio.to_thread(
+            get_model_token_client(request.app.state).invalidate_model_mint_memo_sync,
+            user_id=user_id,
+            server_prefix=MODEL_OBO_CACHE_PREFIX,
+        )
+        console_evicted = True
+    except Exception:
+        log.warning(
+            "admin.model_memo_invalidate_failed user=%s node=console", user_id, exc_info=True
+        )
+        console_evicted = False
+
+    # The console runtime is not in the node collector; every node is asked separately.
+    nodes: dict[str, str] = {}
+    node_list_read = True
     collector = getattr(request.app.state, "collector", None)
+    if collector is not None:
+        try:
+            for node in collector.get_all_nodes():
+                if node_id := str(node.get("node_id") or ""):
+                    nodes[node_id] = str(node.get("server_url") or "")
+        except Exception:
+            log.warning("admin.model_memo_node_list_failed user=%s", user_id, exc_info=True)
+            node_list_read = False
+    try:
+        registered = await asyncio.to_thread(
+            storage.list_services, "server", max_age_seconds=_MEMO_EVICTION_NODE_WINDOW_S
+        )
+        for service in registered:
+            if node_id := str(service.get("service_id") or ""):
+                nodes.setdefault(node_id, str(service.get("url") or ""))
+    except Exception:
+        log.warning("admin.model_memo_node_registry_failed user=%s", user_id, exc_info=True)
+        node_list_read = False
+    if not nodes:
+        return _MemoEviction(console_evicted, node_list_read=node_list_read)
+    node_ids = tuple(nodes)
     client = getattr(request.app.state, "proxy_client", None)
     token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
-    if collector is None or client is None or token_mgr is None:
-        return 0, 0
+    if client is None or token_mgr is None:
+        return _MemoEviction(
+            console_evicted, node_list_read=node_list_read, nodes_not_reached=node_ids
+        )
+    try:
+        headers = dict(token_mgr.bearer_header)
+        sem = asyncio.Semaphore(_get_fan_out_limit(request))
+    except Exception:
+        log.warning("admin.model_memo_fan_out_unavailable user=%s", user_id, exc_info=True)
+        return _MemoEviction(
+            console_evicted, node_list_read=node_list_read, nodes_not_reached=node_ids
+        )
 
-    headers = dict(token_mgr.bearer_header)
-    nodes = collector.get_all_nodes()
-    sem = asyncio.Semaphore(_get_fan_out_limit(request))
-
-    async def _invalidate(node: dict[str, Any]) -> bool | None:
-        node_id = str(node.get("node_id") or "")
-        url = str(node.get("server_url") or "").rstrip("/")
+    async def _evict(node_id: str, url: str) -> Literal["evicted", "failed", "not_reached"]:
+        url = url.rstrip("/")
         if not url:
-            return None
+            return "not_reached"
         try:
             async with sem:
                 response = await client.post(
@@ -7023,25 +7166,38 @@ async def _invalidate_model_auth_memos_cluster(request: Request, user_id: str) -
                     json={"user_id": user_id},
                     timeout=5,
                 )
-            if response.status_code == 200:
-                return True
-            log.warning(
-                "admin.oidc_identity.model_memo_invalidate_rejected user=%s node=%s status=%s",
-                user_id,
-                node_id,
-                response.status_code,
-            )
         except Exception:
             log.warning(
-                "admin.oidc_identity.model_memo_invalidate_failed user=%s node=%s",
+                "admin.model_memo_invalidate_failed user=%s node=%s",
                 user_id,
                 node_id,
                 exc_info=True,
             )
-        return False
+            return "failed"
+        if response.status_code != 200:
+            log.warning(
+                "admin.model_memo_invalidate_rejected user=%s node=%s status=%s",
+                user_id,
+                node_id,
+                response.status_code,
+            )
+            return "failed"
+        return "evicted"
 
-    outcomes = await asyncio.gather(*(_invalidate(node) for node in nodes))
-    return outcomes.count(True), outcomes.count(False)
+    results = await asyncio.gather(*(_evict(node_id, url) for node_id, url in nodes.items()))
+    outcomes = list(zip(node_ids, results, strict=True))
+    return _MemoEviction(
+        console_evicted,
+        node_list_read=node_list_read,
+        nodes_evicted=tuple(node_id for node_id, outcome in outcomes if outcome == "evicted"),
+        nodes_not_reached=tuple(
+            node_id for node_id, outcome in outcomes if outcome == "not_reached"
+        ),
+        # Every other outcome counts as failed, so no node can drop out of the report.
+        nodes_failed=tuple(
+            node_id for node_id, outcome in outcomes if outcome not in ("evicted", "not_reached")
+        ),
+    )
 
 
 async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
@@ -7063,115 +7219,90 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
     if not issuer or not subject:
         return JSONResponse({"error": "issuer and subject required"}, status_code=400)
 
-    # Look up before delete so audit captures which user was affected
-    identity = storage.get_oidc_identity(issuer, subject)
+    try:
+        identity = await asyncio.to_thread(storage.get_oidc_identity, issuer, subject)
+    except storage_errors():
+        log.warning("admin.oidc_identity.unlink_read_failed issuer=%s", issuer, exc_info=True)
+        return _admin_change_not_saved()
     if not identity:
         return JSONResponse({"error": "Identity not found"}, status_code=404)
+    # As for deleting an account: an admin can't cut off their own sign-in.
+    auth_result = getattr(request.state, "auth_result", None)
+    if auth_result and auth_result.user_id == identity["user_id"]:
+        return JSONResponse({"error": "Cannot unlink your own OIDC identity"}, status_code=400)
 
-    storage.delete_oidc_identity(issuer, subject)
-
-    # #551: unlinking the identity must revoke the captured IdP refresh
-    # credential (keyed on (user_id, issuer)) AND purge the already-minted
-    # oauth_obo access-token cache rows — otherwise a deprovisioned user's
-    # scheduled/autonomous runs keep executing MCP tool calls with the still-fresh
-    # cached bearer until it expires (deleting only the credential stops FUTURE
-    # mints but not the live cache). Best-effort: a failure must not leave the
-    # identity un-deleted.
-    user_id = identity["user_id"]
-    credential_revoked = False
-    obo_cache_purged = 0
-    token_store = oauth_context(request.app.state).token_store
-    if token_store is not None:
+    # #551: unlinking the identity revokes the captured IdP refresh credential (keyed on
+    # (user_id, issuer)) and purges the minted oauth_obo and delegated model token rows, all in
+    # one transaction with the identity: otherwise a deprovisioned user's scheduled and
+    # autonomous runs keep calling MCP tools and models with a still-fresh cached bearer. When it
+    # fails, nothing has changed and the admin can retry.
+    user_id = str(identity["user_id"])
+    credential_revoked: bool | None = None
+    rows_purged: int | None = None
+    try:
+        unlinked = await asyncio.to_thread(
+            storage.unlink_oidc_identity, issuer, subject, model_token_prefix=MODEL_OBO_CACHE_PREFIX
+        )
+    except storage_errors():
+        log.warning("admin.oidc_identity.unlink_failed issuer=%s", issuer, exc_info=True)
+        # A failure as the commit was acknowledged may still have committed: read again. The
+        # identity gone, or now linking another user (whose sign-in created it again), means the
+        # unlink committed, with counts no longer known.
         try:
-            credential_revoked = bool(token_store.delete_oidc_credential(user_id, issuer))
-        except Exception:
-            log.warning(
-                "admin.oidc_identity.credential_revoke_failed user=%s", user_id, exc_info=True
-            )
-        try:
-            from turnstone.core.mcp_oauth import obo_server_names
+            now = await asyncio.to_thread(storage.get_oidc_identity, issuer, subject)
+        except storage_errors():
+            return JSONResponse({"error": _ADMIN_CHANGE_MAYBE_SAVED}, status_code=503)
+        if now is not None and str(now.get("user_id") or "") == user_id:
+            return _admin_change_not_saved()
+    else:
+        if unlinked is None:  # another request unlinked it since the read above
+            return JSONResponse({"error": "Identity not found"}, status_code=404)
+        credential_revoked = unlinked["credential_deleted"]
+        rows_purged = unlinked["delegated_token_rows_deleted"]
 
-            obo_servers = sorted(obo_server_names(storage))
-        except Exception:
-            obo_servers = []
-            log.warning(
-                "admin.oidc_identity.obo_server_list_failed user=%s", user_id, exc_info=True
-            )
-        for server_name in obo_servers:
-            # Per-server try/except: a failure on one server must not leave the
-            # remaining servers' cached bearers un-purged for a deprovisioned user.
-            try:
-                if token_store.delete_user_token(user_id, server_name):
-                    obo_cache_purged += 1
-            except Exception:
-                log.warning(
-                    "admin.oidc_identity.obo_cache_purge_failed user=%s server=%s",
-                    user_id,
-                    server_name,
-                    exc_info=True,
-                )
-        # Model-provider OBO rows use synthetic server keys and therefore are
-        # not present in mcp_servers/obo_server_names. Purge only delegated
-        # model rows for this user; __model_app__ rows belong to the shared
-        # __app__ identity and intentionally survive user deprovisioning.
-        try:
-            metadata = token_store.list_user_token_metadata(user_id)
-        except Exception:
-            metadata = []
-            log.warning(
-                "admin.oidc_identity.model_obo_cache_list_failed user=%s",
-                user_id,
-                exc_info=True,
-            )
-        for row in metadata:
-            token_key = str(row.get("token_key") or "")
-            if not token_key.startswith(MODEL_OBO_CACHE_PREFIX):
-                continue
-            try:
-                if token_store.delete_user_token(user_id, token_key):
-                    obo_cache_purged += 1
-            except Exception:
-                log.warning(
-                    "admin.oidc_identity.model_obo_cache_purge_failed user=%s server=%s",
-                    user_id,
-                    token_key,
-                    exc_info=True,
-                )
-    # The console runtime is not in the node collector, so invalidate its
-    # memo directly as well as fanning out below.
-    model_client = get_model_token_client(request.app.state)
-    model_client.invalidate_model_mint_memo_sync(
-        user_id=user_id,
-        server_prefix=MODEL_OBO_CACHE_PREFIX,
-    )
-    memo_nodes_invalidated, memo_nodes_failed = await _invalidate_model_auth_memos_cluster(
-        request, user_id
-    )
-
+    # The unlink is audited as soon as it commits, so it is on record even if the process stops
+    # during the eviction below.
     audit_uid, ip = _audit_context(request)
-    record_audit(
+    resource = f"{issuer}:{subject}"
+    await asyncio.to_thread(
+        record_audit,
         storage,
         audit_uid,
         "oidc_identity.delete",
         "oidc_identity",
-        f"{issuer}:{subject}",
+        resource,
         {
             "user_id": user_id,
             "obo_credential_revoked": credential_revoked,
-            "obo_cache_rows_purged": obo_cache_purged,
-            "model_memo_nodes_invalidated": memo_nodes_invalidated,
-            "model_memo_nodes_failed": memo_nodes_failed,
+            "obo_cache_rows_purged": rows_purged,
+        },
+        ip,
+    )
+    eviction = await _evict_delegated_model_memos(request, storage, user_id)
+    await asyncio.to_thread(
+        record_audit,
+        storage,
+        audit_uid,
+        "oidc_identity.delete.memo_eviction",
+        "oidc_identity",
+        resource,
+        {
+            # First, among the keys the Audit tab shows: where the user's cached model tokens
+            # may outlive the unlink until they expire.
+            "model_memo_unconfirmed": eviction.unconfirmed(),
+            "user_id": user_id,
+            "model_memo": eviction.report(),
         },
         ip,
     )
 
     return JSONResponse(
         {
-            "status": "ok",
+            "status": "ok" if eviction.complete and rows_purged is not None else "incomplete",
             "obo_credential_revoked": credential_revoked,
-            "obo_cache_rows_purged": obo_cache_purged,
-            "model_memo_nodes_invalidated": memo_nodes_invalidated,
-            "model_memo_nodes_failed": memo_nodes_failed,
+            "obo_cache_rows_purged": rows_purged,
+            "model_memo_unconfirmed": eviction.unconfirmed(),
+            "model_memo": eviction.report(),
         }
     )
 
@@ -7922,6 +8053,8 @@ _VALID_PERMISSIONS = frozenset(
         "workstreams.create",
         "workstreams.close",
         "conversation.modify",
+        # Direct node filesystem browsing, distinct from tool execution.
+        "files.read",
         # Projects — shared resource containers.  Granted to builtin-admin via
         # migration 062; grantable to non-admin users via a custom role.
         # ``project.read``/``project.write`` compose with the per-project ACL
@@ -9008,6 +9141,24 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     return JSONResponse(_skill_to_response(skill))
 
 
+# Optional skill fields a PUT may send as null to mean "leave unchanged". ``description`` refuses
+# null on purpose, and the session config fields keep their own null rules.
+_SKILL_NULL_MEANS_UNCHANGED = frozenset(
+    {
+        "name",
+        "content",
+        "category",
+        "variables",
+        "author",
+        "version",
+        "license",
+        "compatibility",
+        "tags",
+        "priority",
+    }
+)
+
+
 async def admin_update_skill(request: Request) -> JSONResponse:
     """PUT /v1/api/admin/skills/{skill_id} — update a skill."""
     import json as _json
@@ -9032,6 +9183,14 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
+    if is_readonly:
+        # A locked row changes only its runtime config. Every other field is dropped before any is
+        # parsed or compared: the skill editor sends them all back, and a value that would not be
+        # written (a mirrored prompt's name the editor trimmed, say) must not refuse the save, a
+        # disable included.
+        body = {k: v for k, v in body.items() if k in _SKILL_RUNTIME_CONFIG_FIELDS}
+    # A null optional field is left unchanged, as an absent one is; the request schema allows it.
+    body = {k: v for k, v in body.items() if v is not None or k not in _SKILL_NULL_MEANS_UNCHANGED}
 
     # Session config fields via shared helper
     session_fields, session_err = _parse_skill_session_config(body)
@@ -9041,6 +9200,13 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     updates: dict[str, Any] = dict(session_fields)
     if "name" in body:
         updates["name"] = str(body["name"]).strip()[:256]
+        if existing.get("origin") == "mcp" and updates["name"] != existing.get("name"):
+            # The sync finds a mirrored prompt by the name its server gives it: a renamed row
+            # would be left behind while the prompt came back under that name as a new skill.
+            return JSONResponse(
+                {"error": "A skill mirrored from an MCP server cannot be renamed"},
+                status_code=400,
+            )
         existing_by_name = storage.get_prompt_template_by_name(updates["name"])
         if existing_by_name and existing_by_name["template_id"] != skill_id:
             return JSONResponse({"error": "Skill name already exists"}, status_code=409)
@@ -9134,7 +9300,10 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         changed_by=audit_uid_pre,
     )
 
-    storage.update_prompt_template(skill_id, **updates)
+    if not storage.update_prompt_template(skill_id, **updates):
+        # Deleted since it was read (by another host's MCP prompt sync, for one): nothing
+        # changed, so nothing is audited as done.
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -9148,6 +9317,8 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     )
 
     updated_skill = storage.get_prompt_template(skill_id)
+    if updated_skill is None:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
     rc_map = storage.count_skill_resources_bulk([skill_id])
     return JSONResponse(_skill_to_response(updated_skill, resource_count=rc_map.get(skill_id, 0)))
 
@@ -9427,12 +9598,13 @@ async def admin_rescan_skill(request: Request) -> JSONResponse:
     content = skill.get("content", "")
     allowed_tools = skill.get("allowed_tools", "[]")
     risk_level, scan_report, scan_version = scan_skill_content(content, allowed_tools)
-    storage.update_prompt_template(
+    if not storage.update_prompt_template(
         skill_id,
         risk_level=risk_level,
         scan_report=scan_report,
         scan_version=scan_version,
-    )
+    ):
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
     return JSONResponse(
         {
             "risk_level": risk_level,
@@ -9468,6 +9640,11 @@ async def admin_unlock_skill(request: Request) -> JSONResponse:
     existing = storage.get_prompt_template(skill_id)
     if existing is None:
         return JSONResponse({"error": "Skill not found"}, status_code=404)
+    if existing.get("origin") == "mcp":
+        # Its server owns the text, and the sync keeps the row in step with it.
+        return JSONResponse(
+            {"error": "A skill mirrored from an MCP server cannot be unlocked"}, status_code=400
+        )
     if not existing.get("readonly"):
         return JSONResponse({"error": "Skill is already unlocked"}, status_code=400)
 
@@ -10946,22 +11123,26 @@ async def admin_registry_install(request: Request) -> JSONResponse:
     server_id = uuid.uuid4().hex
     audit_uid, ip = _audit_context(request)
 
-    created = storage.create_mcp_server(
-        server_id=server_id,
-        name=name,
-        transport=config["transport"],
-        command=config.get("command", ""),
-        args=json.dumps(config.get("args", [])),
-        url=config.get("url", ""),
-        headers=json.dumps(merged_headers),
-        env=json.dumps(merged_env),
-        auto_approve=False,
-        enabled=True,
-        created_by=audit_uid,
-        registry_name=registry_name,
-        registry_version=config["registry_version"],
-        registry_meta=json.dumps(config["registry_meta"]),
-    )
+    try:
+        created = storage.create_mcp_server(
+            server_id=server_id,
+            name=name,
+            transport=config["transport"],
+            command=config.get("command", ""),
+            args=json.dumps(config.get("args", [])),
+            url=config.get("url", ""),
+            headers=json.dumps(merged_headers),
+            env=json.dumps(merged_env),
+            auto_approve=False,
+            enabled=True,
+            created_by=audit_uid,
+            registry_name=registry_name,
+            registry_version=config["registry_version"],
+            registry_meta=json.dumps(config["registry_meta"]),
+        )
+    except storage_errors():
+        log.warning("admin.mcp.install_failed name=%s", name, exc_info=True)
+        return _admin_change_not_saved()
     if not created:
         # Another request installed this registry server, or took the name, since the checks above.
         # A retry's checks say which.
@@ -11349,6 +11530,65 @@ def _canonical_oauth_user_url(
         return url, JSONResponse({"error": f"url: {exc}"}, status_code=400)
 
 
+# The reply to an admin change refused because storage failed partway: nothing was written, and
+# the same request can be sent again.
+_ADMIN_CHANGE_NOT_SAVED = "The change could not be saved, and nothing was changed. Try again."
+
+# Returned when a server update's compare-and-set finds the row changed since the request read it.
+_MCP_SERVER_CHANGED_MEANWHILE = (
+    "The server was changed by another request since this one read it. Reload it and try again."
+)
+
+# The columns an MCP server update takes its purge, issuer and client decisions from; the write
+# applies only while the row still holds the values the request read.
+_MCP_BINDING_COLUMNS = (
+    "name",
+    "auth_type",
+    "url",
+    "oauth_authorization_server_url",
+    "oauth_audience",
+    "oauth_scopes",
+    "oauth_registration_mode",
+)
+
+
+# Returned when a write failed in a way that may still have committed, and reading again could
+# not tell.
+_ADMIN_CHANGE_MAYBE_SAVED = "The change may not have been saved. Check before trying again."
+
+
+def _admin_change_not_saved() -> JSONResponse:
+    return JSONResponse({"error": _ADMIN_CHANGE_NOT_SAVED}, status_code=503)
+
+
+def _mcp_write_in_doubt(
+    storage: Any, server_id: str, landed: Callable[[dict[str, Any] | None], bool]
+) -> JSONResponse | None:
+    """After a storage error on an MCP server write, read the row again: a failure as the commit
+    was acknowledged may still have committed.
+
+    Returns ``None`` when *landed* says the row shows the write, for the caller to go on as after
+    a success (audit, reload); otherwise the 503 that nothing was changed, or, when the row
+    cannot be read, the 503 that the change may have been saved.
+    """
+    try:
+        row = storage.get_mcp_server(server_id)
+    except storage_errors():
+        return JSONResponse({"error": _ADMIN_CHANGE_MAYBE_SAVED}, status_code=503)
+    return None if landed(row) else _admin_change_not_saved()
+
+
+def _parse_registration_mode(value: Any) -> tuple[str | None, JSONResponse | None]:
+    """Return the cleaned ``oauth_registration_mode``, or a 400 for a value no flow runs."""
+    mode = _clean_oauth_text(value)
+    if mode is None or mode in OAUTH_REGISTRATION_MODES:
+        return mode, None
+    allowed = " or ".join(repr(name) for name in OAUTH_REGISTRATION_MODES)
+    return None, JSONResponse(
+        {"error": f"oauth_registration_mode must be {allowed}"}, status_code=400
+    )
+
+
 def _same_oauth_resource(existing_url: str, new_url: str) -> bool:
     """True when two server URLs name the same RFC 8707 resource.
 
@@ -11384,8 +11624,8 @@ def _oauth_columns_to_clear(auth_type: str | None) -> dict[str, None]:
     ``oauth_audience`` (+ ``oauth_scopes`` under rfc8693) but none of the
     oauth_user-only columns; ``static``/``none`` use no OAuth columns at all.
     ``oauth_client_secret_ct`` is owned by a dedicated write path and is not
-    included here. Callers that cannot persist ``oauth_as_issuer_cached`` (the
-    create path) drop that key.
+    included here. The create and update paths pass every key, the cached
+    issuer included.
     """
     if auth_type == "oauth_user":
         return {}
@@ -11620,51 +11860,43 @@ def _require_token_store_for_oauth_secret(
     return None
 
 
-def _apply_oauth_client_secret(
-    request: Request,
-    *,
-    server_id: str,
-    body: dict[str, Any],
-    auth_type: str,
-    audit_uid: str,
-    storage: Any,
-    ip: str,
-) -> tuple[bool | None, JSONResponse | None]:
-    """Encrypt + persist the operator-supplied client secret.
+def _client_secret_write(
+    request: Request, body: dict[str, Any], *, auth_type: str
+) -> tuple[Any, JSONResponse | None]:
+    """The client-secret ciphertext a create or update stores with the server row.
 
-    ``oauth_client_secret`` is read from ``body``; ``None`` / empty string
-    clears the column.  No-op when the field is absent or ``auth_type``
-    is not ``oauth_user`` — ``(None, None)`` is returned in that case.
-
-    On success returns ``(True, None)`` for a set or ``(False, None)``
-    for a clear.  Returns ``(None, error_response)`` only when
-    ``_require_token_store_for_oauth_secret`` refuses the body field
-    (callers must invoke it BEFORE the storage write to avoid a
-    partial-write hazard; this helper runs it again in case lifespan
-    state changed mid-request).
+    ``oauth_client_secret`` is read from ``body``; ``None`` or an empty string clears the column.
+    Returns ``MCP_SECRET_UNCHANGED`` when the field is absent or ``auth_type`` is not
+    ``oauth_user``, and ``(None, error_response)`` when no encryption key is configured.
+    Encryption stays in ``MCPTokenStore``; the write itself commits with the change.
     """
     if "oauth_client_secret" not in body or auth_type != "oauth_user":
-        return None, None
+        return MCP_SECRET_UNCHANGED, None
     err = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type)
     if err is not None:
         return None, err
-    secret_input = body.get("oauth_client_secret")
     token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
     if token_store is None:
         return None, JSONResponse({"error": _OAUTH_TOKEN_STORE_503_MSG}, status_code=503)
-    secret_text = (secret_input or "").strip()
-    secret_value: str | None = secret_text or None
-    token_store.set_oauth_client_secret(server_id, secret_value)
-    cleared = secret_value is None
+    secret_text = (body.get("oauth_client_secret") or "").strip()
+    return (token_store.encrypt_oauth_client_secret(secret_text) if secret_text else None), None
+
+
+def _audit_client_secret_write(
+    request: Request, storage: Any, audit_uid: str, server_id: str, secret_ct: Any, ip: str
+) -> None:
+    """Audit a client-secret set or clear that committed with the server row."""
+    if secret_ct is MCP_SECRET_UNCHANGED:
+        return
+    token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
     _audit_oauth_client_secret_set(
         storage,
         audit_uid,
         server_id,
-        cleared=cleared,
-        cipher=token_store.cipher,
+        cleared=secret_ct is None,
+        cipher=token_store.cipher if token_store is not None else None,
         ip=ip,
     )
-    return (not cleared), None
 
 
 def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str, Any]:
@@ -12169,49 +12401,53 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
     # flip. ``oauth_as_issuer_cached`` (nulled by the cleared set for a
     # non-oauth_user type) IS a valid create parameter, so it passes through
     # to ``create_mcp_server`` as its default None.
+    registration_mode, err_resp = _parse_registration_mode(body.get("oauth_registration_mode"))
+    if err_resp is not None:
+        return err_resp
     oauth_cols: dict[str, Any] = {
         "oauth_client_id": _clean_oauth_text(body.get("oauth_client_id")),
         "oauth_scopes": clean_scopes,
         "oauth_audience": clean_audience,
-        "oauth_registration_mode": _clean_oauth_text(body.get("oauth_registration_mode")),
+        "oauth_registration_mode": registration_mode,
         "oauth_authorization_server_url": _clean_oauth_text(
             body.get("oauth_authorization_server_url"), max_length=2048
         ),
     }
     oauth_cols.update(_oauth_columns_to_clear(auth_type))
 
-    created = storage.create_mcp_server(
-        server_id=server_id,
-        name=name,
-        transport=transport,
-        command=str(body.get("command", "")).strip(),
-        args=json.dumps(args_list) if isinstance(args_list, list) else "[]",
-        url=server_url,
-        headers=json.dumps(headers_dict) if isinstance(headers_dict, dict) else "{}",
-        env=json.dumps(env_dict) if isinstance(env_dict, dict) else "{}",
-        auto_approve=auto_approve,
-        enabled=enabled,
-        tls_skip_verify=tls_skip_verify,
-        created_by=audit_uid,
-        auth_type=auth_type,
-        **oauth_cols,
-    )
+    secret_ct, err_resp = _client_secret_write(request, body, auth_type=auth_type)
+    if err_resp is not None:
+        return err_resp
+    if secret_ct is not MCP_SECRET_UNCHANGED:
+        oauth_cols["oauth_client_secret_ct"] = secret_ct
+    try:
+        created = storage.create_mcp_server(
+            server_id=server_id,
+            name=name,
+            transport=transport,
+            command=str(body.get("command", "")).strip(),
+            args=json.dumps(args_list) if isinstance(args_list, list) else "[]",
+            url=server_url,
+            headers=json.dumps(headers_dict) if isinstance(headers_dict, dict) else "{}",
+            env=json.dumps(env_dict) if isinstance(env_dict, dict) else "{}",
+            auto_approve=auto_approve,
+            enabled=enabled,
+            tls_skip_verify=tls_skip_verify,
+            created_by=audit_uid,
+            auth_type=auth_type,
+            **oauth_cols,
+        )
+    except storage_errors():
+        log.warning("admin.mcp.create_failed name=%s", name, exc_info=True)
+        # The id is this request's own, so a row under it is this create.
+        in_doubt = _mcp_write_in_doubt(storage, server_id, lambda row: row is not None)
+        if in_doubt is not None:
+            return in_doubt
+        created = True
     if not created:  # another request took the name since the check above
         return JSONResponse({"error": f"Server '{name}' already exists"}, status_code=409)
 
-    # Encrypt + persist the operator-supplied client secret via the dedicated
-    # writer.  Pre-checked above; the helper re-checks defensively.
-    secret_set_state, err_resp = _apply_oauth_client_secret(
-        request,
-        server_id=server_id,
-        body=body,
-        auth_type=auth_type,
-        audit_uid=audit_uid,
-        storage=storage,
-        ip=ip,
-    )
-    if err_resp is not None:
-        return err_resp
+    _audit_client_secret_write(request, storage, audit_uid, server_id, secret_ct, ip)
 
     audit_detail: dict[str, Any] = {"name": name, "auth_type": auth_type}
     if tls_skip_verify:
@@ -12221,8 +12457,8 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
         audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
-        if secret_set_state is not None:
-            audit_detail["oauth_client_secret_set"] = secret_set_state
+        if secret_ct is not MCP_SECRET_UNCHANGED:
+            audit_detail["oauth_client_secret_set"] = secret_ct is not None
     if transport == "streamable-http":
         # Where the server points, never its path or query, which can carry a credential. Last,
         # so a header reference or client-secret marker keeps its place among those three keys.
@@ -12358,10 +12594,19 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     for _oauth_key in (
         "oauth_client_id",
         "oauth_scopes",
-        "oauth_registration_mode",
     ):
         if _oauth_key in body:
             updates[_oauth_key] = _clean_oauth_text(body[_oauth_key])
+    # A stored mode sent back unchanged (a client writing the row back) is kept, whatever it is,
+    # as an unchanged URL or header is; only a change is checked.
+    if "oauth_registration_mode" in body and _clean_oauth_text(body["oauth_registration_mode"]) != (
+        existing.get("oauth_registration_mode") or None
+    ):
+        updates["oauth_registration_mode"], err_resp = _parse_registration_mode(
+            body["oauth_registration_mode"]
+        )
+        if err_resp is not None:
+            return err_resp
     for _oauth_url_key in (
         "oauth_audience",
         "oauth_authorization_server_url",
@@ -12500,17 +12745,23 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     # Pointing a row at a different authorization server is a token-binding
     # change like a URL change: the stored refresh tokens were issued by the
     # OLD authorization server, and the next refresh would present them to the
-    # new one. A dynamically registered client_id has the same problem — it
-    # was issued by the old server and means nothing at the new one — so it is
-    # cleared too, letting registration run again. A pre-registered client_id
-    # is the operator's own value and is left alone.
+    # new one.
     as_url_purge = as_url_changing and is_user_scoped_auth(old_auth)
-    if as_url_purge:
-        registration_mode = str(
-            updates.get("oauth_registration_mode", existing.get("oauth_registration_mode")) or ""
-        )
-        if registration_mode == "dynamic":
-            updates["oauth_client_id"] = None
+    # A dynamically registered client, id and secret alike, was issued by the authorization
+    # server the row pointed at. On either event that drops the cached issuer it goes, and
+    # registration runs again wherever the row points now. Either mode counts: one save can
+    # switch out of dynamic registration or into it. An id this request sets is the operator's
+    # and stays; one that only repeats the stored id is cleared. A pre-registered row keeps both.
+    stored_mode = existing.get("oauth_registration_mode") or None
+    mode_after = updates.get("oauth_registration_mode", stored_mode)
+    clear_dcr_client = (url_changing or as_url_changing) and (
+        registers_a_client(stored_mode) or registers_a_client(mode_after)
+    )
+    if clear_dcr_client and (updates.get("oauth_client_id") or None) in (
+        None,
+        existing.get("oauth_client_id") or None,
+    ):
+        updates["oauth_client_id"] = None
     # Changing oauth_audience on a pool-backed row is a token-binding change too:
     # minted obo bearers (and oauth_user tokens) are audience-scoped, so cached
     # rows for the OLD audience must be purged or a privilege reduction silently
@@ -12545,6 +12796,13 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     err_resp = _require_token_store_for_oauth_secret(request, body, auth_type=auth_type_now)
     if err_resp is not None:
         return err_resp
+    # The client secret commits with the change. A secret this request sets is written; leaving
+    # oauth_user, or a dynamically registered client being dropped, clears it.
+    secret_ct, err_resp = _client_secret_write(request, body, auth_type=auth_type_now)
+    if err_resp is not None:
+        return err_resp
+    if secret_ct is MCP_SECRET_UNCHANGED and (leaving_oauth_user or clear_dcr_client):
+        secret_ct = None
 
     # sec-1: enforce https:// for the post-update url+auth_type combination,
     # using the new url if present in updates, else the existing row's url.
@@ -12577,11 +12835,35 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
     if err_resp is not None:
         return err_resp
 
+    # Purge per-user tokens + pending OAuth states keyed on the row's name on
+    # rename, on any pool-backed auth_type transition, on URL change, or on an
+    # audience / obo-scope change for a pool-backed row. All cases would
+    # otherwise leave tokens orphaned-and-rebindable or bound to a superseded
+    # URL/audience/scope set (the OAuth tables key on the mutable
+    # ``server_name`` and tokens are bound to the URL + audience + scopes
+    # active at mint/consent time). The purge and the change commit in one
+    # transaction, so neither lands without the other.
+    purge_oauth_rows = (
+        name_changing
+        or auth_type_purge
+        or url_changing
+        or as_url_purge
+        or audience_changing
+        or scopes_changing
+    )
     # Written even when *updates* is empty (it then stamps only ``updated``): the write is what
     # says whether the row still exists, so a server deleted since the read above answers 404
-    # before any purge, secret write, audit event or reload.
+    # before any secret write, audit event or reload.
     try:
-        found = storage.update_mcp_server(server_id, **updates)
+        found = storage.update_mcp_server(
+            server_id,
+            purge_oauth_rows=purge_oauth_rows,
+            oauth_client_secret_ct=secret_ct,
+            # Every decision above was taken from the row read before the body: the write applies
+            # only while the row still holds those values.
+            expected={column: existing.get(column) for column in _MCP_BINDING_COLUMNS},
+            **updates,
+        )
     except StorageConflictError:
         if not name_changing:
             raise
@@ -12589,80 +12871,53 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         return JSONResponse(
             {"error": f"Server '{updates['name']}' already exists"}, status_code=409
         )
-    if not found:  # another request deleted the server since the read above
-        return JSONResponse({"error": "MCP server not found"}, status_code=404)
+    except storage_errors():
+        log.warning("admin.mcp.update_failed server_id=%s", server_id, exc_info=True)
+        # The row shows this write by what the request set. The clears the update derives (the
+        # cached issuer, a dynamically registered client's id and secret) go with a URL,
+        # authorization-server or auth-type change the other columns show, and discovery or a
+        # registration may have set them again before this read.
+        written = {
+            k: v
+            for k, v in updates.items()
+            if k != "oauth_as_issuer_cached" and not (k == "oauth_client_id" and clear_dcr_client)
+        }
+        if (
+            secret_ct is not MCP_SECRET_UNCHANGED
+            and "oauth_client_secret" in body
+            and not clear_dcr_client
+        ):
+            written["oauth_client_secret_ct"] = secret_ct
+        in_doubt = _mcp_write_in_doubt(
+            storage,
+            server_id,
+            lambda row: row is not None and all(row.get(k) == v for k, v in written.items()),
+        )
+        if in_doubt is not None:
+            return in_doubt
+        found = True
+    if not found:
+        # Deleted since the read above, or changed by another request: either way nothing was
+        # written, and the decisions above may not hold for the row as it is now.
+        try:
+            gone = storage.get_mcp_server(server_id) is None
+        except storage_errors():
+            return _admin_change_not_saved()
+        if gone:
+            return JSONResponse({"error": "MCP server not found"}, status_code=404)
+        return JSONResponse({"error": _MCP_SERVER_CHANGED_MEANWHILE}, status_code=409)
 
     audit_uid, ip = _audit_context(request)
 
-    # Purge per-user tokens + pending OAuth states keyed on the OLD name on
-    # rename, on any pool-backed auth_type transition, on URL change, or on an
-    # audience / obo-scope change for a pool-backed row. All cases would
-    # otherwise leave tokens orphaned-and-rebindable or bound to a superseded
-    # URL/audience/scope set (the OAuth tables key on the mutable
-    # ``server_name`` and tokens are bound to the URL + audience + scopes
-    # active at mint/consent time).
+    # sec-2: leaving ``oauth_user`` cleared the encrypted client secret in the write above, as
+    # "disable OAuth" should: stale ciphertext would resurface if the row were flipped back. A
+    # clear is audited when it removed a secret or the request asked for one.
     if (
-        name_changing
-        or auth_type_purge
-        or url_changing
-        or as_url_purge
-        or audience_changing
-        or scopes_changing
+        secret_ct is not None
+        or "oauth_client_secret" in body
+        or existing.get("oauth_client_secret_ct") is not None
     ):
-        purge_target = existing.get("name", "")
-        if purge_target:
-            try:
-                storage.delete_mcp_oauth_rows_by_server_name(purge_target)
-            except Exception:
-                log.warning(
-                    "admin.mcp.purge_oauth_rows_failed server_id=%s",
-                    server_id,
-                    exc_info=True,
-                )
-
-    # sec-2: when the row is leaving ``oauth_user`` (to static/none or to
-    # oauth_obo), also clear the encrypted client secret column.  Operators
-    # expect "disable OAuth" to revoke credentials; leaving stale ciphertext
-    # that resurfaces if the row is flipped back is surprising and a footgun.
-    if leaving_oauth_user:
-        token_store = cast("MCPTokenStore | None", oauth_context(request.app.state).token_store)
-        if token_store is not None:
-            token_store.set_oauth_client_secret(server_id, None)
-            _audit_oauth_client_secret_set(
-                storage,
-                audit_uid,
-                server_id,
-                cleared=True,
-                cipher=token_store.cipher,
-                ip=ip,
-            )
-        else:
-            # No encryption key configured — clear the column directly so the
-            # operator's mental model holds.  No cipher fingerprint to audit.
-            storage.set_mcp_oauth_client_secret_ct(server_id, None)
-            _audit_oauth_client_secret_set(
-                storage,
-                audit_uid,
-                server_id,
-                cleared=True,
-                cipher=None,
-                ip=ip,
-            )
-
-    # Encrypt + persist the operator-supplied client secret via the dedicated
-    # writer.  Skip when the post-update auth_type is not oauth_user (the
-    # generic update above also clears OAuth columns in that case).
-    secret_set_state, err_resp = _apply_oauth_client_secret(
-        request,
-        server_id=server_id,
-        body=body,
-        auth_type=auth_type_now,
-        audit_uid=audit_uid,
-        storage=storage,
-        ip=ip,
-    )
-    if err_resp is not None:
-        return err_resp
+        _audit_client_secret_write(request, storage, audit_uid, server_id, secret_ct, ip)
 
     audit_detail = dict(updates)
     # Values that can carry a credential: a stdio server's arguments (--api-key ...) as much as
@@ -12696,8 +12951,8 @@ async def admin_update_mcp_server(request: Request) -> JSONResponse:
         audit_detail["header_references"] = header_refs
     if "oauth_client_secret" in body:
         audit_detail["oauth_client_secret"] = "(redacted)"
-        if secret_set_state is not None:
-            audit_detail["oauth_client_secret_set"] = secret_set_state
+        if secret_ct is not MCP_SECRET_UNCHANGED and auth_type_now == "oauth_user":
+            audit_detail["oauth_client_secret_set"] = secret_ct is not None
     record_audit(
         storage,
         audit_uid,
@@ -12736,25 +12991,21 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
     if existing is None:
         return JSONResponse({"error": "MCP server not found"}, status_code=404)
 
-    # Purge per-user tokens + pending OAuth states keyed on this name
-    # before the row goes away. The OAuth tables are keyed on the
-    # mutable ``server_name``; without this purge, a future server with
-    # the same name (and an attacker-controlled URL) would silently
-    # rebind those tokens. A future schema migration will replace this
-    # with a server_id FK + ON DELETE CASCADE; until then, explicit
-    # purge is the only safe path.
+    # The per-user tokens + pending OAuth states keyed on this name go in the
+    # same transaction as the row. The OAuth tables are keyed on the mutable
+    # ``server_name``; left behind, they would be rebound by a future server
+    # with the same name (and an attacker-controlled URL).
     existing_name = existing.get("name", "")
-    if existing_name:
-        try:
-            storage.delete_mcp_oauth_rows_by_server_name(existing_name)
-        except Exception:
-            log.warning(
-                "admin.mcp.purge_oauth_rows_failed server_id=%s",
-                server_id,
-                exc_info=True,
-            )
-
-    storage.delete_mcp_server(server_id)
+    try:
+        deleted = storage.delete_mcp_server(server_id)
+    except storage_errors():
+        log.warning("admin.mcp.delete_failed server_id=%s", server_id, exc_info=True)
+        in_doubt = _mcp_write_in_doubt(storage, server_id, lambda row: row is None)
+        if in_doubt is not None:
+            return in_doubt
+        deleted = True
+    if not deleted:  # another request deleted the server since the read above
+        return JSONResponse({"error": "MCP server not found"}, status_code=404)
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -13536,6 +13787,10 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
                 tls_skip_verify=tls_skip_verify,
                 created_by=audit_uid,
             )
+        except storage_errors():
+            log.warning("admin.mcp.import_failed name=%s", srv_name, exc_info=True)
+            errors.append(f"{srv_name}: could not be saved; nothing was changed")
+            continue
         except Exception as exc:
             errors.append(f"{srv_name}: {exc}")
             continue
