@@ -305,6 +305,155 @@ already shipped on the 1.8 line are not repeated here.
 
 ### Added
 
+- **Read-aloud speaks symbols, units and version numbers.** Before text goes to the text-to-speech
+  backend, a small English rule set rewrites things models read badly into plain words: `~5`
+  becomes "about 5", `32GB` "32 gigabytes", `120ms` "120 milliseconds", `3-5` "3 to 5", `1.8.5`
+  "1 point 8 point 5", `->` "to", `60s` "60 seconds" (but `the 80s` stays a decade), `2026-10-16`
+  "October 16th, 2026" and `2026-10` "October 2026", `300W` "300 watts" (attached only), a
+  ten-digit phone number digit by digit, `speech_text.py` "speech_text dot py", and `e.g.` "for
+  example". A few technical terms voices mangle get plain respellings
+  (`PostgreSQL` as "Postgres", `systemctl`, `kubectl`, `YAML`, `JSON`). It uses no model-specific syntax, so it
+  behaves the same on Kokoro, OpenAI and vLLM-Omni backends. The new `audio.tts_normalize` setting
+  (on by default) turns it off, and `audio.tts_pronunciations` takes one `word = respelling` per
+  line for words the rules do not cover; an entry there overrides a built-in respelling.
+
+- **MCP servers on the 2026-07-28 revision (#679).** A connection probes `server/discover` and
+  adopts 2026-07-28 when the server offers it; a server that refuses the probe gets the 2025-11-25
+  `initialize` handshake, so existing servers connect as before. On 2026-07-28 connections, change
+  notifications arrive on a `subscriptions/listen` stream, reopened when the server ends it with a
+  full catalog refresh after each reopen; the liveness check sends `server/discover` instead of
+  `ping`; a shared server's catalogs refresh when their cache hint runs out; resource reads are
+  cached for as long as their hint allows; and a tool call rejected for mismatched headers relists
+  the tools and retries once. On a per-user server, a read the server marks `public` is shared
+  among that server's users until it expires (#1388). A request for input, which turnstone does
+  not handle yet, fails the call without counting against the server's circuit breaker. Two
+  optional settings: `log_level` (in `[mcp]`, or per server) writes server log messages at or
+  above that severity to turnstone's log, capped at `WARNING`, and `resource_subscriptions` (per
+  server) names resources whose cached reads a change notice drops. A tool result with only
+  structured content now reaches the model as JSON instead of "(no output)". See
+  [Optional 2026-07-28 settings](docs/tools.md#optional-2026-07-28-settings).
+- **User avatars (#997).** Each person shows as the first letter of their name on one of six
+  colours, or as a picture they upload, in the rail's user chip and the console's Users table.
+  **Change avatar** in the user menu offers the six colours, a picture upload (PNG, JPEG or WebP;
+  the browser crops it to a square and shrinks it before sending) and removing the picture. Changing
+  an avatar needs the `write` scope, so a viewer keeps the colour their account was given. A new
+  account gets the colour that sets it furthest apart from people who share its initial, taking
+  colour-blind viewers into account. Admins can remove anyone's picture
+  (`DELETE /v1/api/admin/users/{user_id}/avatar/picture`, `admin.users`). Setting and removing a
+  picture are audited as `user.avatar.set_picture` and `user.avatar.remove_picture`, with the
+  picture's version. Login, setup, refresh and whoami return the signed-in person's `display_name`
+  and `avatar` (`color`, `initial`, `picture`), login and refresh also return the login name as
+  `username`, and the admin user list returns each user's `avatar`. Any signed-in caller can fetch a
+  picture at `GET /v1/api/users/{user_id}/avatar`. Pictures are stored as a 256px PNG with no
+  metadata from the upload. The server takes at most 4 MB, 4096 by 4096 pixels for JPEG and 2048 by
+  2048 for PNG and WebP, refuses JPEGs saved in more than 100 progressive passes, and decodes one
+  picture at a time. Each person has one upload in progress at a time, up to four more wait their
+  turn, and the rest are asked to retry. A picture uploaded through the API with a wide-gamut colour
+  profile such as Display P3 is read as sRGB, so it looks a little duller; the upload dialog
+  converts to sRGB before it sends.
+- **Test an MCP server's connection before saving it (#1328).** The MCP Servers add and edit forms
+  have a **Test connection** button for Streamable HTTP servers with no authorization or static
+  headers. The console connects once with the form's values, the way a save would, and shows the
+  server's tools and its resource and prompt counts, or why it could not connect: the HTTP status, a
+  TLS failure, a timeout, a URL that serves a web page or other non-MCP content, or the catalog
+  entry that fails validation. Nothing is saved. The test runs from the console; nodes connect from
+  their own network. Each test is audited as `mcp_server.test`, with the scheme, host, port and
+  outcome. Scripts can call `POST /v1/api/admin/mcp-servers/test` (`admin.mcp`), or
+  `test_mcp_server` (which waits up to 75 s) / `testMcpServer` in the SDKs.
+- **Secret references for model API keys and MCP headers (#1329).** A model definition's `api_key`
+  and a `streamable-http` MCP server's headers can hold `secret://<backend>/<path>[#<field>]`
+  instead of the value. The value is fetched from the store configured under `[secrets]` in
+  config.toml when the registry loads or the server connects, is reused for `cache_ttl_seconds`, and
+  is never written to the database. Two backends ship: `file` (a file under a dedicated root, for
+  container and Kubernetes secret mounts) and `vault` (Vault or OpenBao KV v2 with `jwt` or
+  `approle` login). Both backends drop one trailing line break; what remains must be printable
+  ASCII, with spaces and tabs only between other characters, as an HTTP header value must, or it is
+  refused without being quoted. The console shows a reference verbatim where it masks a literal,
+  validates it when it is saved, and requires `admin.mcp`, held explicitly, to introduce one, to
+  probe a typed one with Detect, or to test an MCP server's connection with one; a reference in MCP
+  stdio `env` is refused. While the store is down, values already fetched stay in use. With a store
+  configured, nodes and the console reload their models every `cache_ttl_seconds` (at least 60 s),
+  so a rotated key, and any model definition saved since the last Sync to Nodes, reaches them within
+  that interval (the Models tab then clears its pending-Sync marker); MCP connections pick a
+  rotation up on Reconnect. When the store refuses a reference (not found, denied), anything new
+  gets the refusal at once, a model already running keeps running until Sync to Nodes leaves it out,
+  and an MCP server whose header is refused is retried every five minutes. See [Secret
+  references](docs/security.md#secret-references).
+- **Output-guard evals in `turnstone-eval` (#1291).** `--output-guard judge` scores the LLM stage on
+  tool outputs with directives planted at known lines: detection, false positives, whether its flags
+  stay inside the fixed vocabulary, citation precision and recall, and failed verdicts.
+  `--output-guard locate` checks that a model finds the lines an advisory cites, alone and as the
+  first of two results, and `--output-guard subagent` whether production's task agent acts on a
+  planted directive with and without the advisory, counting only calls that carry it out (a command
+  by the program it runs, a write by its path, a fetch by its URL), retrying a run that fails before
+  it acts and keeping the error of one that fails after. Each subagent run keeps the agent's
+  transcript, with the reasoning its provider returned, and `--output-guard grade` reads those
+  transcripts back to a grader model: whether the agent noticed the planted instruction, what it did
+  about it, whether it mentioned the guard's warning, and how it read the instruction, so a paid run
+  is graded without being repeated. `--judge-model` runs the guard's judge on a model of its own,
+  selected through `judge.output_guard_model`. `--provider` reaches the endpoint through the named
+  adapter, so a model that takes mid-conversation system messages receives the advisory as one; a
+  hosted provider reaches its own API and reads its own key variable. Cases ship in
+  `turnstone/eval/scenarios/output_guard.py`. The mode flags `--nudges`, `--skill-adherence` and
+  `--output-guard` are now mutually exclusive; given together, one ran and the other was silently
+  dropped.
+- **One live owner per workstream.** A process that loads a workstream holds a time-bounded owner
+  lease on it, renewed every 10 seconds and judged against the database clock, and every write the
+  session makes presents the lease's fencing epoch. Two servers sharing PostgreSQL can no longer
+  both open the same workstream: the second answers 409 with code `workstream_lease_held` and the
+  holder's node; the console follows a refused open to the holder and its delete proxy retries there
+  once, while the node UI and the standalone shell say which node holds it. Concurrent opens of one
+  workstream load it once and report `already_loaded` to the others. A paused or partitioned former
+  holder cannot write history, state, configuration, attachments or lifecycle changes after another
+  process took over; its copy stops generating, tells open panes why, and is unloaded. A non-holder
+  cannot close or hard-delete a workstream another live process owns. SQLite keeps its
+  single-process behavior: a new process takes the lease over when it opens a workstream, though
+  until a crashed process's leases expire (up to 30 seconds), deleting, renaming or importing those
+  workstreams without opening them is refused, and the refusal names the crashed process's node,
+  which can be the restarted one. In the CLI, `/resume` and `/new` open the workstream
+  in a tab of their own, carrying the current tab's approvals (and `/new` its model, persona and
+  settings), and `/resume` of a workstream another tab has switches to that tab; one that fails
+  says why and stays on the current tab (or, when that tab was a stopped copy of the workstream it
+  named, brings the next one forward). The tab left closes once its messages are saved, retrying
+  any that are not; one whose background programs still run stays open until `/ws close`. A
+  workstream another process took over closes with a notice, the next one comes forward, and input
+  typed for the closed one is dropped; `/resume` of such a tab opens it again, `/ws close` says
+  whether a tab closed, moved elsewhere or is still saving, `/exit` works with none open, and a
+  slash command that fails or is interrupted reports why and returns to the prompt instead of
+  ending the CLI. A node that loses a workstream to another process announces `ws_unloaded` on its
+  event stream (not `ws_closed`: it may live on elsewhere), its own dashboard drops the row,
+  and the console's cluster stream forwards it with the node's ID, so dashboards list the
+  workstream under its holder only.
+  `turnstone_workstream_lease_events_total{event}` counts acquisitions, takeovers, conflicts,
+  renewals and losses. See [Workstream Owner Lease](docs/architecture.md#workstream-owner-lease).
+
+- **Attachment cases in `turnstone-eval`.** A case can attach text files (`attachments` entries
+  with `filename`, `content` and an optional `mime_type`); each is classified like an upload and
+  sent through the real user-turn path, so the model receives exactly what an uploaded file
+  produces. `forbidden_actions` fails a run that makes any listed tool call, and
+  `expected_content` lists regexes the final answer must match. `eval_attachments.json` uses both
+  to measure whether a model answers from an attached or pasted file instead of looking for it on
+  disk.
+- **Anthropic workspace scoping per model definition.** An organization-level Anthropic API key
+  in a multi-workspace organization needs the `anthropic-workspace-id` header on every request.
+  The model editor gains a Workspace ID field for the `anthropic` and `anthropic-compatible`
+  providers, stored as `capabilities.server_compat.anthropic_workspace_id`; the registry pins it
+  on the alias's client so model turns, the Detect probe, the doctor check, and delegated-credential
+  calls all carry it. Values must be visible ASCII of at most 128 characters; the console refuses
+  anything else, or a value on a provider that does not speak the Anthropic protocol.
+- **`turnstone-doctor` flags a Caddy running an outdated Caddyfile.** On a Docker install, the
+  report compares the config Caddy loaded with the Caddyfile on disk and, when they differ, gives
+  the `docker compose restart caddy` command that applies it.
+- **`evaluation` workstream state (#1325).** While Smart Approvals waits for the intent judge's
+  verdicts, a web or coordinator workstream is in the new `evaluation` state instead of
+  `attention`: the judge may still approve the batch with no person. The dashboards, the sidebar,
+  the tabs and a coordinator's child tree show it as ⚖ in the judge colour, and the cluster summary
+  counts it separately. It moves to `attention` when a card is published for a person (including
+  after the wait times out), or to `running` when the batch is approved. With Smart Approvals off
+  the verdict is advice, and the workstream goes straight to `attention`. State events, counts,
+  filters and the `turnstone_workstreams_by_state` metric can now carry `evaluation`; clients
+  that list the states should add it. The CLI's `/cluster nodes` table gains an EVAL column, and a
+  sidebar row's hover text now names its state when it is not idle or running.
 - **One live owner per workstream.** A database-backed lease prevents two nodes
   from writing to the same conversation. Opens route to the owner, concurrent
   opens share one session, and a process that loses ownership stops generating
