@@ -1036,7 +1036,7 @@ async def speech_to_text_response(
     authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
     run: Callable[..., Awaitable[Any]] = _console_dictation,
     poll_s: float = 1.0,
-    request_timeout_s: float = STT_REQUEST_TIMEOUT_S,
+    request_timeout_s: float | None = None,
 ) -> JSONResponse:
     """Serve ``POST /v1/api/workstreams/{ws_id}/speech-to-text`` against *registry*.
 
@@ -1048,7 +1048,8 @@ async def speech_to_text_response(
     *run* runs the transcription on the process's dictation threads within its
     admission budget (:func:`run_dictation`); the node passes its own budget.
     *request_timeout_s* is the HTTP budget from arrival (the node passes its
-    own): the credential lookup, transcode, admission and the one backend
+    own; ``None`` is the console's ``STT_REQUEST_TIMEOUT_S``, read at call
+    time): the credential lookup, transcode, admission and the one backend
     attempt all come out of it.
     Everything else is one contract so the coordinator mic behaves like a node's.
     """
@@ -1092,7 +1093,9 @@ async def speech_to_text_response(
     prompt = stt_prompt(config_store, dictionary)
     abort_ref = StreamAbortRef()
     # One budget from arrival: the credential lookup and the call share it.
-    deadline = arrived + request_timeout_s
+    # The console's budget is read now, as its admission wait is.
+    budget = STT_REQUEST_TIMEOUT_S if request_timeout_s is None else request_timeout_s
+    deadline = arrived + budget
     backend_auth_resolver = audio_backend_auth_resolver(request, deadline=deadline)
     try:
         # Blocking SDK round-trip, off the event loop.
@@ -1153,16 +1156,19 @@ async def speech_to_text_stream_response(
     authorize: Callable[[Request, str], Awaitable[JSONResponse | None]],
     run: Callable[..., Awaitable[Any]] = _console_dictation,
     poll_s: float = 1.0,
-    request_timeout_s: float = STT_REQUEST_TIMEOUT_S,
+    request_timeout_s: float | None = None,
 ) -> Response:
     """Serve ``POST .../speech-to-text/stream``: the transcript as plain-text deltas.
 
     Lower perceived latency than the JSON route.  Resolve/transcode failures
-    surface as 503 / 502 before any bytes are sent; once streaming begins the
-    body is best-effort (a mid-stream backend error just ends the partial
-    stream).  Dictionary terms are hinted in the prompt like the JSON route,
-    but transcript correction is JSON-route only — this route has no final
-    event, only raw deltas.  *registry* / *authorize* as in
+    surface as 503 / 502 before any bytes are sent.  Once streaming begins, a
+    mid-stream backend failure (the request deadline included) aborts the body
+    without its last chunk, so the browser's read fails instead of taking the
+    partial text for a whole transcript; a caller that has gone ends quietly.
+    The node serves its route through this handler too, so its composer gets
+    the same signal.  Dictionary terms are hinted in the prompt like the JSON
+    route, but transcript correction is JSON-route only — this route has no
+    final event, only raw deltas.  *registry* / *authorize* as in
     :func:`speech_to_text_response`.
     """
     import asyncio
@@ -1212,7 +1218,9 @@ async def speech_to_text_stream_response(
     prompt = stt_prompt(config_store, dictionary)
     abort_ref = StreamAbortRef()
     # One budget from arrival: the credential lookup and the call share it.
-    deadline = arrived + request_timeout_s
+    # The console's budget is read now, as its admission wait is.
+    budget = STT_REQUEST_TIMEOUT_S if request_timeout_s is None else request_timeout_s
+    deadline = arrived + budget
     backend_auth_resolver = audio_backend_auth_resolver(request, deadline=deadline)
 
     # Resolve + transcode + admission + open the stream eagerly (off the event
@@ -1264,6 +1272,9 @@ async def speech_to_text_stream_response(
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         stop = threading.Event()
+        # Set before the final None when the backend failed mid-stream.  A clean
+        # end would read as a whole transcript, so the body fails instead.
+        failed = threading.Event()
 
         def _pump() -> None:
             try:
@@ -1272,9 +1283,11 @@ async def speech_to_text_stream_response(
                         break
                     loop.call_soon_threadsafe(queue.put_nowait, delta.encode("utf-8"))
             except Exception:
-                # Mid-stream backend failure: end the partial stream (logged).
+                # Mid-stream backend failure (logged); a caller that has gone
+                # aborted the stream itself, and that ends quietly.
                 if not abort_ref.aborted:
                     log.warning("speech_to_text_stream.mid_stream_failed", exc_info=True)
+                    failed.set()
             finally:
                 close = getattr(deltas, "close", None)
                 if callable(close):
@@ -1286,6 +1299,10 @@ async def speech_to_text_stream_response(
             while True:
                 chunk = await queue.get()
                 if chunk is None:
+                    if failed.is_set():
+                        # Escapes the response, so the server drops the
+                        # connection before the chunked body's last chunk.
+                        raise AudioBackendError("Speech transcription stream failed mid-stream")
                     break
                 yield chunk
         finally:
